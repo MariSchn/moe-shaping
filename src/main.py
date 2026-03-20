@@ -5,6 +5,7 @@ from typing import Callable, Tuple
 
 from utils import get_device
 
+
 def create_target_function(
     domain: Tuple[float, float],
     num_pieces: int,
@@ -33,7 +34,9 @@ def create_target_function(
     if intercepts is None:
         intercepts = torch.randn(num_pieces, device=device)
     if breakpoints is None:
-        breakpoints = torch.linspace(domain[0], domain[1], num_pieces + 1, device=device)
+        breakpoints = torch.linspace(
+            domain[0], domain[1], num_pieces + 1, device=device
+        )
     else:
         breakpoints = breakpoints.to(device)
     slopes = slopes.to(device)
@@ -109,7 +112,9 @@ def main() -> None:
     device = get_device()
     target_function = create_target_function(domain, num_pieces, device=device)
 
-    model = Model(num_experts=num_pieces, input_dim=1, output_dim=1, router_top_k=1).to(device)
+    model = Model(num_experts=num_pieces, input_dim=1, output_dim=1, router_top_k=1).to(
+        device
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     loss_fn = nn.MSELoss()
 
@@ -127,6 +132,7 @@ def main() -> None:
         print(f"Step {i}, Loss: {loss.item()}")
 
     print(f"Final loss: {loss.item()}")
+
 
 if __name__ == "__main__":
     main()
