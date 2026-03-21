@@ -1,0 +1,14 @@
+target:
+  num_pieces: 2
+  domain: [-1, 1]
+
+model:
+  num_experts: 2
+  input_dim: 1
+  output_dim: 1
+  router_top_k: 1
+
+training:
+  num_steps: 100
+  batch_size: 100
+  learning_rate: 0.01

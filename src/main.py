@@ -1,5 +1,8 @@
+import argparse
+
 import torch
 import torch.nn as nn
+from omegaconf import DictConfig, OmegaConf
 
 from typing import Tuple
 
@@ -104,26 +107,39 @@ class Model(nn.Module):
         return weighted.sum(dim=1), gating_scores
 
 
-def main() -> None:
-    num_pieces = 2
-    domain = (-10, 10)
-    num_steps = 100
-    batch_size = 100
-    learning_rate = 0.01
-    device = get_device()
-    target_function = PiecewiseLinearTarget(domain, num_pieces, device=device)
+def load_config(argv: list[str] | None = None) -> DictConfig:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="configs/default.yaml")
+    args, overrides = parser.parse_known_args(argv)
 
-    model = Model(num_experts=num_pieces, input_dim=1, output_dim=1, router_top_k=1).to(
-        device
-    )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    file_cfg = OmegaConf.load(args.config)
+    cli_cfg = OmegaConf.from_dotlist(overrides)
+    return OmegaConf.merge(file_cfg, cli_cfg)
+
+
+def main() -> None:
+    cfg = load_config()
+    device = get_device()
+
+    target_cfg = cfg.target
+    domain = target_cfg.domain
+    target_function = PiecewiseLinearTarget(**target_cfg, device=device)
+
+    model_cfg = cfg.model
+    model = Model(**model_cfg).to(device)
+
+    training_cfg = cfg.training
+    optimizer = torch.optim.AdamW(model.parameters(), lr=training_cfg.learning_rate)
     loss_fn = nn.MSELoss()
 
-    for i in range(num_steps):
-        x = torch.randn(batch_size, 1).to(device)
+    for i in range(training_cfg.num_steps):
+        # Sample x uniformly at random inside the domain
+        x = (domain[1] - domain[0]) * torch.rand(
+            training_cfg.batch_size, 1, device=device
+        ) + domain[0]
         y = target_function(x)
 
-        y_pred = model(x)
+        y_pred, _ = model(x)
         loss = loss_fn(y_pred, y)
 
         optimizer.zero_grad()
