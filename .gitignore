@@ -3,4 +3,9 @@
 __pycache__/
 .ruff_cache/
 
+wandb/
+.wandb_data/
+
+.vscode/
+
 playground.ipynb
