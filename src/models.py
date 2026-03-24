@@ -5,7 +5,15 @@ from typing import Tuple
 
 class Model(nn.Module):
     def __init__(
-        self, num_experts: int, input_dim: int, output_dim: int, router_top_k: int
+        self,
+        num_experts: int,
+        input_dim: int,
+        output_dim: int,
+        router_top_k: int,
+        initial_expert_weights: list[list[float]] = None,
+        initial_expert_biases: list[list[float]] = None,
+        initial_gating_weights: list[list[float]] = None,
+        initial_gating_biases: list[float] = None,
     ):
         super().__init__()
 
@@ -18,6 +26,30 @@ class Model(nn.Module):
             [nn.Linear(input_dim, output_dim, bias=True) for _ in range(num_experts)]
         )
         self.gating_function = nn.Linear(input_dim, num_experts, bias=True)
+
+        # Insert hard-coded weights and biases if provided
+        if initial_expert_weights is not None:
+            assert len(initial_expert_weights) == num_experts, (
+                f"Initial weights must have {num_experts} elements, got {len(initial_expert_weights)}"
+            )
+            for i in range(num_experts):
+                self.experts[i].weight.data = torch.tensor(initial_expert_weights[i])
+        if initial_expert_biases is not None:
+            assert len(initial_expert_biases) == num_experts, (
+                f"Initial biases must have {num_experts} elements, got {len(initial_expert_biases)}"
+            )
+            for i in range(num_experts):
+                self.experts[i].bias.data = torch.tensor(initial_expert_biases[i])
+        if initial_gating_weights is not None:
+            assert len(initial_gating_weights) == num_experts, (
+                f"Initial gating weights must have {num_experts} elements, got {len(initial_gating_weights)}"
+            )
+            self.gating_function.weight.data = torch.tensor(initial_gating_weights)
+        if initial_gating_biases is not None:
+            assert len(initial_gating_biases) == num_experts, (
+                f"Initial gating biases must have {num_experts} elements, got {len(initial_gating_biases)}"
+            )
+            self.gating_function.bias.data = torch.tensor(initial_gating_biases)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
