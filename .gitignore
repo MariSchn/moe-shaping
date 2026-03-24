@@ -1,3 +1,6 @@
 .venv/
-playground.ipynb
+
 __pycache__/
+.ruff_cache/
+
+playground.ipynb
