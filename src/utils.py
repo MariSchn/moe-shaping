@@ -71,3 +71,15 @@ def calculate_per_expert_loss(
     per_expert_loss = per_expert_loss_sum / expert_counts.clamp(min=1.0)
 
     return per_expert_loss
+
+
+def per_expert_gradient_norm(model: nn.Module) -> list[float]:
+    """L2 norm of each expert submodule's parameter gradients, one scalar per expert."""
+    norms: list[float] = []
+    for expert in model.experts:
+        sum_sq = 0.0
+        for p in expert.parameters():
+            if p.grad is not None:
+                sum_sq += float(p.grad.detach().pow(2).sum().item())
+        norms.append(sum_sq**0.5)
+    return norms

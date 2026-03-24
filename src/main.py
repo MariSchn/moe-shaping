@@ -10,7 +10,12 @@ from tqdm import tqdm
 
 from targets import PiecewiseLinearTarget
 from models import Model
-from utils import get_device, calculate_per_expert_loss, sample_uniformly
+from utils import (
+    get_device,
+    calculate_per_expert_loss,
+    per_expert_gradient_norm,
+    sample_uniformly,
+)
 from visualization import (
     model_visualization,
     top_expert_visualization,
@@ -56,7 +61,10 @@ def main() -> None:
         )
         expert_loss_steps: list[int] = []
         expert_loss_ys: list[list[float]] = [[] for _ in range(model_cfg.num_experts)]
-        expert_loss_keys = [f"expert_{e}" for e in range(model_cfg.num_experts)]
+        expert_grad_norm_ys: list[list[float]] = [
+            [] for _ in range(model_cfg.num_experts)
+        ]
+        expert_series_keys = [f"expert_{e}" for e in range(model_cfg.num_experts)]
 
     pbar = tqdm(range(training_cfg.num_steps), desc="Training")
     for step in pbar:
@@ -69,15 +77,14 @@ def main() -> None:
 
         optimizer.zero_grad()
         loss.backward()
-        optimizer.step()
-
-        pbar.set_postfix({"loss": loss.item()})
 
         # ===== LOGGING =====
         if wandb_cfg.enabled:
             log_dict = {
                 "train/loss": loss.item(),
             }
+
+            per_expert_grad_norm = per_expert_gradient_norm(model)
 
             per_expert_loss = (
                 calculate_per_expert_loss(
@@ -115,8 +122,13 @@ def main() -> None:
             expert_loss_steps.append(step)
             for e, v in enumerate(per_expert_loss):
                 expert_loss_ys[e].append(v)
+            for e, v in enumerate(per_expert_grad_norm):
+                expert_grad_norm_ys[e].append(v)
 
             wandb.log(log_dict, step=step)
+
+        optimizer.step()
+        pbar.set_postfix({"loss": loss.item()})
 
     if wandb_cfg.enabled:
         if expert_loss_steps:
@@ -125,8 +137,15 @@ def main() -> None:
                     "per_expert_loss": wandb.plot.line_series(
                         expert_loss_steps,
                         expert_loss_ys,
-                        keys=expert_loss_keys,
+                        keys=expert_series_keys,
                         title="Per-Expert Loss",
+                        xname="step",
+                    ),
+                    "per_expert_grad_norm": wandb.plot.line_series(
+                        expert_loss_steps,
+                        expert_grad_norm_ys,
+                        keys=expert_series_keys,
+                        title="Per-Expert Gradient Norm",
                         xname="step",
                     ),
                 },
