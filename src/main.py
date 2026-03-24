@@ -13,6 +13,7 @@ from models import Model
 from utils import (
     get_device,
     calculate_per_expert_loss,
+    gating_gradient_norm,
     per_expert_gradient_norm,
     sample_uniformly,
 )
@@ -82,6 +83,7 @@ def main() -> None:
         if wandb_cfg.enabled:
             log_dict = {
                 "train/loss": loss.item(),
+                "train/router_grad_norm": gating_gradient_norm(model),
             }
 
             per_expert_grad_norm = per_expert_gradient_norm(model)
