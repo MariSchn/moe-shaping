@@ -15,6 +15,7 @@ from visualization import (
     model_visualization,
     top_expert_visualization,
     router_visualization,
+    expert_visualization,
 )
 
 
@@ -105,6 +106,10 @@ def main() -> None:
                     "figure"
                 ]
                 log_dict["plots/router"] = wandb.Image(fig)
+                plt.close(fig)
+
+                fig = expert_visualization(model, domain, 100)["figure"]
+                log_dict["plots/expert"] = wandb.Image(fig)
                 plt.close(fig)
 
             expert_loss_steps.append(step)

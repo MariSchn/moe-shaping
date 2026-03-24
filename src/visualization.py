@@ -114,7 +114,7 @@ def router_visualization(
 
     for i in range(model.num_experts):
         y = slopes[i] * x + intercepts[i]
-        ax.plot(x.cpu(), y.cpu(), label=f"Expert {i}")
+        ax.plot(x.cpu(), y.cpu(), label=f"Expert {i} Vector")
 
     breakpoints = None
     if target_function is not None:
@@ -136,4 +136,37 @@ def router_visualization(
         "slopes": slopes,
         "intercepts": intercepts,
         "breakpoints": breakpoints,
+    }
+
+
+def expert_visualization(
+    model: nn.Module,
+    domain: Tuple[float, float],
+    num_points: int,
+) -> plt.Figure:
+    assert model.input_dim == 1, (
+        "Model must have a single input dimension for expert visualization"
+    )
+    assert model.output_dim == 1, (
+        "Model must have a single output dimension for expert visualization"
+    )
+
+    device = model_device(model)
+    x = torch.linspace(domain[0], domain[1], num_points, device=device).unsqueeze(-1)
+
+    with torch.inference_mode():
+        output = model(x)
+    expert_outputs = output["expert_outputs"]
+
+    fig, ax = plt.subplots()
+    for i in range(model.num_experts):
+        ax.plot(x.cpu(), expert_outputs[:, i, 0].cpu(), label=f"Expert {i}")
+    ax.legend()
+    ax.set_xlim(domain)
+    ax.set_title("Expert Visualization")
+
+    return {
+        "figure": fig,
+        "x": x,
+        "expert_outputs": expert_outputs,
     }
