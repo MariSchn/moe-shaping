@@ -32,14 +32,15 @@ def model_visualization(
         y_target = target_function(x)
 
     fig, ax = plt.subplots()
-    ax.plot(x.cpu(), y_model.cpu(), label="pred")
+    ax.plot(x.cpu(), y_model.cpu(), label="Model")
 
     if y_target is not None:
-        ax.plot(x.cpu(), y_target.cpu(), label="target")
+        ax.plot(x.cpu(), y_target.cpu(), label="Target")
 
     ax.legend()
     ax.set_xlim(domain)
     ax.grid(True)
+    ax.set_title("Model Visualization")
 
     return {
         "figure": fig,
@@ -67,7 +68,7 @@ def top_expert_visualization(
     top_expert = output["selected_experts"][:, 0]
 
     fig, ax = plt.subplots()
-    ax.plot(x.detach().cpu(), top_expert.detach().cpu(), label="top_expert")
+    ax.plot(x.detach().cpu(), top_expert.detach().cpu(), label="Top Expert")
 
     breakpoints = None
     if target_function is not None:
@@ -83,6 +84,7 @@ def top_expert_visualization(
     ax.set_xlim(domain)
     ax.set_yticks(range(model.num_experts))
     ax.set_ylim(-0.1, model.num_experts - 0.9)
+    ax.set_title("Top Expert Visualization")
 
     return {
         "figure": fig,
@@ -126,6 +128,7 @@ def router_visualization(
 
     ax.legend()
     ax.set_xlim(domain)
+    ax.set_title("Router Visualization")
 
     return {
         "figure": fig,
