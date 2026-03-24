@@ -3,6 +3,7 @@ import argparse
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
+from tqdm import tqdm
 
 from typing import Tuple
 
@@ -132,7 +133,8 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=training_cfg.learning_rate)
     loss_fn = nn.MSELoss()
 
-    for i in range(training_cfg.num_steps):
+    pbar = tqdm(range(training_cfg.num_steps), desc="Training")
+    for i in pbar:
         # Sample x uniformly at random inside the domain
         x = (domain[1] - domain[0]) * torch.rand(
             training_cfg.batch_size, 1, device=device
@@ -146,9 +148,7 @@ def main() -> None:
         loss.backward()
         optimizer.step()
 
-        print(f"Step {i}, Loss: {loss.item()}")
-
-    print(f"Final loss: {loss.item()}")
+        pbar.set_postfix({"loss": loss.item()})
 
 
 if __name__ == "__main__":
