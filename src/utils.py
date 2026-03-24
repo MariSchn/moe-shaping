@@ -1,5 +1,13 @@
 import torch
+import torch.nn as nn
 from typing import Callable, Tuple
+
+
+def model_device(model: nn.Module) -> torch.device:
+    p = next(model.parameters(), None)
+    if p is not None:
+        return p.device
+    return torch.device("cpu")
 
 
 def get_device() -> torch.device:

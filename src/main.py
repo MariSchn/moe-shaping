@@ -1,5 +1,6 @@
 import argparse
 
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import wandb
@@ -10,6 +11,11 @@ from tqdm import tqdm
 from targets import PiecewiseLinearTarget
 from models import Model
 from utils import get_device, calculate_per_expert_loss, sample_uniformly
+from visualization import (
+    model_visualization,
+    top_expert_visualization,
+    router_visualization,
+)
 
 
 def load_config(argv: list[str] | None = None) -> DictConfig:
@@ -37,14 +43,15 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=training_cfg.learning_rate)
     loss_fn = nn.MSELoss()
 
-    wandb_cfg = OmegaConf.select(cfg, "wandb")
+    logging_cfg = cfg.logging
+    wandb_cfg = cfg.wandb
     if wandb_cfg.enabled:
         wandb.init(
             project=wandb_cfg.project,
-            entity=OmegaConf.select(wandb_cfg, "entity", default=None),
-            name=OmegaConf.select(wandb_cfg, "run_name", default=None),
-            tags=OmegaConf.select(wandb_cfg, "run_tags", default=[]),
-            config=OmegaConf.to_container(cfg, resolve=True),
+            entity=wandb_cfg.entity,
+            name=wandb_cfg.run_name,
+            tags=wandb_cfg.run_tags,
+            config=cfg,
         )
         expert_loss_steps: list[int] = []
         expert_loss_ys: list[list[float]] = [[] for _ in range(model_cfg.num_experts)]
@@ -67,6 +74,10 @@ def main() -> None:
 
         # ===== LOGGING =====
         if wandb_cfg.enabled:
+            log_dict = {
+                "train/loss": loss.item(),
+            }
+
             per_expert_loss = (
                 calculate_per_expert_loss(
                     output["expert_outputs"],
@@ -79,11 +90,28 @@ def main() -> None:
                 .tolist()
             )
 
+            if step % logging_cfg.log_plots_every_n_steps == 0:
+                fig = model_visualization(model, domain, 100, target_function)["figure"]
+                log_dict["plots/model"] = wandb.Image(fig)
+                plt.close(fig)
+
+                fig = top_expert_visualization(model, domain, 100, target_function)[
+                    "figure"
+                ]
+                log_dict["plots/top_expert"] = wandb.Image(fig)
+                plt.close(fig)
+
+                fig = router_visualization(model, domain, 100, target_function)[
+                    "figure"
+                ]
+                log_dict["plots/router"] = wandb.Image(fig)
+                plt.close(fig)
+
             expert_loss_steps.append(step)
             for e, v in enumerate(per_expert_loss):
                 expert_loss_ys[e].append(v)
 
-            wandb.log({"loss": loss.item()}, step=step)
+            wandb.log(log_dict, step=step)
 
     if wandb_cfg.enabled:
         if expert_loss_steps:
