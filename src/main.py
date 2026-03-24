@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 from typing import Tuple
 
-from utils import get_device
+from utils import get_device, calculate_per_expert_loss, sample_uniformly
 
 
 class PiecewiseLinearTarget:
@@ -105,7 +105,14 @@ class Model(nn.Module):
         # Combine expert outputs: (B, output_dim)
         weighted = selected_outputs * selected_gate_probs.unsqueeze(-1)
 
-        return weighted.sum(dim=1), gating_scores
+        out = {
+            "predictions": weighted.sum(dim=1),  # (B, output_dim)
+            "gating_scores": gating_scores,  # (B, num_experts)
+            "expert_outputs": expert_outputs,  # (B, num_experts, output_dim)
+            "selected_experts": top_k_indices,  # (B, top_k)
+        }
+
+        return out
 
 
 def load_config(argv: list[str] | None = None) -> DictConfig:
@@ -135,20 +142,28 @@ def main() -> None:
 
     pbar = tqdm(range(training_cfg.num_steps), desc="Training")
     for i in pbar:
-        # Sample x uniformly at random inside the domain
-        x = (domain[1] - domain[0]) * torch.rand(
-            training_cfg.batch_size, 1, device=device
-        ) + domain[0]
+        # ===== TRAINING =====
+        x = sample_uniformly(domain, training_cfg.batch_size).to(device)
         y = target_function(x)
 
-        y_pred, _ = model(x)
-        loss = loss_fn(y_pred, y)
+        output = model(x)
+        loss = loss_fn(output["predictions"], y)
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
         pbar.set_postfix({"loss": loss.item()})
+
+        # ===== LOGGING =====
+        per_expert_loss = calculate_per_expert_loss(
+            output["expert_outputs"],
+            output["selected_experts"],
+            y,
+            torch.nn.functional.mse_loss,
+        )
+
+        print(per_expert_loss)
 
 
 if __name__ == "__main__":
