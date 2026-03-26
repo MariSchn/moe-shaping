@@ -43,7 +43,7 @@ def main() -> None:
     model = Model(**model_cfg).to(device)
 
     training_cfg = cfg.training
-    optimizer = torch.optim.AdamW(model.parameters(), lr=training_cfg.learning_rate)
+    optimizer = torch.optim.SGD(model.parameters(), lr=training_cfg.learning_rate)
     loss_fn = nn.MSELoss()
 
     viz_num_points = 200

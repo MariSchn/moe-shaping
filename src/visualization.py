@@ -69,10 +69,16 @@ def top_expert_visualization(
 
     with torch.inference_mode():
         output = model(x)
-    top_expert = output["selected_experts"][:, 0]
+    selected_experts = output["selected_experts"]
+    top_k = selected_experts.shape[1]
 
     fig, ax = plt.subplots()
-    ax.plot(x.detach().cpu(), top_expert.detach().cpu(), label="Top Expert")
+    for k in range(top_k):
+        ax.plot(
+            x.detach().cpu(),
+            selected_experts[:, k].detach().cpu(),
+            label=f"Top-{k + 1} Expert",
+        )
 
     breakpoints = None
     if target_function is not None:
@@ -97,7 +103,7 @@ def top_expert_visualization(
     return {
         "figure": fig,
         "x": x,
-        "top_expert": top_expert,
+        "selected_experts": selected_experts,
         "breakpoints": breakpoints,
     }
 
@@ -217,8 +223,9 @@ def export_training_animation_visualization(
     )
     # gating_scores: (n_frames, num_points, num_experts)
     all_router_y = np.array([f["gating_scores"].numpy() for f in viz_frames])
-    # selected_experts top-1: (n_frames, num_points)
-    all_top_experts = [f["selected_experts"][:, 0].numpy() for f in viz_frames]
+    # selected_experts: (n_frames, num_points, top_k)
+    all_top_experts = [f["selected_experts"].numpy() for f in viz_frames]
+    top_k = all_top_experts[0].shape[1]
     # step numbers
     steps = [f["step"] for f in viz_frames]
 
@@ -296,26 +303,31 @@ def export_training_animation_visualization(
 
     _save_animation(fig, model_update, model_init, "model.gif")
 
-    # ===== 2. TOP EXPERT VISUALIZATION =====
+    # ===== 2. TOP-K EXPERT VISUALIZATION =====
     fig, ax = plt.subplots()
-    (line_te,) = ax.plot(x_np, np.zeros(num_points), label="Top Expert", color="blue")
+    te_lines = []
+    for k in range(top_k):
+        (ln,) = ax.plot(x_np, np.zeros(num_points), label=f"Top-{k + 1} Expert")
+        te_lines.append(ln)
     _add_breakpoints(ax)
     ax.legend()
     ax.set_xlim(domain)
     ax.set_yticks(range(num_experts))
     ax.set_ylim(-0.1, num_experts - 0.9)
-    ax.set_title("Top Expert Visualization")
+    ax.set_title("Top-k Expert Visualization")
     ft = _add_frame_text(ax)
 
     def te_init():
-        line_te.set_ydata(np.full(num_points, np.nan))
+        for ln in te_lines:
+            ln.set_ydata(np.full(num_points, np.nan))
         ft.set_text("")
-        return (line_te, ft)
+        return (*te_lines, ft)
 
     def te_update(i):
-        line_te.set_ydata(all_top_experts[i])
+        for k, ln in enumerate(te_lines):
+            ln.set_ydata(all_top_experts[i][:, k])
         ft.set_text(_step_label(i))
-        return (line_te, ft)
+        return (*te_lines, ft)
 
     _save_animation(fig, te_update, te_init, "top_expert.gif")
 
