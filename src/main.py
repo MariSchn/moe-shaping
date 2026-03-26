@@ -132,10 +132,12 @@ def main() -> None:
             "per_expert_grad_norm",
             "per_expert_sample_count",
         ]
+        log_dict = {}
         for name in gif_names:
             path = os.path.join(output_dir, f"{name}.gif")
             if os.path.exists(path):
-                wandb.log({f"animations/{name}": wandb.Video(path, format="gif")})
+                log_dict[f"animations/{name}"] = wandb.Video(path, format="gif")
+        wandb.log(log_dict)
 
 
 if __name__ == "__main__":
