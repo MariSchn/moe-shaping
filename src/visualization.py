@@ -81,7 +81,11 @@ def top_expert_visualization(
         breakpoints = inner_breakpoints
         for i, bp in enumerate(inner_breakpoints.tolist()):
             ax.axvline(
-                bp, color="red", linestyle="--", linewidth=1, label="GT Breakpoints"
+                bp,
+                color="red",
+                linestyle="--",
+                linewidth=1,
+                label="GT Breakpoints" if i == 0 else None,
             )
 
     ax.legend()
@@ -127,7 +131,11 @@ def router_visualization(
         breakpoints = inner_breakpoints
         for i, bp in enumerate(inner_breakpoints.tolist()):
             ax.axvline(
-                bp, color="red", linestyle="--", linewidth=1, label="GT Breakpoints"
+                bp,
+                color="red",
+                linestyle="--",
+                linewidth=1,
+                label="GT Breakpoints" if i == 0 else None,
             )
 
     ax.legend()
@@ -255,9 +263,13 @@ def export_training_animation_visualization(
 
     def _add_breakpoints(ax):
         if breakpoints is not None:
-            for bp in breakpoints:
+            for i, bp in enumerate(breakpoints):
                 ax.axvline(
-                    bp, color="red", linestyle="--", linewidth=1, label="GT Breakpoints"
+                    bp,
+                    color="red",
+                    linestyle="--",
+                    linewidth=1,
+                    label="GT Breakpoints" if i == 0 else None,
                 )
 
     # ===== 1. MODEL VISUALIZATION =====
