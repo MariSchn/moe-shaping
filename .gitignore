@@ -8,4 +8,6 @@ wandb/
 
 .vscode/
 
+outputs/
+
 playground.ipynb

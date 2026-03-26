@@ -1,15 +1,17 @@
+output_dir: "./outputs/default"
+
 target:
   num_pieces: 2
   domain: [-1, 1]
 
 model:
-  num_experts: 2
+  num_experts: 5
   input_dim: 1
   output_dim: 1
-  router_top_k: 1
+  router_top_k: 2
 
 training:
-  num_steps: 1000
+  num_steps: 100
   batch_size: 100
   learning_rate: 0.01
 
@@ -20,5 +22,5 @@ wandb:
   enabled: true
   project: moe-shaping
   entity: mari-schn
-  run_name: debug
+  run_name: random_initialization
   run_tags: []

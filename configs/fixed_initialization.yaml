@@ -1,3 +1,5 @@
+output_dir: "./outputs/fixed_initialization"
+
 target:
   num_pieces: 2
   domain: [-1, 1]

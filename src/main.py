@@ -1,27 +1,23 @@
 import argparse
+import os
 
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
-import wandb
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
-
-from targets import PiecewiseLinearTarget
+import wandb
 from models import Model
+from targets import PiecewiseLinearTarget
 from utils import (
-    get_device,
     calculate_per_expert_loss,
     gating_gradient_norm,
+    get_device,
     per_expert_gradient_norm,
     sample_uniformly,
 )
 from visualization import (
-    model_visualization,
-    top_expert_visualization,
-    router_visualization,
-    expert_visualization,
+    export_training_animation_visualization,
 )
 
 
@@ -50,22 +46,24 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=training_cfg.learning_rate)
     loss_fn = nn.MSELoss()
 
-    logging_cfg = cfg.logging
-    wandb_cfg = cfg.wandb
-    if wandb_cfg.enabled:
+    viz_num_points = 200
+    viz_x = torch.linspace(
+        domain[0], domain[1], viz_num_points, device=device
+    ).unsqueeze(-1)
+    viz_frames = []
+
+    output_dir = cfg.output_dir or "./outputs"
+    os.makedirs(output_dir, exist_ok=True)
+
+    use_wandb = cfg.wandb.enabled
+    if use_wandb:
         wandb.init(
-            project=wandb_cfg.project,
-            entity=wandb_cfg.entity,
-            name=wandb_cfg.run_name,
-            tags=wandb_cfg.run_tags,
+            project=cfg.wandb.project,
+            entity=cfg.wandb.entity,
+            name=cfg.wandb.run_name,
+            tags=cfg.wandb.run_tags,
             config=cfg,
         )
-        expert_loss_steps: list[int] = []
-        expert_loss_ys: list[list[float]] = [[] for _ in range(model_cfg.num_experts)]
-        expert_grad_norm_ys: list[list[float]] = [
-            [] for _ in range(model_cfg.num_experts)
-        ]
-        expert_series_keys = [f"expert_{e}" for e in range(model_cfg.num_experts)]
 
     pbar = tqdm(range(training_cfg.num_steps), desc="Training")
     for step in pbar:
@@ -80,80 +78,62 @@ def main() -> None:
         loss.backward()
 
         # ===== LOGGING =====
-        if wandb_cfg.enabled:
-            log_dict = {
-                "train/loss": loss.item(),
-                "train/router_grad_norm": gating_gradient_norm(model),
-            }
+        per_expert_grad_norms = per_expert_gradient_norm(model)
+        per_expert_losses = calculate_per_expert_loss(
+            output["expert_outputs"].detach(),
+            output["selected_experts"],
+            y,
+            torch.nn.functional.mse_loss,
+        ).cpu()
 
-            per_expert_grad_norm = per_expert_gradient_norm(model)
-
-            per_expert_loss = (
-                calculate_per_expert_loss(
-                    output["expert_outputs"],
-                    output["selected_experts"],
-                    y,
-                    torch.nn.functional.mse_loss,
-                )
-                .detach()
-                .cpu()
-                .tolist()
+        if use_wandb:
+            wandb.log(
+                {
+                    "loss": loss.item(),
+                    "gating_grad_norm": gating_gradient_norm(model),
+                }
             )
 
-            if step % logging_cfg.log_plots_every_n_steps == 0:
-                fig = model_visualization(model, domain, 100, target_function)["figure"]
-                log_dict["plots/model"] = wandb.Image(fig)
-                plt.close(fig)
-
-                fig = top_expert_visualization(model, domain, 100, target_function)[
-                    "figure"
-                ]
-                log_dict["plots/top_expert"] = wandb.Image(fig)
-                plt.close(fig)
-
-                fig = router_visualization(model, domain, 100, target_function)[
-                    "figure"
-                ]
-                log_dict["plots/router"] = wandb.Image(fig)
-                plt.close(fig)
-
-                fig = expert_visualization(model, domain, 100)["figure"]
-                log_dict["plots/expert"] = wandb.Image(fig)
-                plt.close(fig)
-
-            expert_loss_steps.append(step)
-            for e, v in enumerate(per_expert_loss):
-                expert_loss_ys[e].append(v)
-            for e, v in enumerate(per_expert_grad_norm):
-                expert_grad_norm_ys[e].append(v)
-
-            wandb.log(log_dict, step=step)
+        # ===== VISUALIZATION SNAPSHOT =====
+        with torch.inference_mode():
+            viz_output = model(viz_x)
+        viz_frames.append(
+            {
+                "step": step,
+                "predictions": viz_output["predictions"].cpu(),
+                "gating_scores": viz_output["gating_scores"].cpu(),
+                "expert_outputs": viz_output["expert_outputs"].cpu(),
+                "selected_experts": viz_output["selected_experts"].cpu(),
+                "per_expert_loss": per_expert_losses,
+                "per_expert_grad_norm": per_expert_grad_norms,
+            }
+        )
 
         optimizer.step()
         pbar.set_postfix({"loss": loss.item()})
 
-    if wandb_cfg.enabled:
-        if expert_loss_steps:
-            wandb.log(
-                {
-                    "per_expert_loss": wandb.plot.line_series(
-                        expert_loss_steps,
-                        expert_loss_ys,
-                        keys=expert_series_keys,
-                        title="Per-Expert Loss",
-                        xname="step",
-                    ),
-                    "per_expert_grad_norm": wandb.plot.line_series(
-                        expert_loss_steps,
-                        expert_grad_norm_ys,
-                        keys=expert_series_keys,
-                        title="Per-Expert Gradient Norm",
-                        xname="step",
-                    ),
-                },
-                step=expert_loss_steps[-1],
-            )
-        wandb.finish()
+    export_training_animation_visualization(
+        viz_frames=viz_frames,
+        viz_x=viz_x.cpu(),
+        output_dir=output_dir,
+        domain=tuple(domain),
+        target_function=target_function,
+    )
+
+    if use_wandb:
+        gif_names = [
+            "model",
+            "top_expert",
+            "router",
+            "expert",
+            "per_expert_loss",
+            "per_expert_grad_norm",
+            "per_expert_sample_count",
+        ]
+        for name in gif_names:
+            path = os.path.join(output_dir, f"{name}.gif")
+            if os.path.exists(path):
+                wandb.log({f"animations/{name}": wandb.Video(path, format="gif")})
 
 
 if __name__ == "__main__":
