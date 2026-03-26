@@ -28,26 +28,40 @@ class Model(nn.Module):
         self.gating_function = nn.Linear(input_dim, num_experts, bias=True)
 
         # Insert hard-coded weights and biases if provided
+        self.set_initial_weights(
+            initial_expert_weights,
+            initial_expert_biases,
+            initial_gating_weights,
+            initial_gating_biases,
+        )
+
+    def set_initial_weights(
+        self,
+        initial_expert_weights: list[list[float]],
+        initial_expert_biases: list[list[float]],
+        initial_gating_weights: list[list[float]],
+        initial_gating_biases: list[float],
+    ):
         if initial_expert_weights is not None:
-            assert len(initial_expert_weights) == num_experts, (
-                f"Initial weights must have {num_experts} elements, got {len(initial_expert_weights)}"
+            assert len(initial_expert_weights) == self.num_experts, (
+                f"Initial weights must have {self.num_experts} elements, got {len(initial_expert_weights)}"
             )
-            for i in range(num_experts):
+            for i in range(self.num_experts):
                 self.experts[i].weight.data = torch.tensor(initial_expert_weights[i])
         if initial_expert_biases is not None:
-            assert len(initial_expert_biases) == num_experts, (
-                f"Initial biases must have {num_experts} elements, got {len(initial_expert_biases)}"
+            assert len(initial_expert_biases) == self.num_experts, (
+                f"Initial biases must have {self.num_experts} elements, got {len(initial_expert_biases)}"
             )
-            for i in range(num_experts):
+            for i in range(self.num_experts):
                 self.experts[i].bias.data = torch.tensor(initial_expert_biases[i])
         if initial_gating_weights is not None:
-            assert len(initial_gating_weights) == num_experts, (
-                f"Initial gating weights must have {num_experts} elements, got {len(initial_gating_weights)}"
+            assert len(initial_gating_weights) == self.num_experts, (
+                f"Initial gating weights must have {self.num_experts} elements, got {len(initial_gating_weights)}"
             )
             self.gating_function.weight.data = torch.tensor(initial_gating_weights)
         if initial_gating_biases is not None:
-            assert len(initial_gating_biases) == num_experts, (
-                f"Initial gating biases must have {num_experts} elements, got {len(initial_gating_biases)}"
+            assert len(initial_gating_biases) == self.num_experts, (
+                f"Initial gating biases must have {self.num_experts} elements, got {len(initial_gating_biases)}"
             )
             self.gating_function.bias.data = torch.tensor(initial_gating_biases)
 

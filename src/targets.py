@@ -31,21 +31,29 @@ class PiecewiseLinearTarget:
             raise ValueError(f"Invalid breakpoint mode: {breakpoint_mode}")
 
         # Override with hard-coded values if provided
+        self.set_initial_weights(slopes, intercepts, breakpoints)
+
+    def set_initial_weights(
+        self,
+        slopes: list[list[float]],
+        intercepts: list[list[float]],
+        breakpoints: torch.Tensor,
+    ):
         if slopes is not None:
-            assert len(slopes) == num_pieces, (
-                f"Slopes must have {num_pieces} elements, got {len(slopes)}"
+            assert len(slopes) == self.num_pieces, (
+                f"Slopes must have {self.num_pieces} elements, got {len(slopes)}"
             )
-            self.slopes = torch.tensor(slopes, device=device)
+            self.slopes = torch.tensor(slopes, device=self.device)
         if intercepts is not None:
-            assert len(intercepts) == num_pieces, (
-                f"Intercepts must have {num_pieces} elements, got {len(intercepts)}"
+            assert len(intercepts) == self.num_pieces, (
+                f"Intercepts must have {self.num_pieces} elements, got {len(intercepts)}"
             )
-            self.intercepts = torch.tensor(intercepts, device=device)
+            self.intercepts = torch.tensor(intercepts, device=self.device)
         if breakpoints is not None:
-            assert len(breakpoints) == num_pieces + 1, (
-                f"Breakpoints must have {num_pieces + 1} elements, got {len(breakpoints)}"
+            assert len(breakpoints) == self.num_pieces + 1, (
+                f"Breakpoints must have {self.num_pieces + 1} elements, got {len(breakpoints)}"
             )
-            self.breakpoints = torch.tensor(breakpoints, device=device)
+            self.breakpoints = torch.tensor(breakpoints, device=self.device)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         indices = torch.bucketize(x, self.breakpoints) - 1
