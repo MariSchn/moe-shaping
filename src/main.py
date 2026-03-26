@@ -60,7 +60,8 @@ def main() -> None:
         wandb.init(
             project=cfg.wandb.project,
             entity=cfg.wandb.entity,
-            name=cfg.wandb.run_name,
+            name=cfg.wandb.run_name
+            or f"e{model_cfg.num_experts}_a{model_cfg.router_top_k}_p{target_cfg.num_pieces}",
             tags=cfg.wandb.run_tags,
             config=cfg,
         )
@@ -106,6 +107,7 @@ def main() -> None:
                 "selected_experts": viz_output["selected_experts"].cpu(),
                 "per_expert_loss": per_expert_losses,
                 "per_expert_grad_norm": per_expert_grad_norms,
+                "train_selected_experts": output["selected_experts"].detach().cpu(),
             }
         )
 

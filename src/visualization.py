@@ -439,7 +439,9 @@ def export_training_animation_visualization(
     # ===== 7. PER EXPERT SAMPLE COUNT (BAR CHART) =====
     all_expert_counts = np.array(
         [
-            np.bincount(f["selected_experts"].numpy().ravel(), minlength=num_experts)
+            np.bincount(
+                f["train_selected_experts"].numpy().ravel(), minlength=num_experts
+            )
             for f in viz_frames
         ]
     )
