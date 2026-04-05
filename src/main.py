@@ -1,6 +1,7 @@
 import argparse
 import os
 
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
@@ -17,7 +18,11 @@ from utils import (
     sample_uniformly,
 )
 from visualization import (
+    expert_visualization,
     export_training_animation_visualization,
+    model_visualization,
+    router_visualization,
+    top_expert_visualization,
 )
 
 
@@ -66,6 +71,31 @@ def main() -> None:
             config=cfg,
         )
 
+    def log_static_visualizations(panel_prefix):
+        viz_kwargs = dict(
+            model=model,
+            domain=tuple(domain),
+            num_points=viz_num_points,
+            target_function=target_function,
+        )
+        figs = {
+            "model": model_visualization(**viz_kwargs)["figure"],
+            "top_expert": top_expert_visualization(**viz_kwargs)["figure"],
+            "router": router_visualization(**viz_kwargs)["figure"],
+            "expert": expert_visualization(**viz_kwargs)["figure"],
+        }
+        if use_wandb:
+            wandb.log(
+                {
+                    f"{panel_prefix}/{name}": wandb.Image(fig)
+                    for name, fig in figs.items()
+                }
+            )
+        for fig in figs.values():
+            plt.close(fig)
+
+    log_static_visualizations("initialization")
+
     pbar = tqdm(range(training_cfg.num_steps), desc="Training")
     for step in pbar:
         # ===== TRAINING =====
@@ -113,6 +143,8 @@ def main() -> None:
 
         optimizer.step()
         pbar.set_postfix({"loss": loss.item()})
+
+    log_static_visualizations("final")
 
     export_training_animation_visualization(
         viz_frames=viz_frames,

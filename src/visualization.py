@@ -163,6 +163,7 @@ def expert_visualization(
     model: nn.Module,
     domain: Tuple[float, float],
     num_points: int,
+    target_function: Optional[PiecewiseLinearTarget] = None,
 ) -> plt.Figure:
     assert model.input_dim == 1, (
         "Model must have a single input dimension for expert visualization"
@@ -178,9 +179,15 @@ def expert_visualization(
         output = model(x)
     expert_outputs = output["expert_outputs"]
 
+    y_target = None
+    if target_function is not None:
+        y_target = target_function(x)
+
     fig, ax = plt.subplots()
     for i in range(model.num_experts):
         ax.plot(x.cpu(), expert_outputs[:, i, 0].cpu(), label=f"Expert {i}")
+    if y_target is not None:
+        ax.plot(x.cpu(), y_target.cpu(), label="Target", linestyle="--")
     ax.legend()
     ax.set_xlim(domain)
     ax.set_title("Expert Visualization")
@@ -347,7 +354,7 @@ def _build_router_animation(
 
 
 def _build_expert_animation(
-    filepath, x_np, all_expert_y, num_experts, domain, expert_ylim, steps, fps
+    filepath, x_np, all_expert_y, num_experts, domain, expert_ylim, y_target, steps, fps
 ):
     matplotlib.use("Agg")
     num_points = len(x_np)
@@ -356,6 +363,8 @@ def _build_expert_animation(
     for i in range(num_experts):
         (ln,) = ax.plot(x_np, np.zeros(num_points), label=f"Expert {i}")
         lines.append(ln)
+    if y_target is not None:
+        ax.plot(x_np, y_target, label="Target", color="red", linestyle="--")
     ax.legend()
     ax.set_xlim(domain)
     ax.set_ylim(expert_ylim)
@@ -413,7 +422,7 @@ def export_training_animation_visualization(
     output_dir: str,
     domain: Tuple[float, float] = (-1, 1),
     target_function: Optional[PiecewiseLinearTarget] = None,
-    fps: int = 20,
+    fps: int = 5,
 ) -> None:
     os.makedirs(output_dir, exist_ok=True)
 
@@ -461,7 +470,7 @@ def export_training_animation_visualization(
 
     expert_indices = np.arange(num_experts)
     model_ylim = _ylim(all_model_y, y_target)
-    expert_ylim = _ylim(all_expert_y)
+    expert_ylim = _ylim(all_expert_y, y_target)
     router_ylim = _ylim(all_router_y)
 
     def path(name):
@@ -512,6 +521,7 @@ def export_training_animation_visualization(
                 num_experts,
                 domain,
                 expert_ylim,
+                y_target,
                 steps,
                 fps,
             ),
