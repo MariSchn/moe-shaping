@@ -261,7 +261,7 @@ def _save_animation(fig, update_fn, init_fn, filepath, n_frames, fps):
         interval=50,
         blit=True,
     )
-    ani.save(filepath, writer="pillow", fps=fps)
+    ani.save(filepath, writer="ffmpeg", fps=fps)
     plt.close(fig)
 
 
@@ -500,7 +500,7 @@ def export_training_animation_visualization(
         futures = [
             pool.submit(
                 _build_model_animation,
-                path("model.gif"),
+                path("model.mp4"),
                 x_np,
                 all_model_y,
                 y_target,
@@ -511,7 +511,7 @@ def export_training_animation_visualization(
             ),
             pool.submit(
                 _build_top_expert_animation,
-                path("top_expert.gif"),
+                path("top_expert.mp4"),
                 x_np,
                 all_top_experts,
                 top_k,
@@ -523,7 +523,7 @@ def export_training_animation_visualization(
             ),
             pool.submit(
                 _build_router_animation,
-                path("router.gif"),
+                path("router.mp4"),
                 x_np,
                 all_router_y,
                 num_experts,
@@ -535,7 +535,7 @@ def export_training_animation_visualization(
             ),
             pool.submit(
                 _build_expert_animation,
-                path("expert.gif"),
+                path("expert.mp4"),
                 x_np,
                 all_expert_y,
                 num_experts,
@@ -547,7 +547,7 @@ def export_training_animation_visualization(
             ),
             pool.submit(
                 _build_bar_animation,
-                path("per_expert_loss.gif"),
+                path("per_expert_loss.mp4"),
                 all_per_expert_loss,
                 expert_indices,
                 (0, float(np.nanmax(all_per_expert_loss)) * 1.1),
@@ -558,7 +558,7 @@ def export_training_animation_visualization(
             ),
             pool.submit(
                 _build_bar_animation,
-                path("per_expert_grad_norm.gif"),
+                path("per_expert_grad_norm.mp4"),
                 all_per_expert_grad_norm,
                 expert_indices,
                 (0, float(all_per_expert_grad_norm.max()) * 1.1),
@@ -569,7 +569,7 @@ def export_training_animation_visualization(
             ),
             pool.submit(
                 _build_bar_animation,
-                path("per_expert_sample_count.gif"),
+                path("per_expert_sample_count.mp4"),
                 all_expert_counts,
                 expert_indices,
                 (0, int(all_expert_counts.max()) + 1),
@@ -580,7 +580,7 @@ def export_training_animation_visualization(
             ),
             pool.submit(
                 _build_bar_animation,
-                path("routing_biases.gif"),
+                path("routing_biases.mp4"),
                 all_routing_biases,
                 expert_indices,
                 _ylim(all_routing_biases),

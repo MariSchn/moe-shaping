@@ -186,9 +186,9 @@ def main() -> None:
         ]
         log_dict = {}
         for name in gif_names:
-            path = os.path.join(output_dir, f"{name}.gif")
+            path = os.path.join(output_dir, f"{name}.mp4")
             if os.path.exists(path):
-                log_dict[f"animations/{name}"] = wandb.Video(path, format="gif")
+                log_dict[f"animations/{name}"] = wandb.Video(path, format="mp4")
         wandb.log(log_dict)
 
 
