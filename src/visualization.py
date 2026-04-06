@@ -126,10 +126,12 @@ def router_visualization(
     slopes = model.gating_function.weight.detach()
     intercepts = model.gating_function.bias.detach()
 
+    routing_biases = model.routing_biases.detach()
+
     fig, ax = plt.subplots()
 
     for i in range(model.num_experts):
-        y = slopes[i] * x + intercepts[i]
+        y = slopes[i] * x + intercepts[i] + routing_biases[i]
         ax.plot(x.cpu(), y.cpu(), label=f"Expert {i} Vector")
 
     breakpoints = None

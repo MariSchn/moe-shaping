@@ -27,6 +27,9 @@ class Model(nn.Module):
         )
         self.gating_function = nn.Linear(input_dim, num_experts, bias=True)
 
+        # Auxiliary loss-free load balancing (ignored if cfg.training.load_balancing_loss_weight < 0)
+        self.register_buffer("routing_biases", torch.zeros(num_experts))
+
         # Insert hard-coded weights and biases if provided
         self.set_initial_weights(
             initial_expert_weights,
@@ -65,6 +68,44 @@ class Model(nn.Module):
             )
             self.gating_function.bias.data = torch.tensor(initial_gating_biases)
 
+    def update_routing_biases(
+        self,
+        selected_experts: torch.Tensor,
+        gamma: float = 1e-3,
+        target_load: float | None = None,
+    ):
+        if gamma <= 0:
+            return
+
+        B, _ = selected_experts.shape
+
+        # Use uniform load as default target load
+        target_load = target_load or self.router_top_k / self.num_experts
+
+        # Calculate the mean load of each expert
+        expert_counts = torch.zeros(self.num_experts, device=selected_experts.device)
+        expert_counts.scatter_add_(
+            0,
+            selected_experts.flatten(),
+            torch.ones(selected_experts.numel(), device=selected_experts.device),
+        )
+        expert_loads = expert_counts / B
+
+        # Calculate the difference between the expert load and the target load
+        load_differences = expert_loads - target_load
+
+        bias_updates = torch.zeros(self.num_experts, device=selected_experts.device)
+        bias_updates[load_differences < 0] = gamma
+        bias_updates[load_differences > 0] = -gamma
+
+        # Update the routing biases
+        self.routing_biases += bias_updates
+
+        print(f"Gamma: {gamma}")
+        print(f"Load differences: {load_differences}")
+        print(f"Bias updates: {bias_updates}")
+        print(f"Routing biases: {self.routing_biases}")
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
         assert x.ndim == 2, f"Input must be a 2D tensor (B, D), got {x.ndim}D"
@@ -74,9 +115,10 @@ class Model(nn.Module):
 
         # Routing
         gating_scores = self.gating_function(x)  # (B, num_experts)
-        top_k_scores, top_k_indices = torch.topk(
-            gating_scores, self.router_top_k, dim=1
+        _, top_k_indices = torch.topk(
+            gating_scores + self.routing_biases, self.router_top_k, dim=1
         )  # (B, top_k) each
+        top_k_scores = torch.gather(gating_scores, dim=1, index=top_k_indices)
 
         # Run all experts on the input (inefficient, but simple)
         # Shape: (B, num_experts, output_dim)

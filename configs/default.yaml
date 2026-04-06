@@ -14,8 +14,10 @@ training:
   num_steps: 100
   batch_size: 100
   learning_rate: 0.01
-  # Controls the weight of the Switch Transformer-style load balancing loss (1e-2 from paper).
-  load_balancing_loss_weight: 1e-2
+  # Controls the weight of the Switch Transformer-style load balancing loss (1e-2 default from paper).
+  load_balancing_loss_weight: 0.0
+  # DeepSeek V3 auxiliary loss-free load balancing gamma, controlling how much is added/subtracted to under/over-utilized experts (1e-3 default from paper)
+  auxiliarly_loss_free_load_balancing_gamma: 1e-3
 
 logging:
   log_plots_every_n_steps: 100

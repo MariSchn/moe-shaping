@@ -154,6 +154,10 @@ def main() -> None:
         )
 
         optimizer.step()
+        model.update_routing_biases(
+            output["selected_experts"],
+            training_cfg.auxiliarly_loss_free_load_balancing_gamma,
+        )
         pbar.set_postfix({"loss": loss.item()})
 
     log_static_visualizations("final")
