@@ -22,6 +22,42 @@ def sample_uniformly(domain: Tuple[float, float], batch_size: int) -> torch.Tens
     return (domain[1] - domain[0]) * torch.rand(batch_size, 1) + domain[0]
 
 
+def calculate_load_balancing_loss(
+    gating_scores: torch.Tensor,
+    selected_experts: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Auxiliary load balancing loss to encourage uniform expert utilization.
+
+    Follows Switch Transformer: L = num_experts * sum_i(f_i * P_i)
+    where f_i is the fraction of tokens dispatched to expert i (non-differentiable)
+    and P_i is the mean softmax router probability for expert i (differentiable).
+
+    Args:
+        gating_scores: (B, num_experts) raw router logits
+        selected_experts: (B, top_k) indices of selected experts
+
+    Returns:
+        Scalar load balancing loss.
+    """
+    B, num_experts = gating_scores.shape
+
+    # P_i: mean softmax probability for each expert over the batch (differentiable)
+    router_probs = torch.softmax(gating_scores, dim=-1)  # (B, num_experts)
+    P = router_probs.mean(dim=0)  # (num_experts,)
+
+    # f_i: fraction of tokens routed to each expert (non-differentiable)
+    expert_counts = torch.zeros(num_experts, device=gating_scores.device)
+    expert_counts.scatter_add_(
+        0,
+        selected_experts.flatten(),
+        torch.ones(selected_experts.numel(), device=gating_scores.device),
+    )
+    f = expert_counts / B
+
+    return num_experts * (f * P).sum()
+
+
 def calculate_per_expert_loss(
     expert_outputs: torch.Tensor,
     selected_experts: torch.Tensor,
