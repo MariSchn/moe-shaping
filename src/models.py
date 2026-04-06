@@ -101,11 +101,6 @@ class Model(nn.Module):
         # Update the routing biases
         self.routing_biases += bias_updates
 
-        print(f"Gamma: {gamma}")
-        print(f"Load differences: {load_differences}")
-        print(f"Bias updates: {bias_updates}")
-        print(f"Routing biases: {self.routing_biases}")
-
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
         assert x.ndim == 2, f"Input must be a 2D tensor (B, D), got {x.ndim}D"
