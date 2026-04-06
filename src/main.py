@@ -23,6 +23,7 @@ from visualization import (
     export_training_animation_visualization,
     model_visualization,
     router_visualization,
+    routing_bias_visualization,
     top_expert_visualization,
 )
 
@@ -84,6 +85,7 @@ def main() -> None:
             "top_expert": top_expert_visualization(**viz_kwargs)["figure"],
             "router": router_visualization(**viz_kwargs)["figure"],
             "expert": expert_visualization(**viz_kwargs)["figure"],
+            "routing_bias": routing_bias_visualization(model)["figure"],
         }
         if use_wandb:
             wandb.log(
@@ -150,6 +152,7 @@ def main() -> None:
                 "per_expert_loss": per_expert_losses,
                 "per_expert_grad_norm": per_expert_grad_norms,
                 "train_selected_experts": output["selected_experts"].detach().cpu(),
+                "routing_biases": model.routing_biases.detach().cpu(),
             }
         )
 
@@ -179,6 +182,7 @@ def main() -> None:
             "per_expert_loss",
             "per_expert_grad_norm",
             "per_expert_sample_count",
+            "routing_biases",
         ]
         log_dict = {}
         for name in gif_names:

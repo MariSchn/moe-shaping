@@ -201,6 +201,22 @@ def expert_visualization(
     }
 
 
+def routing_bias_visualization(model: nn.Module) -> dict:
+    biases = model.routing_biases.detach().cpu().numpy()
+    num_experts = len(biases)
+    expert_indices = np.arange(num_experts)
+
+    fig, ax = plt.subplots()
+    ax.bar(expert_indices, biases)
+    ax.set_xticks(expert_indices)
+    ax.set_xticklabels([f"Expert {i}" for i in expert_indices])
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.set_ylabel("Bias")
+    ax.set_title("Routing Biases")
+
+    return {"figure": fig, "biases": biases}
+
+
 def _ylim(data, extra=None):
     ymin, ymax = float(data.min()), float(data.max())
     if extra is not None:
@@ -450,6 +466,8 @@ def export_training_animation_visualization(
     top_k = all_top_experts[0].shape[1]
     steps = [f["step"] for f in viz_frames]
 
+    all_routing_biases = np.array([f["routing_biases"].numpy() for f in viz_frames])
+
     all_per_expert_loss = np.array(
         [
             f["per_expert_loss"].numpy()
@@ -557,6 +575,17 @@ def export_training_animation_visualization(
                 (0, int(all_expert_counts.max()) + 1),
                 "Sample Count",
                 "Per Expert Sample Count",
+                steps,
+                fps,
+            ),
+            pool.submit(
+                _build_bar_animation,
+                path("routing_biases.gif"),
+                all_routing_biases,
+                expert_indices,
+                _ylim(all_routing_biases),
+                "Bias",
+                "Routing Biases",
                 steps,
                 fps,
             ),
