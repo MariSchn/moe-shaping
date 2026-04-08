@@ -11,14 +11,14 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
 from utils import model_device
-from targets import PiecewiseLinearTarget
+from targets import TargetFunction
 
 
 def model_visualization(
     model: nn.Module,
     domain: Tuple[float, float],
     num_points: int,
-    target_function: Optional[PiecewiseLinearTarget] = None,
+    target_function: Optional[TargetFunction] = None,
 ):
     assert model.output_dim == 1, (
         "Model must have a single output dimension for visualization"
@@ -60,7 +60,7 @@ def top_expert_visualization(
     model: nn.Module,
     domain: Tuple[float, float],
     num_points: int,
-    target_function: Optional[PiecewiseLinearTarget] = None,
+    target_function: Optional[TargetFunction] = None,
 ) -> plt.Figure:
     assert model.input_dim == 1, (
         "Model must have a single input dimension for router visualization"
@@ -83,9 +83,9 @@ def top_expert_visualization(
         )
 
     breakpoints = None
-    if target_function is not None:
-        inner_breakpoints = target_function.breakpoints.detach().cpu()
-        inner_breakpoints = inner_breakpoints[1:-1]
+    if target_function is not None and target_function.breakpoints is not None:
+        all_bps = target_function.breakpoints.detach().cpu()
+        inner_breakpoints = all_bps[(all_bps > domain[0]) & (all_bps < domain[1])]
         breakpoints = inner_breakpoints
         for i, bp in enumerate(inner_breakpoints.tolist()):
             ax.axvline(
@@ -114,7 +114,7 @@ def router_visualization(
     model: nn.Module,
     domain: Tuple[float, float],
     num_points: int,
-    target_function: Optional[PiecewiseLinearTarget] = None,
+    target_function: Optional[TargetFunction] = None,
 ) -> plt.Figure:
     assert model.input_dim == 1, (
         "Model must have a single input dimension for router visualization"
@@ -135,9 +135,9 @@ def router_visualization(
         ax.plot(x.cpu(), y.cpu(), label=f"Expert {i} Vector")
 
     breakpoints = None
-    if target_function is not None:
-        inner_breakpoints = target_function.breakpoints.detach().cpu()
-        inner_breakpoints = inner_breakpoints[1:-1]
+    if target_function is not None and target_function.breakpoints is not None:
+        all_bps = target_function.breakpoints.detach().cpu()
+        inner_breakpoints = all_bps[(all_bps > domain[0]) & (all_bps < domain[1])]
         breakpoints = inner_breakpoints
         for i, bp in enumerate(inner_breakpoints.tolist()):
             ax.axvline(
@@ -165,7 +165,7 @@ def expert_visualization(
     model: nn.Module,
     domain: Tuple[float, float],
     num_points: int,
-    target_function: Optional[PiecewiseLinearTarget] = None,
+    target_function: Optional[TargetFunction] = None,
 ) -> plt.Figure:
     assert model.input_dim == 1, (
         "Model must have a single input dimension for expert visualization"
@@ -439,8 +439,8 @@ def export_training_animation_visualization(
     viz_x: torch.Tensor,
     output_dir: str,
     domain: Tuple[float, float] = (-1, 1),
-    target_function: Optional[PiecewiseLinearTarget] = None,
-    fps: int = 5,
+    target_function: Optional[TargetFunction] = None,
+    fps: int = 24,
 ) -> None:
     os.makedirs(output_dir, exist_ok=True)
 
@@ -451,10 +451,14 @@ def export_training_animation_visualization(
     y_target = None
     breakpoints = None
     if target_function is not None:
-        target_device = target_function.breakpoints.device
+        bps = target_function.breakpoints
+        target_device = bps.device if bps is not None else viz_x.device
         y_target = target_function(viz_x.to(target_device)).squeeze(-1).cpu().numpy()
-        inner_bp = target_function.breakpoints.detach().cpu()
-        breakpoints = inner_bp[1:-1].tolist()
+        if bps is not None:
+            all_bps = bps.detach().cpu()
+            breakpoints = all_bps[
+                (all_bps > domain[0]) & (all_bps < domain[1])
+            ].tolist()
 
     # Stack all frames into numpy arrays
     all_model_y = np.array([f["predictions"].squeeze(-1).numpy() for f in viz_frames])

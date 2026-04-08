@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 import wandb
 from models import Model
-from targets import PiecewiseLinearTarget
+from targets import ModelTarget, PiecewiseLinearTarget
 from utils import (
     calculate_load_balancing_loss,
     calculate_per_expert_loss,
@@ -44,7 +44,21 @@ def main() -> None:
 
     target_cfg = cfg.target
     domain = target_cfg.domain
-    target_function = PiecewiseLinearTarget(**target_cfg, device=device)
+    target_kwargs = (
+        OmegaConf.to_container(target_cfg.kwargs, resolve=True)
+        if target_cfg.kwargs
+        else {}
+    )
+
+    if target_cfg.type == "piecewise_linear":
+        target_function = PiecewiseLinearTarget(
+            domain=domain, device=device, **target_kwargs
+        )
+    elif target_cfg.type == "model":
+        target_model = Model(**target_kwargs).to(device)
+        target_function = ModelTarget(target_model)
+    else:
+        raise ValueError(f"Unknown target type: {target_cfg.type}")
 
     model_cfg = cfg.model
     model = Model(**model_cfg).to(device)
@@ -171,6 +185,7 @@ def main() -> None:
         output_dir=output_dir,
         domain=tuple(domain),
         target_function=target_function,
+        fps=training_cfg.num_steps // 10,
     )
 
     if use_wandb:
