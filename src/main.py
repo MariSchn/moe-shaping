@@ -63,10 +63,23 @@ def main() -> None:
         raise ValueError(f"Unknown target type: {target_cfg.type}")
 
     model_cfg = cfg.model
-    model = Model(**model_cfg).to(device)
+    freeze_router = model_cfg.get("freeze_router", False)
+    freeze_experts = model_cfg.get("freeze_experts", False)
+    model_init_cfg = OmegaConf.to_container(model_cfg, resolve=True)
+    model_init_cfg.pop("freeze_router", None)
+    model_init_cfg.pop("freeze_experts", None)
+    model = Model(**model_init_cfg).to(device)
+
+    if freeze_router:
+        for p in model.gating_function.parameters():
+            p.requires_grad_(False)
+    if freeze_experts:
+        for p in model.experts.parameters():
+            p.requires_grad_(False)
 
     training_cfg = cfg.training
-    optimizer = torch.optim.SGD(model.parameters(), lr=training_cfg.learning_rate)
+    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
+    optimizer = torch.optim.SGD(trainable_params, lr=training_cfg.learning_rate)
     loss_fn = nn.MSELoss()
 
     viz_num_points = 200

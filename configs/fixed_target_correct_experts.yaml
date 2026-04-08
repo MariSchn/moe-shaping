@@ -34,6 +34,8 @@ model:
   input_dim: 1
   output_dim: 1
   router_top_k: 2
+  freeze_router: false
+  freeze_experts: true
   initial_expert_weights:
     - [[2.0]]
     - [[-1.0]]

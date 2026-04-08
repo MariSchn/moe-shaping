@@ -1,4 +1,4 @@
-output_dir: "./outputs/fixed-target-correct-router"
+output_dir: "./outputs/fixed-inbalanced-target-correct-experts"
 
 target:
   type: model  # "piecewise_linear" or "model"
@@ -22,30 +22,40 @@ target:
       - [-1.0]
       - [-0.5]
       - [0.5]
-      - [1.0]
+      - [4.0]
     initial_gating_biases: 
-      - -0.50
+      - -0.40
+      - -0.00
       - -0.25
-      - -0.25
-      - -0.50
+      - -2.6
 
 model:
   num_experts: 4
   input_dim: 1
   output_dim: 1
   router_top_k: 2
-  freeze_router: true
-  freeze_experts: false
-  initial_gating_weights:
+  freeze_router: false
+  freeze_experts: true
+  initial_expert_weights:
+    - [[2.0]]
+    - [[-1.0]]
+    - [[3.0]]
+    - [[-4.0]]
+  initial_expert_biases:
+    - [2.0]
     - [-1.0]
+    - [0.0]
+    - [3.0]
+  initial_gating_weights:
     - [-0.5]
+    - [-0.0]
+    - [0.25]
     - [0.5]
-    - [1.0]
   initial_gating_biases: 
-    - -0.50
     - -0.25
-    - -0.25
-    - -0.50
+    - -0.5
+    - -0.1
+    - -0.4
 
 training:
   num_steps: 500
@@ -63,5 +73,5 @@ wandb:
   enabled: true
   project: moe-shaping
   entity: mari-schn
-  run_name: fixed-target-correct-router
+  run_name: fixed-inbalanced-target-correct-experts
   run_tags: []
