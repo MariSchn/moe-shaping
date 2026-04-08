@@ -24,6 +24,8 @@ from visualization import (
     model_visualization,
     router_visualization,
     routing_bias_visualization,
+    target_router_visualization,
+    target_visualization,
     top_expert_visualization,
 )
 
@@ -74,7 +76,11 @@ def main() -> None:
     viz_frames = []
 
     output_dir = cfg.output_dir or "./outputs"
-    os.makedirs(output_dir, exist_ok=True)
+    init_dir = os.path.join(output_dir, "init")
+    final_dir = os.path.join(output_dir, "final")
+    anim_dir = os.path.join(output_dir, "anims")
+    for d in (init_dir, final_dir, anim_dir):
+        os.makedirs(d, exist_ok=True)
 
     use_wandb = cfg.wandb.enabled
     if use_wandb:
@@ -87,7 +93,7 @@ def main() -> None:
             config=cfg,
         )
 
-    def log_static_visualizations(panel_prefix):
+    def log_static_visualizations(subdir, panel_prefix):
         viz_kwargs = dict(
             model=model,
             domain=tuple(domain),
@@ -100,7 +106,20 @@ def main() -> None:
             "router": router_visualization(**viz_kwargs)["figure"],
             "expert": expert_visualization(**viz_kwargs)["figure"],
             "routing_bias": routing_bias_visualization(model)["figure"],
+            "target": target_visualization(
+                target_function, tuple(domain), viz_num_points
+            )["figure"],
         }
+        target_router = target_router_visualization(
+            target_function, tuple(domain), viz_num_points
+        )
+        if target_router is not None:
+            figs["target_router"] = target_router["figure"]
+
+        for name, fig in figs.items():
+            fig.savefig(
+                os.path.join(subdir, f"{name}.png"), dpi=150, bbox_inches="tight"
+            )
         if use_wandb:
             wandb.log(
                 {
@@ -111,7 +130,7 @@ def main() -> None:
         for fig in figs.values():
             plt.close(fig)
 
-    log_static_visualizations("initialization")
+    log_static_visualizations(init_dir, "initialization")
 
     pbar = tqdm(range(training_cfg.num_steps), desc="Training")
     for step in pbar:
@@ -177,12 +196,12 @@ def main() -> None:
         )
         pbar.set_postfix({"loss": loss.item()})
 
-    log_static_visualizations("final")
+    log_static_visualizations(final_dir, "final")
 
     export_training_animation_visualization(
         viz_frames=viz_frames,
         viz_x=viz_x.cpu(),
-        output_dir=output_dir,
+        output_dir=anim_dir,
         domain=tuple(domain),
         target_function=target_function,
         fps=training_cfg.num_steps // 10,
@@ -201,7 +220,7 @@ def main() -> None:
         ]
         log_dict = {}
         for name in gif_names:
-            path = os.path.join(output_dir, f"{name}.mp4")
+            path = os.path.join(anim_dir, f"{name}.mp4")
             if os.path.exists(path):
                 log_dict[f"animations/{name}"] = wandb.Video(path, format="mp4")
         wandb.log(log_dict)

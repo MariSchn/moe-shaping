@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
 from utils import model_device
-from targets import TargetFunction
+from targets import ModelTarget, TargetFunction
 
 
 def model_visualization(
@@ -199,6 +199,80 @@ def expert_visualization(
         "x": x,
         "expert_outputs": expert_outputs,
     }
+
+
+def target_visualization(
+    target_function: TargetFunction,
+    domain: Tuple[float, float],
+    num_points: int,
+) -> dict:
+    x = torch.linspace(domain[0], domain[1], num_points).unsqueeze(-1)
+    y = target_function(x).cpu()
+
+    fig, ax = plt.subplots()
+    ax.plot(x, y, label="Target")
+
+    bps = target_function.breakpoints
+    if bps is not None:
+        inner_bps = bps.detach().cpu()
+        inner_bps = inner_bps[(inner_bps > domain[0]) & (inner_bps < domain[1])]
+        for i, bp in enumerate(inner_bps.tolist()):
+            ax.axvline(
+                bp,
+                color="red",
+                linestyle="--",
+                linewidth=1,
+                label="Breakpoints" if i == 0 else None,
+            )
+
+    ax.legend()
+    ax.set_xlim(domain)
+    ax.grid(True)
+    ax.set_title("Target Function")
+
+    return {"figure": fig, "x": x, "y": y}
+
+
+def target_router_visualization(
+    target_function: TargetFunction,
+    domain: Tuple[float, float],
+    num_points: int,
+) -> dict | None:
+    """Visualizes the gating function of a ModelTarget. Returns None for other target types."""
+    if not isinstance(target_function, ModelTarget):
+        return None
+
+    model = target_function.model
+    device = model_device(model)
+    x = torch.linspace(domain[0], domain[1], num_points, device=device).unsqueeze(-1)
+
+    slopes = model.gating_function.weight.detach()
+    intercepts = model.gating_function.bias.detach()
+    routing_biases = model.routing_biases.detach()
+
+    fig, ax = plt.subplots()
+    for i in range(model.num_experts):
+        y = slopes[i] * x + intercepts[i] + routing_biases[i]
+        ax.plot(x.cpu(), y.cpu(), label=f"Expert {i} Vector")
+
+    bps = target_function.breakpoints
+    if bps is not None:
+        inner_bps = bps.detach().cpu()
+        inner_bps = inner_bps[(inner_bps > domain[0]) & (inner_bps < domain[1])]
+        for i, bp in enumerate(inner_bps.tolist()):
+            ax.axvline(
+                bp,
+                color="red",
+                linestyle="--",
+                linewidth=1,
+                label="Breakpoints" if i == 0 else None,
+            )
+
+    ax.legend()
+    ax.set_xlim(domain)
+    ax.set_title("Target Router Visualization")
+
+    return {"figure": fig, "x": x}
 
 
 def routing_bias_visualization(model: nn.Module) -> dict:
