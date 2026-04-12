@@ -105,11 +105,13 @@ def main() -> None:
     optimizer = torch.optim.SGD(trainable_params, lr=training_cfg.learning_rate)
     loss_fn = nn.MSELoss()
 
+    can_visualize = model_cfg.input_dim == 1
+    viz_frames = []
+
     viz_num_points = 200
     viz_x = torch.linspace(
         domain[0], domain[1], viz_num_points, device=device
     ).unsqueeze(-1)
-    viz_frames = []
 
     output_dir = cfg.output_dir or "./outputs"
     init_dir = os.path.join(output_dir, "init")
@@ -155,12 +157,15 @@ def main() -> None:
         for fig in figs.values():
             plt.close(fig)
 
-    log_static_visualizations(init_dir, "initialization")
+    if can_visualize:
+        log_static_visualizations(init_dir, "initialization")
 
     pbar = tqdm(range(training_cfg.num_steps), desc="Training")
     for step in pbar:
         # ===== TRAINING =====
-        x = sample_uniformly(domain, training_cfg.batch_size).to(device)
+        x = sample_uniformly(domain, training_cfg.batch_size, model_cfg.input_dim).to(
+            device
+        )
         y = target_function(x)
 
         output = model(x)
@@ -198,7 +203,7 @@ def main() -> None:
             )
 
         # ===== VISUALIZATION SNAPSHOT =====
-        if step % cfg.logging.anim_sampling_rate == 0:
+        if can_visualize and step % cfg.logging.anim_sampling_rate == 0:
             with torch.inference_mode():
                 viz_output = model(viz_x)
             viz_frames.append(
@@ -222,34 +227,35 @@ def main() -> None:
         )
         pbar.set_postfix({"loss": loss.item()})
 
-    log_static_visualizations(final_dir, "final")
+    if can_visualize:
+        log_static_visualizations(final_dir, "final")
 
-    export_training_animation_visualization(
-        viz_frames=viz_frames,
-        viz_x=viz_x.cpu(),
-        output_dir=anim_dir,
-        domain=tuple(domain),
-        target_function=target_function,
-        fps=len(viz_frames) // 10,
-    )
+        export_training_animation_visualization(
+            viz_frames=viz_frames,
+            viz_x=viz_x.cpu(),
+            output_dir=anim_dir,
+            domain=tuple(domain),
+            target_function=target_function,
+            fps=len(viz_frames) // 10,
+        )
 
-    if use_wandb:
-        gif_names = [
-            "model",
-            "top_expert",
-            "router",
-            "expert",
-            "per_expert_loss",
-            "per_expert_grad_norm",
-            "per_expert_sample_count",
-            "routing_biases",
-        ]
-        log_dict = {}
-        for name in gif_names:
-            path = os.path.join(anim_dir, f"{name}.mp4")
-            if os.path.exists(path):
-                log_dict[f"animations/{name}"] = wandb.Video(path, format="mp4")
-        wandb.log(log_dict)
+        if use_wandb:
+            gif_names = [
+                "model",
+                "top_expert",
+                "router",
+                "expert",
+                "per_expert_loss",
+                "per_expert_grad_norm",
+                "per_expert_sample_count",
+                "routing_biases",
+            ]
+            log_dict = {}
+            for name in gif_names:
+                path = os.path.join(anim_dir, f"{name}.mp4")
+                if os.path.exists(path):
+                    log_dict[f"animations/{name}"] = wandb.Video(path, format="mp4")
+            wandb.log(log_dict)
 
 
 if __name__ == "__main__":

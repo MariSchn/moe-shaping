@@ -29,8 +29,10 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-def sample_uniformly(domain: Tuple[float, float], batch_size: int) -> torch.Tensor:
-    return (domain[1] - domain[0]) * torch.rand(batch_size, 1) + domain[0]
+def sample_uniformly(
+    domain: Tuple[float, float], batch_size: int, input_dim: int = 1
+) -> torch.Tensor:
+    return (domain[1] - domain[0]) * torch.rand(batch_size, input_dim) + domain[0]
 
 
 def calculate_load_balancing_loss(

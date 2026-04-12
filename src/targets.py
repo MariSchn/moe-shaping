@@ -90,12 +90,11 @@ class ModelTarget(TargetFunction):
         self.model.eval()
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        original_shape = x.shape
         model_device = next(self.model.parameters()).device
         x_2d = x.reshape(-1, self.model.input_dim).to(model_device)
         with torch.no_grad():
             output = self.model(x_2d)
-        return output["predictions"].reshape(original_shape).to(x.device)
+        return output["predictions"].to(x.device)
 
     @property
     def breakpoints(self) -> torch.Tensor | None:
