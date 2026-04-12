@@ -4,7 +4,7 @@ target:
   type: model  # "piecewise_linear" or "model"
   domain: [-1, 1]
   kwargs:
-    num_experts: 5
+    num_experts: 4
     input_dim: 1
     output_dim: 1
     router_top_k: 2
@@ -14,6 +14,8 @@ model:
   input_dim: 1
   output_dim: 1
   router_top_k: 2
+  freeze_router: false
+  freeze_experts: false
 
 training:
   num_steps: 500
