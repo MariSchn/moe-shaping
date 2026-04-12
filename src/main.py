@@ -17,6 +17,7 @@ from utils import (
     get_device,
     per_expert_gradient_norm,
     sample_uniformly,
+    set_seed,
 )
 from visualization import (
     expert_visualization,
@@ -42,6 +43,10 @@ def load_config(argv: list[str] | None = None) -> DictConfig:
 
 def main() -> None:
     cfg = load_config()
+
+    if cfg.seed is not None:
+        set_seed(cfg.seed)
+
     device = get_device()
 
     target_cfg = cfg.target

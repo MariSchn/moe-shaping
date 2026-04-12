@@ -1,4 +1,5 @@
 output_dir: "./outputs/fixed-target-correct-router"
+seed: null
 
 target:
   type: model  # "piecewise_linear" or "model"

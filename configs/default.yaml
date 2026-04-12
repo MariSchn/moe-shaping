@@ -1,4 +1,5 @@
 output_dir: "./outputs/model-target"
+seed: null
 
 target:
   type: model  # "piecewise_linear" or "model"
