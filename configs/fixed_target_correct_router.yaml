@@ -57,7 +57,7 @@ training:
   auxiliarly_loss_free_load_balancing_gamma: 0.0
 
 logging:
-  log_plots_every_n_steps: 100
+  anim_sampling_rate: 1
 
 wandb:
   enabled: true

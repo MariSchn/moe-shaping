@@ -186,21 +186,22 @@ def main() -> None:
             )
 
         # ===== VISUALIZATION SNAPSHOT =====
-        with torch.inference_mode():
-            viz_output = model(viz_x)
-        viz_frames.append(
-            {
-                "step": step,
-                "predictions": viz_output["predictions"].cpu(),
-                "gating_scores": viz_output["gating_scores"].cpu(),
-                "expert_outputs": viz_output["expert_outputs"].cpu(),
-                "selected_experts": viz_output["selected_experts"].cpu(),
-                "per_expert_loss": per_expert_losses,
-                "per_expert_grad_norm": per_expert_grad_norms,
-                "train_selected_experts": output["selected_experts"].detach().cpu(),
-                "routing_biases": model.routing_biases.detach().cpu(),
-            }
-        )
+        if step % cfg.logging.anim_sampling_rate == 0:
+            with torch.inference_mode():
+                viz_output = model(viz_x)
+            viz_frames.append(
+                {
+                    "step": step,
+                    "predictions": viz_output["predictions"].cpu(),
+                    "gating_scores": viz_output["gating_scores"].cpu(),
+                    "expert_outputs": viz_output["expert_outputs"].cpu(),
+                    "selected_experts": viz_output["selected_experts"].cpu(),
+                    "per_expert_loss": per_expert_losses,
+                    "per_expert_grad_norm": per_expert_grad_norms,
+                    "train_selected_experts": output["selected_experts"].detach().cpu(),
+                    "routing_biases": model.routing_biases.detach().cpu(),
+                }
+            )
 
         optimizer.step()
         model.update_routing_biases(
@@ -217,7 +218,7 @@ def main() -> None:
         output_dir=anim_dir,
         domain=tuple(domain),
         target_function=target_function,
-        fps=training_cfg.num_steps // 10,
+        fps=len(viz_frames) // 10,
     )
 
     if use_wandb:
