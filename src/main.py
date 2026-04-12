@@ -102,7 +102,9 @@ def main() -> None:
 
     training_cfg = cfg.training
     trainable_params = filter(lambda p: p.requires_grad, model.parameters())
-    optimizer = torch.optim.SGD(trainable_params, lr=training_cfg.learning_rate)
+    optimizer_type = training_cfg.get("optimizer", "SGD")
+    optimizer_cls = getattr(torch.optim, optimizer_type)
+    optimizer = optimizer_cls(trainable_params, lr=training_cfg.learning_rate)
     loss_fn = nn.MSELoss()
 
     can_visualize = model_cfg.input_dim == 1
