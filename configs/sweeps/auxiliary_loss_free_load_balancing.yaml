@@ -1,0 +1,26 @@
+name: auxiliary-loss-free-load-balancing
+project: moe-shaping
+entity: mari-schn
+
+method: grid
+metric:
+  name: loss
+  goal: minimize
+
+program: src/main.py
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --config
+  - configs/fixed_target.yaml
+
+parameters:
+  training:
+    parameters:
+      batch_size:
+        values: [32, 128, 256]
+      learning_rate:
+        values: [1e-4, 1e-3, 1e-2]
+      auxiliarly_loss_free_load_balancing_gamma:
+        values: [1e-4,1e-3, 1e-2]

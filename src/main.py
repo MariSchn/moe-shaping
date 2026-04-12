@@ -31,10 +31,10 @@ from visualization import (
 )
 
 
-def load_config(argv: list[str] | None = None) -> DictConfig:
+def load_config() -> DictConfig:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/default.yaml")
-    args, overrides = parser.parse_known_args(argv)
+    args, overrides = parser.parse_known_args()
 
     file_cfg = OmegaConf.load(args.config)
     cli_cfg = OmegaConf.from_dotlist(overrides)
@@ -43,6 +43,24 @@ def load_config(argv: list[str] | None = None) -> DictConfig:
 
 def main() -> None:
     cfg = load_config()
+
+    use_wandb = cfg.wandb.enabled
+    if use_wandb:
+        run_name = None
+        if not os.environ.get("WANDB_SWEEP_ID"):
+            run_name = cfg.wandb.run_name or None
+
+        wandb.init(
+            project=cfg.wandb.project,
+            entity=cfg.wandb.entity,
+            name=run_name,
+            tags=cfg.wandb.run_tags,
+            config=OmegaConf.to_container(cfg, resolve=True),
+        )
+        # When running as part of a sweep, merge sweep parameters into config
+        if wandb.run.sweep_id:
+            sweep_cfg = OmegaConf.create(dict(wandb.config))
+            cfg = OmegaConf.merge(cfg, sweep_cfg)
 
     if cfg.seed is not None:
         set_seed(cfg.seed)
@@ -99,17 +117,6 @@ def main() -> None:
     anim_dir = os.path.join(output_dir, "anims")
     for d in (init_dir, final_dir, anim_dir):
         os.makedirs(d, exist_ok=True)
-
-    use_wandb = cfg.wandb.enabled
-    if use_wandb:
-        wandb.init(
-            project=cfg.wandb.project,
-            entity=cfg.wandb.entity,
-            name=cfg.wandb.run_name
-            or f"e{model_cfg.num_experts}_a{model_cfg.router_top_k}_p{target_cfg.num_pieces}",
-            tags=cfg.wandb.run_tags,
-            config=cfg,
-        )
 
     def log_static_visualizations(subdir, panel_prefix):
         viz_kwargs = dict(
