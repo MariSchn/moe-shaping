@@ -50,23 +50,31 @@ class Model(nn.Module):
                 f"Initial weights must have {self.num_experts} elements, got {len(initial_expert_weights)}"
             )
             for i in range(self.num_experts):
-                self.experts[i].weight.data = torch.tensor(initial_expert_weights[i])
+                self.experts[i].weight.data = torch.tensor(
+                    initial_expert_weights[i], dtype=torch.float32
+                )
         if initial_expert_biases is not None:
             assert len(initial_expert_biases) == self.num_experts, (
                 f"Initial biases must have {self.num_experts} elements, got {len(initial_expert_biases)}"
             )
             for i in range(self.num_experts):
-                self.experts[i].bias.data = torch.tensor(initial_expert_biases[i])
+                self.experts[i].bias.data = torch.tensor(
+                    initial_expert_biases[i], dtype=torch.float32
+                )
         if initial_gating_weights is not None:
             assert len(initial_gating_weights) == self.num_experts, (
                 f"Initial gating weights must have {self.num_experts} elements, got {len(initial_gating_weights)}"
             )
-            self.gating_function.weight.data = torch.tensor(initial_gating_weights)
+            self.gating_function.weight.data = torch.tensor(
+                initial_gating_weights, dtype=torch.float32
+            )
         if initial_gating_biases is not None:
             assert len(initial_gating_biases) == self.num_experts, (
                 f"Initial gating biases must have {self.num_experts} elements, got {len(initial_gating_biases)}"
             )
-            self.gating_function.bias.data = torch.tensor(initial_gating_biases)
+            self.gating_function.bias.data = torch.tensor(
+                initial_gating_biases, dtype=torch.float32
+            )
 
     def update_routing_biases(
         self,
