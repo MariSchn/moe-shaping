@@ -539,7 +539,9 @@ def export_training_animation_visualization(
     all_expert_y = np.array(
         [f["expert_outputs"].squeeze(-1).numpy() for f in viz_frames]
     )
-    all_router_y = np.array([f["gating_scores"].numpy() for f in viz_frames])
+    all_router_y = np.array(
+        [f["gating_scores"].numpy() + f["routing_biases"].numpy() for f in viz_frames]
+    )
     all_top_experts = [f["selected_experts"].numpy() for f in viz_frames]
     top_k = all_top_experts[0].shape[1]
     steps = [f["step"] for f in viz_frames]
