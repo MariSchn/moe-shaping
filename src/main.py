@@ -131,7 +131,6 @@ def main() -> None:
     optimizer = optimizer_cls(trainable_params, lr=training_cfg.learning_rate)
     loss_fn = nn.MSELoss()
 
-    can_visualize = model_cfg.input_dim == 1
     viz_frames = []
 
     viz_num_points = 200
@@ -147,27 +146,29 @@ def main() -> None:
         os.makedirs(d, exist_ok=True)
 
     def log_static_visualizations(subdir, panel_prefix):
-        viz_kwargs = dict(
-            model=model,
-            domain=tuple(domain),
-            num_points=viz_num_points,
-            target_function=target_function,
-        )
         figs = {
-            "model": model_visualization(**viz_kwargs)["figure"],
-            "top_expert": top_expert_visualization(**viz_kwargs)["figure"],
-            "router": router_visualization(**viz_kwargs)["figure"],
-            "expert": expert_visualization(**viz_kwargs)["figure"],
             "routing_bias": routing_bias_visualization(model)["figure"],
-            "target": target_visualization(
-                target_function, tuple(domain), viz_num_points
-            )["figure"],
         }
-        target_router = target_router_visualization(
-            target_function, tuple(domain), viz_num_points
-        )
-        if target_router is not None:
-            figs["target_router"] = target_router["figure"]
+
+        if model.input_dim == 1:
+            viz_kwargs = dict(
+                model=model,
+                domain=tuple(domain),
+                num_points=viz_num_points,
+                target_function=target_function,
+            )
+            figs["model"] = model_visualization(**viz_kwargs)["figure"]
+            figs["top_expert"] = top_expert_visualization(**viz_kwargs)["figure"]
+            figs["router"] = router_visualization(**viz_kwargs)["figure"]
+            figs["expert"] = expert_visualization(**viz_kwargs)["figure"]
+            figs["target"] = target_visualization(
+                target_function, tuple(domain), viz_num_points
+            )["figure"]
+            target_router = target_router_visualization(
+                target_function, tuple(domain), viz_num_points
+            )
+            if target_router is not None:
+                figs["target_router"] = target_router["figure"]
 
         for name, fig in figs.items():
             fig.savefig(
@@ -183,8 +184,7 @@ def main() -> None:
         for fig in figs.values():
             plt.close(fig)
 
-    if can_visualize:
-        log_static_visualizations(init_dir, "initialization")
+    log_static_visualizations(init_dir, "initialization")
 
     pbar = tqdm(range(training_cfg.num_steps), desc="Training")
     for step in pbar:
@@ -229,22 +229,22 @@ def main() -> None:
             )
 
         # ===== VISUALIZATION SNAPSHOT =====
-        if can_visualize and step % cfg.logging.anim_sampling_rate == 0:
-            with torch.inference_mode():
-                viz_output = model(viz_x)
-            viz_frames.append(
-                {
-                    "step": step,
-                    "predictions": viz_output["predictions"].cpu(),
-                    "gating_scores": viz_output["gating_scores"].cpu(),
-                    "expert_outputs": viz_output["expert_outputs"].cpu(),
-                    "selected_experts": viz_output["selected_experts"].cpu(),
-                    "per_expert_loss": per_expert_losses,
-                    "per_expert_grad_norm": per_expert_grad_norms,
-                    "train_selected_experts": output["selected_experts"].detach().cpu(),
-                    "routing_biases": model.routing_biases.detach().cpu(),
-                }
-            )
+        if step % cfg.logging.anim_sampling_rate == 0:
+            frame = {
+                "step": step,
+                "per_expert_loss": per_expert_losses,
+                "per_expert_grad_norm": per_expert_grad_norms,
+                "train_selected_experts": output["selected_experts"].detach().cpu(),
+                "routing_biases": model.routing_biases.detach().cpu(),
+            }
+            if model.input_dim == 1:
+                with torch.inference_mode():
+                    viz_output = model(viz_x)
+                frame["predictions"] = viz_output["predictions"].cpu()
+                frame["gating_scores"] = viz_output["gating_scores"].cpu()
+                frame["expert_outputs"] = viz_output["expert_outputs"].cpu()
+                frame["selected_experts"] = viz_output["selected_experts"].cpu()
+            viz_frames.append(frame)
 
         optimizer.step()
         model.update_routing_biases(
@@ -253,35 +253,34 @@ def main() -> None:
         )
         pbar.set_postfix({"loss": loss.item()})
 
-    if can_visualize:
-        log_static_visualizations(final_dir, "final")
+    log_static_visualizations(final_dir, "final")
 
-        export_training_animation_visualization(
-            viz_frames=viz_frames,
-            viz_x=viz_x.cpu(),
-            output_dir=anim_dir,
-            domain=tuple(domain),
-            target_function=target_function,
-            fps=len(viz_frames) // 10,
-        )
+    export_training_animation_visualization(
+        viz_frames=viz_frames,
+        viz_x=viz_x.cpu(),
+        output_dir=anim_dir,
+        domain=tuple(domain),
+        target_function=target_function,
+        fps=len(viz_frames) // 10,
+    )
 
-        if use_wandb:
-            gif_names = [
-                "model",
-                "top_expert",
-                "router",
-                "expert",
-                "per_expert_loss",
-                "per_expert_grad_norm",
-                "per_expert_sample_count",
-                "routing_biases",
-            ]
-            log_dict = {}
-            for name in gif_names:
-                path = os.path.join(anim_dir, f"{name}.mp4")
-                if os.path.exists(path):
-                    log_dict[f"animations/{name}"] = wandb.Video(path, format="mp4")
-            wandb.log(log_dict)
+    if use_wandb:
+        anim_names = [
+            "model",
+            "top_expert",
+            "router",
+            "expert",
+            "per_expert_loss",
+            "per_expert_grad_norm",
+            "per_expert_sample_count",
+            "routing_biases",
+        ]
+        log_dict = {}
+        for name in anim_names:
+            path = os.path.join(anim_dir, f"{name}.mp4")
+            if os.path.exists(path):
+                log_dict[f"animations/{name}"] = wandb.Video(path, format="mp4")
+        wandb.log(log_dict)
 
 
 if __name__ == "__main__":

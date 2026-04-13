@@ -518,36 +518,12 @@ def export_training_animation_visualization(
 ) -> None:
     os.makedirs(output_dir, exist_ok=True)
 
+    has_1d_data = "predictions" in viz_frames[0]
+
     x_np = viz_x.squeeze(-1).numpy()
-    num_experts = viz_frames[0]["gating_scores"].shape[1]
-
-    # Precompute target curve (fixed across frames)
-    y_target = None
-    breakpoints = None
-    if target_function is not None:
-        bps = target_function.breakpoints
-        target_device = bps.device if bps is not None else viz_x.device
-        y_target = target_function(viz_x.to(target_device)).squeeze(-1).cpu().numpy()
-        if bps is not None:
-            all_bps = bps.detach().cpu()
-            breakpoints = all_bps[
-                (all_bps > domain[0]) & (all_bps < domain[1])
-            ].tolist()
-
-    # Stack all frames into numpy arrays
-    all_model_y = np.array([f["predictions"].squeeze(-1).numpy() for f in viz_frames])
-    all_expert_y = np.array(
-        [f["expert_outputs"].squeeze(-1).numpy() for f in viz_frames]
-    )
-    all_router_y = np.array(
-        [f["gating_scores"].numpy() + f["routing_biases"].numpy() for f in viz_frames]
-    )
-    all_top_experts = [f["selected_experts"].numpy() for f in viz_frames]
-    top_k = all_top_experts[0].shape[1]
     steps = [f["step"] for f in viz_frames]
 
     all_routing_biases = np.array([f["routing_biases"].numpy() for f in viz_frames])
-
     all_per_expert_loss = np.array(
         [
             f["per_expert_loss"].numpy()
@@ -559,6 +535,7 @@ def export_training_animation_visualization(
     all_per_expert_grad_norm = np.array(
         [np.array(f["per_expert_grad_norm"]) for f in viz_frames]
     )
+    num_experts = all_routing_biases.shape[1]
     all_expert_counts = np.array(
         [
             np.bincount(
@@ -567,64 +544,13 @@ def export_training_animation_visualization(
             for f in viz_frames
         ]
     )
-
     expert_indices = np.arange(num_experts)
-    model_ylim = _ylim(all_model_y, y_target)
-    expert_ylim = _ylim(all_expert_y, y_target)
-    router_ylim = _ylim(all_router_y)
 
     def path(name):
         return os.path.join(output_dir, name)
 
     with ProcessPoolExecutor() as pool:
         futures = [
-            pool.submit(
-                _build_model_animation,
-                path("model.mp4"),
-                x_np,
-                all_model_y,
-                y_target,
-                domain,
-                model_ylim,
-                steps,
-                fps,
-            ),
-            pool.submit(
-                _build_top_expert_animation,
-                path("top_expert.mp4"),
-                x_np,
-                all_top_experts,
-                top_k,
-                num_experts,
-                breakpoints,
-                domain,
-                steps,
-                fps,
-            ),
-            pool.submit(
-                _build_router_animation,
-                path("router.mp4"),
-                x_np,
-                all_router_y,
-                num_experts,
-                breakpoints,
-                domain,
-                router_ylim,
-                steps,
-                fps,
-            ),
-            pool.submit(
-                _build_expert_animation,
-                path("expert.mp4"),
-                x_np,
-                all_expert_y,
-                num_experts,
-                domain,
-                expert_ylim,
-                y_target,
-                steps,
-                fps,
-            ),
             pool.submit(
                 _build_bar_animation,
                 path("per_expert_loss.mp4"),
@@ -670,5 +596,91 @@ def export_training_animation_visualization(
                 fps,
             ),
         ]
+
+        if has_1d_data:
+            y_target = None
+            breakpoints = None
+            if target_function is not None:
+                bps = target_function.breakpoints
+                target_device = bps.device if bps is not None else viz_x.device
+                y_target = (
+                    target_function(viz_x.to(target_device)).squeeze(-1).cpu().numpy()
+                )
+                if bps is not None:
+                    all_bps = bps.detach().cpu()
+                    breakpoints = all_bps[
+                        (all_bps > domain[0]) & (all_bps < domain[1])
+                    ].tolist()
+
+            all_model_y = np.array(
+                [f["predictions"].squeeze(-1).numpy() for f in viz_frames]
+            )
+            all_expert_y = np.array(
+                [f["expert_outputs"].squeeze(-1).numpy() for f in viz_frames]
+            )
+            all_router_y = np.array(
+                [
+                    f["gating_scores"].numpy() + f["routing_biases"].numpy()
+                    for f in viz_frames
+                ]
+            )
+            all_top_experts = [f["selected_experts"].numpy() for f in viz_frames]
+            top_k = all_top_experts[0].shape[1]
+
+            model_ylim = _ylim(all_model_y, y_target)
+            expert_ylim = _ylim(all_expert_y, y_target)
+            router_ylim = _ylim(all_router_y)
+
+            futures.extend(
+                [
+                    pool.submit(
+                        _build_model_animation,
+                        path("model.mp4"),
+                        x_np,
+                        all_model_y,
+                        y_target,
+                        domain,
+                        model_ylim,
+                        steps,
+                        fps,
+                    ),
+                    pool.submit(
+                        _build_top_expert_animation,
+                        path("top_expert.mp4"),
+                        x_np,
+                        all_top_experts,
+                        top_k,
+                        num_experts,
+                        breakpoints,
+                        domain,
+                        steps,
+                        fps,
+                    ),
+                    pool.submit(
+                        _build_router_animation,
+                        path("router.mp4"),
+                        x_np,
+                        all_router_y,
+                        num_experts,
+                        breakpoints,
+                        domain,
+                        router_ylim,
+                        steps,
+                        fps,
+                    ),
+                    pool.submit(
+                        _build_expert_animation,
+                        path("expert.mp4"),
+                        x_np,
+                        all_expert_y,
+                        num_experts,
+                        domain,
+                        expert_ylim,
+                        y_target,
+                        steps,
+                        fps,
+                    ),
+                ]
+            )
         for f in futures:
             f.result()
