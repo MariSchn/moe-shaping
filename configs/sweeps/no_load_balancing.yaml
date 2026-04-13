@@ -1,4 +1,4 @@
-name: auxiliary-loss-free-load-balancing
+name: no-load-balancing
 project: moe-shaping
 entity: mari-schn
 
@@ -20,5 +20,3 @@ parameters:
     parameters:
       learning_rate:
         values: [1e-4, 1e-3, 1e-2]
-      auxiliarly_loss_free_load_balancing_gamma:
-        values: [1e-4,1e-3, 1e-2]
