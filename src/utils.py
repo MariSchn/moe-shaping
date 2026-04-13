@@ -134,6 +134,18 @@ def per_expert_gradient_norm(model: nn.Module) -> list[float]:
     return norms
 
 
+def expert_load_std(selected_experts: torch.Tensor, num_experts: int) -> float:
+    """Standard deviation of the expert load fractions (each fraction sums to 1)."""
+    counts = torch.zeros(num_experts, device=selected_experts.device)
+    counts.scatter_add_(
+        0,
+        selected_experts.flatten(),
+        torch.ones(selected_experts.numel(), device=selected_experts.device),
+    )
+    fractions = counts / counts.sum()
+    return fractions.std().item()
+
+
 def gating_gradient_norm(model: nn.Module) -> float:
     """L2 norm of the router / gating Linear's parameter gradients."""
     sum_sq = 0.0

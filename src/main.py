@@ -13,6 +13,7 @@ from targets import ModelTarget, PiecewiseLinearTarget
 from utils import (
     calculate_load_balancing_loss,
     calculate_per_expert_loss,
+    expert_load_std,
     gating_gradient_norm,
     get_device,
     per_expert_gradient_norm,
@@ -225,6 +226,9 @@ def main() -> None:
                     if load_balancing_loss is not None
                     else None,
                     "gating_grad_norm": gating_gradient_norm(model),
+                    "expert_load_std": expert_load_std(
+                        output["selected_experts"], model.num_experts
+                    ),
                 }
             )
 
