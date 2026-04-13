@@ -13,7 +13,6 @@ from targets import ModelTarget, PiecewiseLinearTarget
 from utils import (
     calculate_load_balancing_loss,
     calculate_per_expert_loss,
-    expert_load_std,
     gating_gradient_norm,
     get_device,
     per_expert_gradient_norm,
@@ -198,13 +197,12 @@ def main() -> None:
         output = model(x)
         loss = loss_fn(output["predictions"], y)
 
+        # Always calculate load balancing loss for logging, but only add it to the loss if the weight is positive.
+        load_balancing_loss = calculate_load_balancing_loss(
+            output["gating_scores"], output["selected_experts"]
+        )
         if training_cfg.load_balancing_loss_weight > 0:
-            load_balancing_loss = calculate_load_balancing_loss(
-                output["gating_scores"], output["selected_experts"]
-            )
             loss += training_cfg.load_balancing_loss_weight * load_balancing_loss
-        else:
-            load_balancing_loss = None
 
         optimizer.zero_grad()
         loss.backward()
@@ -222,13 +220,8 @@ def main() -> None:
             wandb.log(
                 {
                     "loss": loss.item(),
-                    "load_balancing_loss": load_balancing_loss.item()
-                    if load_balancing_loss is not None
-                    else None,
+                    "expert_imbalance": load_balancing_loss.item(),
                     "gating_grad_norm": gating_gradient_norm(model),
-                    "expert_load_std": expert_load_std(
-                        output["selected_experts"], model.num_experts
-                    ),
                 }
             )
 
