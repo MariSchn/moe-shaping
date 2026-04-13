@@ -62,6 +62,30 @@ def main() -> None:
             sweep_cfg = OmegaConf.create(dict(wandb.config))
             cfg = OmegaConf.merge(cfg, sweep_cfg)
 
+            # Name run after the swept parameters
+            api = wandb.Api()
+            sweep_def = api.sweep(
+                f"{wandb.run.entity}/{wandb.run.project}/{wandb.run.sweep_id}"
+            )
+            sweep_params = sweep_def.config.get("parameters", {})
+            # Extract leaf parameter names from nested sweep config
+            leaf_names = set()
+            queue = list(sweep_params.items())
+            while queue:
+                name, spec = queue.pop()
+                if "parameters" in spec:
+                    queue.extend(spec["parameters"].items())
+                else:
+                    leaf_names.add(name)
+
+            parts = [
+                f"{k}={wandb.config[k]}"
+                for k in sorted(leaf_names)
+                if k in wandb.config
+            ]
+            if parts:
+                wandb.run.name = "_".join(parts)
+
     if cfg.seed is not None:
         set_seed(cfg.seed)
 
