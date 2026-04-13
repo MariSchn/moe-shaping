@@ -1,40 +1,40 @@
-output_dir: "./outputs/model-target"
-seed: null
+output_dir: "./outputs/default"
+seed: 0
 
 target:
   type: model  # "piecewise_linear" or "model"
   domain: [-1, 1]
   kwargs:
     num_experts: 4
-    input_dim: 1
+    input_dim: 16
     output_dim: 1
     router_top_k: 2
 
 model:
   num_experts: 4
-  input_dim: 1
+  input_dim: 16
   output_dim: 1
   router_top_k: 2
   freeze_router: false
   freeze_experts: false
 
 training:
-  num_steps: 500
-  batch_size: 100
+  num_steps: 2500
+  batch_size: 128
   learning_rate: 0.01
   # One of: SGD, Adam, AdamW
-  optimizer: SGD  
+  optimizer: Adam  
   # Controls the weight of the Switch Transformer-style load balancing loss (1e-2 default from paper).
   load_balancing_loss_weight: 0.0
   # DeepSeek V3 auxiliary loss-free load balancing gamma, controlling how much is added/subtracted to under/over-utilized experts (1e-3 default from paper)
   auxiliarly_loss_free_load_balancing_gamma: 0.0
 
 logging:
-  anim_sampling_rate: 1
+  anim_sampling_rate: 50
 
 wandb:
   enabled: true
   project: moe-shaping
   entity: mari-schn
-  run_name: model-target
+  run_name: default
   run_tags: []
