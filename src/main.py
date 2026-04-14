@@ -68,23 +68,32 @@ def main() -> None:
                 f"{wandb.run.entity}/{wandb.run.project}/{wandb.run.sweep_id}"
             )
             sweep_params = sweep_def.config.get("parameters", {})
-            # Extract leaf parameter names from nested sweep config
-            leaf_names = set()
-            queue = list(sweep_params.items())
+            # Extract leaf parameter names and full paths from nested sweep config
+            leaf_paths = []
+            queue = [("", sweep_params)]
             while queue:
-                name, spec = queue.pop()
-                if "parameters" in spec:
-                    queue.extend(spec["parameters"].items())
-                else:
-                    leaf_names.add(name)
+                prefix, params = queue.pop()
+                for name, spec in params.items():
+                    full_path = f"{prefix}.{name}" if prefix else name
+                    if "parameters" in spec:
+                        queue.append((full_path, spec["parameters"]))
+                    else:
+                        leaf_paths.append((name, full_path))
 
             parts = [
-                f"{k}={wandb.config[k]}"
-                for k in sorted(leaf_names)
-                if k in wandb.config
+                f"{name}={OmegaConf.select(cfg, path)}"
+                for name, path in sorted(leaf_paths)
+                if OmegaConf.select(cfg, path) is not None
             ]
+            print("Parts:", parts)
             if parts:
                 wandb.run.name = "_".join(parts)
+                cfg.output_dir = os.path.join(
+                    os.path.dirname(cfg.output_dir),
+                    "sweeps",
+                    sweep_def.name,
+                    wandb.run.name,
+                )
 
     if cfg.seed is not None:
         set_seed(cfg.seed)
