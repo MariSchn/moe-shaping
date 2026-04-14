@@ -1,0 +1,30 @@
+name: auxiliary-loss-free-load-balancing-bias-collapse
+project: moe-shaping
+entity: mari-schn
+
+method: grid
+metric:
+  name: final_router_bias_std
+  goal: minimize
+
+program: src/main.py
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --config
+  - configs/default.yaml
+
+parameters:
+  training:
+    parameters:
+      optimizer:
+        values: [SGD, Adam]
+      auxiliarly_loss_free_load_balancing_gamma:
+        values: [1e-3, 1e-2]
+      num_experts:
+        values: [4, 16]
+      router_top_k:
+        values: [2, 4, 8]
+      input_dim:
+        values: [1, 16]
