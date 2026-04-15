@@ -10,6 +10,7 @@ class Model(nn.Module):
         input_dim: int,
         output_dim: int,
         router_top_k: int,
+        router_activation: str = "softmax",
         initial_expert_weights: list[list[float]] = None,
         initial_expert_biases: list[list[float]] = None,
         initial_gating_weights: list[list[float]] = None,
@@ -17,10 +18,16 @@ class Model(nn.Module):
     ):
         super().__init__()
 
+        if router_activation not in ("softmax", "sigmoid"):
+            raise ValueError(
+                f"router_activation must be 'softmax' or 'sigmoid', got {router_activation!r}"
+            )
+
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.num_experts = num_experts
         self.router_top_k = router_top_k
+        self.router_activation = router_activation
 
         self.experts = nn.ModuleList(
             [nn.Linear(input_dim, output_dim, bias=True) for _ in range(num_experts)]
@@ -133,8 +140,12 @@ class Model(nn.Module):
         )
         selected_outputs = torch.gather(expert_outputs, dim=1, index=top_k_expanded)
 
-        # Softmax only over the top-k experts, not all experts.
-        selected_gate_probs = torch.softmax(top_k_scores, dim=1)  # (B, top_k)
+        # Normalize only over the top-k experts, not all experts.
+        if self.router_activation == "softmax":
+            selected_gate_probs = torch.softmax(top_k_scores, dim=1)  # (B, top_k)
+        else:  # "sigmoid": sigmoid + sum-normalization
+            sig = torch.sigmoid(top_k_scores)
+            selected_gate_probs = sig / sig.sum(dim=1, keepdim=True).clamp(min=1e-9)
 
         # Combine expert outputs: (B, output_dim)
         weighted = selected_outputs * selected_gate_probs.unsqueeze(-1)
