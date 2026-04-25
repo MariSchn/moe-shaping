@@ -23,6 +23,7 @@ from visualization import (
     expert_visualization,
     export_training_animation_visualization,
     model_visualization,
+    per_expert_sample_count_visualization,
     router_visualization,
     routing_bias_visualization,
     target_router_visualization,
@@ -170,6 +171,11 @@ def main() -> None:
             figs["top_expert"] = top_expert_visualization(**viz_kwargs)["figure"]
             figs["router"] = router_visualization(**viz_kwargs)["figure"]
             figs["expert"] = expert_visualization(**viz_kwargs)["figure"]
+            figs["per_expert_sample_count"] = per_expert_sample_count_visualization(
+                model=model,
+                domain=tuple(domain),
+                num_points=viz_num_points,
+            )["figure"]
             figs["target"] = target_visualization(
                 target_function, tuple(domain), viz_num_points
             )["figure"]
@@ -178,6 +184,20 @@ def main() -> None:
             )
             if target_router is not None:
                 figs["target_router"] = target_router["figure"]
+            if isinstance(target_function, ModelTarget):
+                figs["target_expert"] = expert_visualization(
+                    model=target_function.model,
+                    domain=tuple(domain),
+                    num_points=viz_num_points,
+                    target_function=target_function,
+                )["figure"]
+                figs["target_per_expert_sample_count"] = (
+                    per_expert_sample_count_visualization(
+                        model=target_function.model,
+                        domain=tuple(domain),
+                        num_points=viz_num_points,
+                    )["figure"]
+                )
 
         for name, fig in figs.items():
             fig.savefig(

@@ -275,6 +275,37 @@ def target_router_visualization(
     return {"figure": fig, "x": x}
 
 
+def per_expert_sample_count_visualization(
+    model: nn.Module,
+    domain: Tuple[float, float],
+    num_points: int,
+) -> dict:
+    assert model.input_dim == 1, (
+        "Model must have a single input dimension for per-expert sample count visualization"
+    )
+
+    device = model_device(model)
+    x = torch.linspace(domain[0], domain[1], num_points, device=device).unsqueeze(-1)
+
+    with torch.inference_mode():
+        selected_experts = model(x)["selected_experts"]
+
+    num_experts = model.num_experts
+    counts = np.bincount(
+        selected_experts.detach().cpu().numpy().ravel(), minlength=num_experts
+    )
+    expert_indices = np.arange(num_experts)
+
+    fig, ax = plt.subplots()
+    ax.bar(expert_indices, counts)
+    ax.set_xticks(expert_indices)
+    ax.set_xticklabels([f"Expert {i}" for i in expert_indices])
+    ax.set_ylabel("Sample Count")
+    ax.set_title("Per Expert Sample Count")
+
+    return {"figure": fig, "counts": counts}
+
+
 def routing_bias_visualization(model: nn.Module) -> dict:
     biases = model.routing_biases.detach().cpu().numpy()
     num_experts = len(biases)
