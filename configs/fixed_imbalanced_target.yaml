@@ -11,25 +11,25 @@ target:
     router_top_k: 2
     router_activation: softmax
     initial_expert_weights:
+      - [[0.0]]
+      - [[0.3]]
       - [[2.0]]
-      - [[-1.0]]
-      - [[3.0]]
-      - [[-4.0]]
+      - [[2.0]]
     initial_expert_biases:
-      - [2.0]
-      - [-1.0]
       - [0.0]
-      - [3.0]
+      - [1.0]
+      - [8.0]
+      - [-8.0]
     initial_gating_weights:
-      - [-4.0]
-      - [-0.5]
-      - [2]
-      - [4.0]
-    initial_gating_biases: 
-      - -3.0
-      - -0.0
-      - -1.0
-      - -2.6
+      - [0.0]
+      - [0.0]
+      - [1.0]
+      - [-1.0]
+    initial_gating_biases:
+      - 3.0
+      - 2.9
+      - 2.0
+      - 2.0
 
 model:
   num_experts: 4
@@ -41,7 +41,7 @@ model:
   freeze_experts: false
 
 training:
-  num_steps: 2500
+  num_steps: 5000
   batch_size: 128
   learning_rate: 0.01
   # One of: SGD, Adam, AdamW
@@ -52,7 +52,7 @@ training:
   auxiliarly_loss_free_load_balancing_gamma: 0.0
 
 logging:
-  anim_sampling_rate: 10
+  anim_sampling_rate: 50
 
 wandb:
   enabled: true
