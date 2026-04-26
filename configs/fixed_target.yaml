@@ -41,11 +41,11 @@ model:
   freeze_experts: false
 
 training:
-  num_steps: 5000
+  num_steps: 2500
   batch_size: 128
   learning_rate: 0.01
   # One of: SGD, Adam, AdamW
-  optimizer: Adam  
+  optimizer: Adam
   # Controls the weight of the Switch Transformer-style load balancing loss (1e-2 default from paper).
   load_balancing_loss_weight: 0.0
   # DeepSeek V3 auxiliary loss-free load balancing gamma, controlling how much is added/subtracted to under/over-utilized experts (1e-3 default from paper)
@@ -54,11 +54,11 @@ training:
   inter_router_lola_weight: 0.0
 
 logging:
-  anim_sampling_rate: 10
+  anim_sampling_rate: 50
 
 wandb:
   enabled: true
   project: moe-shaping
   entity: mari-schn
-  run_name: Inbalanced Target
+  run_name: Fixed Target
   run_tags: []
