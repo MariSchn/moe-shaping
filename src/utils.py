@@ -3,6 +3,7 @@ import random
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.func import grad as fgrad, vmap
 from typing import Callable, Tuple
 
 
@@ -127,6 +128,7 @@ def apply_lola_router_shaping(
     output: dict,
     targets: torch.Tensor,
     alpha: float,
+    x: torch.Tensor,
 ) -> None:
     """
     Add a LOLA-style shaping correction to the router (gating) gradients.
@@ -155,9 +157,10 @@ def apply_lola_router_shaping(
     Args:
         model: A `Model` instance with a `.gating_function` Linear.
         output: The dict returned by `Model.forward` for the current batch.
-            Must contain `predictions`, `gating_scores`, `selected_experts`.
+            Must contain `gating_scores`, `expert_outputs`, `selected_experts`.
         targets: (B, output_dim) regression targets for the current batch.
         alpha: LOLA inner-step coefficient. Set to 0 to disable.
+        x: (B, input_dim) model inputs for the current batch.
     """
     if alpha == 0:
         return
@@ -168,7 +171,9 @@ def apply_lola_router_shaping(
         return
 
     gating_scores = output["gating_scores"]  # (B, num_experts)
-    predictions = output["predictions"]  # (B, output_dim)
+    # expert_outputs are fixed w.r.t. gating params — detach to avoid leaking
+    # gradients through the expert networks.
+    expert_outputs = output["expert_outputs"].detach()  # (B, E, output_dim)
 
     # Identify the top-1 expert per sample within the selected set.
     top_k_scores = torch.gather(gating_scores, 1, selected)  # (B, top_k)
@@ -177,57 +182,61 @@ def apply_lola_router_shaping(
         selected, 1, top_idx_within_selected.unsqueeze(1)
     ).squeeze(1)  # (B,)
 
-    # Per-sample MSE loss (mean over output_dim, matching MSELoss(reduction='mean')).
-    per_sample_loss = (predictions - targets).pow(2).mean(dim=-1)  # (B,)
+    gating_w = model.gating_function.weight  # (E, input_dim)
+    gating_bias = model.gating_function.bias  # (E,)
+    router_activation = model.router_activation
 
-    gating_w = model.gating_function.weight  # (num_experts, input_dim)
-    gating_bias = model.gating_function.bias  # (num_experts,)
+    # Pure per-sample loss as a function of gating params only.  Routing is
+    # treated as fixed (sel_b comes from the forward pass and is not
+    # differentiated), which matches what torch.autograd.grad does through the
+    # original graph (topk indices carry no gradient).
+    def _single_sample_loss(gW, gb, x_b, eo_b, t_b, sel_b):
+        gs = x_b @ gW.T + gb  # (E,)
+        tk_scores = gs[sel_b]  # (top_k,)
+        sel_out = eo_b[sel_b]  # (top_k, output_dim)
+        if router_activation == "softmax":
+            probs = torch.softmax(tk_scores, dim=0)
+        else:
+            sig = torch.sigmoid(tk_scores)
+            probs = sig / sig.sum().clamp(min=1e-9)
+        pred = (sel_out * probs.unsqueeze(-1)).sum(dim=0)
+        return (pred - t_b).pow(2).mean()
 
-    weight_correction = torch.zeros_like(gating_w)
-    bias_correction = torch.zeros_like(gating_bias)
+    _grad_loss = fgrad(_single_sample_loss, argnums=(0, 1))
 
-    selected_list = selected.tolist()
-    top_list = top_per_sample.tolist()
+    def _single_sample_correction(gW, gb, x_b, eo_b, t_b, sel_b, top_b):
+        # First-order grads; stop-grad the top expert's rows to form v.
+        gW_b, gb_b = _grad_loss(gW, gb, x_b, eo_b, t_b, sel_b)
+        # Keep top_b as a 1-D index to avoid .item() calls inside vmap.
+        top_idx = top_b.unsqueeze(0)  # (1,)
+        v_w = gW_b[top_idx].squeeze(0).detach()  # (input_dim,)
+        v_bias = gb_b[top_idx].squeeze(0).detach()  # ()
 
-    # Per-sample loop. The "top" expert varies per sample, so the correction is
-    # naturally per-sample; vectorizing across the batch would require torch.func
-    # / vmap which is not used here for clarity.
-    for b in range(B):
-        top_b = top_list[b]
-        others_b = [e for e in selected_list[b] if e != top_b]
-        if not others_b:
-            continue
+        # S_b = v . gW_b[top] + v_bias * gb_b[top]; grad of S_b w.r.t. params
+        # gives the Hessian-vector product used as the LOLA correction.
+        def _S(gW_, gb_):
+            gW_b_, gb_b_ = _grad_loss(gW_, gb_, x_b, eo_b, t_b, sel_b)
+            return (v_w * gW_b_[top_idx].squeeze(0)).sum() + v_bias * gb_b_[
+                top_idx
+            ].squeeze(0)
 
-        # First-order grads of L_b wrt the full gating weight + bias.
-        gW, gb = torch.autograd.grad(
-            per_sample_loss[b],
-            (gating_w, gating_bias),
-            create_graph=True,
-            retain_graph=True,
-        )
+        return fgrad(_S, argnums=(0, 1))(gW, gb)  # (cW_b, cb_b)
 
-        # LOLA shaping scalar built from the *top* expert's first-order grad.
-        # dS/dW_j = d^2 L_b / (dW_j dW_top) * stop_grad(dL_b / dW_top), which is
-        # the LOLA correction for the non-top selected experts.
-        S = (gW[top_b] * gW[top_b].detach()).sum() + (gb[top_b] * gb[top_b].detach())
+    # Vectorise over the batch dimension; gW and gb are shared across samples.
+    all_cW, all_cb = vmap(
+        _single_sample_correction, in_dims=(None, None, 0, 0, 0, 0, 0)
+    )(gating_w, gating_bias, x, expert_outputs, targets, selected, top_per_sample)
+    # all_cW: (B, E, input_dim),  all_cb: (B, E)
 
-        # Hessian-vector product: dS/dW gives the correction; we keep only the
-        # rows corresponding to the *other* selected experts for this sample.
-        cW, cb = torch.autograd.grad(
-            S,
-            (gating_w, gating_bias),
-            retain_graph=True,
-        )
-        for j in others_b:
-            weight_correction[j] = weight_correction[j] - alpha * cW[j]
-            bias_correction[j] = bias_correction[j] - alpha * cb[j]
+    # The top expert's row is left untouched; zero its contribution.
+    E = gating_w.shape[0]
+    top_mask = torch.zeros(B, E, dtype=gating_w.dtype, device=gating_w.device)
+    top_mask[torch.arange(B), top_per_sample] = 1.0  # (B, E)
 
-    # Match the per-batch scaling of mean-reduced MSELoss.
-    weight_correction = weight_correction / B
-    bias_correction = bias_correction / B
-
-    weight_correction = weight_correction.detach()
-    bias_correction = bias_correction.detach()
+    weight_correction = (
+        -(alpha / B) * (all_cW * (1.0 - top_mask).unsqueeze(-1)).sum(0).detach()
+    )
+    bias_correction = -(alpha / B) * (all_cb * (1.0 - top_mask)).sum(0).detach()
 
     if gating_w.grad is None:
         gating_w.grad = weight_correction
