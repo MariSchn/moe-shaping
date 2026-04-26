@@ -133,26 +133,8 @@ def apply_lola_router_shaping(
     """
     Add a LOLA-style shaping correction to the router (gating) gradients.
 
-    For each sample b, let `top_b` be the most-chosen selected expert (highest
-    gating score among the top-k selected) and `others_b` the remaining selected
-    experts. For each j in `others_b`, the correction added to j's gating-weight
-    row is
-
-        delta W_j = -alpha * ( d^2 L_b / (dW_j dW_{top_b}) ) * (dL_b / dW_{top_b})
-
-    and analogously for the bias. The top expert's row is left untouched; the
-    "others" shape themselves with respect to how they couple to `top_b`. This
-    is computed as the gradient (w.r.t. W_j) of the LOLA-DiCE shaping scalar
-
-        S_b = (dL_b / dW_{top_b}) . stop_grad(dL_b / dW_{top_b}),
-
-    which yields the same Hessian-vector product. The correction is averaged
-    over the batch to match the scale of `MSELoss` (mean reduction), and is
-    *added* to whatever is already in `gating_function.{weight,bias}.grad`, so
-    it can be applied either before or after the standard `loss.backward()`
-    call (caller is responsible for `retain_graph=True` if needed).
-
-    No-op when `alpha == 0` or `top_k <= 1` (no "others" to shape from).
+    This function models the top-1 expert as a naive learner and the remaining
+    top-k experts as LOLA learners, shaping the top-1 expert.
 
     Args:
         model: A `Model` instance with a `.gating_function` Linear.
@@ -170,10 +152,9 @@ def apply_lola_router_shaping(
     if top_k <= 1:
         return
 
-    gating_scores = output["gating_scores"]  # (B, num_experts)
-    # expert_outputs are fixed w.r.t. gating params — detach to avoid leaking
-    # gradients through the expert networks.
+    # expert_outputs are fixed w.r.t. gating params -> detach to avoid leaking
     expert_outputs = output["expert_outputs"].detach()  # (B, E, output_dim)
+    gating_scores = output["gating_scores"]  # (B, num_experts)
 
     # Identify the top-1 expert per sample within the selected set.
     top_k_scores = torch.gather(gating_scores, 1, selected)  # (B, top_k)
@@ -182,62 +163,89 @@ def apply_lola_router_shaping(
         selected, 1, top_idx_within_selected.unsqueeze(1)
     ).squeeze(1)  # (B,)
 
+    # Extract the gating function
     gating_w = model.gating_function.weight  # (E, input_dim)
     gating_bias = model.gating_function.bias  # (E,)
     router_activation = model.router_activation
 
-    # Pure per-sample loss as a function of gating params only.  Routing is
-    # treated as fixed (sel_b comes from the forward pass and is not
-    # differentiated), which matches what torch.autograd.grad does through the
-    # original graph (topk indices carry no gradient).
-    def _single_sample_loss(gW, gb, x_b, eo_b, t_b, sel_b):
-        gs = x_b @ gW.T + gb  # (E,)
-        tk_scores = gs[sel_b]  # (top_k,)
-        sel_out = eo_b[sel_b]  # (top_k, output_dim)
+    # Pure per-sample loss as a function of gating params only.
+    # Routing is treated as fixed based on the input selected experts.
+    def _single_sample_loss(
+        gating_weight, gating_bias, input_b, expert_out_b, target_b, selected_b
+    ):
+        all_gating_scores = input_b @ gating_weight.T + gating_bias  # (E,)
+        selected_scores = all_gating_scores[selected_b]  # (top_k,)
+        selected_expert_out = expert_out_b[selected_b]  # (top_k, output_dim)
         if router_activation == "softmax":
-            probs = torch.softmax(tk_scores, dim=0)
+            gate_probs = torch.softmax(selected_scores, dim=0)
         else:
-            sig = torch.sigmoid(tk_scores)
-            probs = sig / sig.sum().clamp(min=1e-9)
-        pred = (sel_out * probs.unsqueeze(-1)).sum(dim=0)
-        return (pred - t_b).pow(2).mean()
+            sig = torch.sigmoid(selected_scores)
+            gate_probs = sig / sig.sum().clamp(min=1e-9)
+        prediction = (selected_expert_out * gate_probs.unsqueeze(-1)).sum(dim=0)
+        return (prediction - target_b).pow(2).mean()
 
+    # Function to compute the gradient of the loss with respect to the gating function parameters.
     _grad_loss = fgrad(_single_sample_loss, argnums=(0, 1))
 
-    def _single_sample_correction(gW, gb, x_b, eo_b, t_b, sel_b, top_b):
-        # First-order grads; stop-grad the top expert's rows to form v.
-        gW_b, gb_b = _grad_loss(gW, gb, x_b, eo_b, t_b, sel_b)
-        # Keep top_b as a 1-D index to avoid .item() calls inside vmap.
-        top_idx = top_b.unsqueeze(0)  # (1,)
-        v_w = gW_b[top_idx].squeeze(0).detach()  # (input_dim,)
-        v_bias = gb_b[top_idx].squeeze(0).detach()  # ()
+    def _single_sample_correction(
+        gating_weight,
+        gating_bias,
+        input_b,
+        expert_out_b,
+        target_b,
+        selected_b,
+        top_expert_b,
+    ):
+        # First-order grads; stop-grad the top expert's rows to form the HVP direction v.
+        grad_weight_b, grad_bias_b = _grad_loss(
+            gating_weight, gating_bias, input_b, expert_out_b, target_b, selected_b
+        )
 
-        # S_b = v . gW_b[top] + v_bias * gb_b[top]; grad of S_b w.r.t. params
-        # gives the Hessian-vector product used as the LOLA correction.
-        def _S(gW_, gb_):
-            gW_b_, gb_b_ = _grad_loss(gW_, gb_, x_b, eo_b, t_b, sel_b)
-            return (v_w * gW_b_[top_idx].squeeze(0)).sum() + v_bias * gb_b_[
-                top_idx
-            ].squeeze(0)
+        # unsqueeze to keep as 1-D index — avoids .item() calls inside vmap.
+        top_idx = top_expert_b.unsqueeze(0)  # (1,)
+        v_weight = grad_weight_b[top_idx].squeeze(0).detach()  # (input_dim,)
+        v_bias = grad_bias_b[top_idx].squeeze(0).detach()  # ()
 
-        return fgrad(_S, argnums=(0, 1))(gW, gb)  # (cW_b, cb_b)
+        # S_b = v . grad_weight_b[top] + v_bias * grad_bias_b[top]
+        # grad(S_b) gives the Hessian-vector product used as the LOLA correction.
+        def _shaping_scalar(gating_weight_, gating_bias_):
+            grad_weight_b_, grad_bias_b_ = _grad_loss(
+                gating_weight_,
+                gating_bias_,
+                input_b,
+                expert_out_b,
+                target_b,
+                selected_b,
+            )
+            return (
+                v_weight * grad_weight_b_[top_idx].squeeze(0)
+            ).sum() + v_bias * grad_bias_b_[top_idx].squeeze(0)
 
-    # Vectorise over the batch dimension; gW and gb are shared across samples.
-    all_cW, all_cb = vmap(
+        return fgrad(_shaping_scalar, argnums=(0, 1))(gating_weight, gating_bias)
+
+    # Vectorise over the batch dimension; gating params are shared across samples.
+    all_weight_corrections, all_bias_corrections = vmap(
         _single_sample_correction, in_dims=(None, None, 0, 0, 0, 0, 0)
     )(gating_w, gating_bias, x, expert_outputs, targets, selected, top_per_sample)
-    # all_cW: (B, E, input_dim),  all_cb: (B, E)
+    # all_weight_corrections: (B, E, input_dim),  all_bias_corrections: (B, E)
 
-    # The top expert's row is left untouched; zero its contribution.
-    E = gating_w.shape[0]
-    top_mask = torch.zeros(B, E, dtype=gating_w.dtype, device=gating_w.device)
-    top_mask[torch.arange(B), top_per_sample] = 1.0  # (B, E)
+    # The top expert's row is left untouched; zero its contribution before summing.
+    num_experts = gating_w.shape[0]
+    top_expert_mask = torch.zeros(
+        B, num_experts, dtype=gating_w.dtype, device=gating_w.device
+    )
+    top_expert_mask[torch.arange(B), top_per_sample] = 1.0  # (B, E)
+    others_mask = 1.0 - top_expert_mask  # (B, E)
 
     weight_correction = (
-        -(alpha / B) * (all_cW * (1.0 - top_mask).unsqueeze(-1)).sum(0).detach()
+        -(alpha / B)
+        * (all_weight_corrections * others_mask.unsqueeze(-1)).sum(0).detach()
     )
-    bias_correction = -(alpha / B) * (all_cb * (1.0 - top_mask)).sum(0).detach()
+    bias_correction = (
+        -(alpha / B) * (all_bias_corrections * others_mask).sum(0).detach()
+    )
 
+    # Apply LOLA correction to the gating function parameters gradient.
     if gating_w.grad is None:
         gating_w.grad = weight_correction
     else:
