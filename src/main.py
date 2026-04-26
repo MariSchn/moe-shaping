@@ -238,7 +238,7 @@ def main() -> None:
 
         # Inter Router LOLA shaping
         lola_alpha = training_cfg.get("inter_router_lola_weight", 0.0)
-        apply_lola_router_shaping(model, output, y, lola_alpha, x)
+        lola_corrections = apply_lola_router_shaping(model, output, y, lola_alpha, x)
         loss.backward(retain_graph=(lola_alpha != 0))
 
         # ===== LOGGING =====
@@ -251,13 +251,25 @@ def main() -> None:
         ).cpu()
 
         if use_wandb:
-            wandb.log(
-                {
-                    "loss": loss.item(),
-                    "expert_imbalance": load_balancing_loss.item(),
-                    "gating_grad_norm": gating_gradient_norm(model),
-                }
-            )
+            log_dict = {
+                "loss": loss.item(),
+                "expert_imbalance": load_balancing_loss.item(),
+                "gating_grad_norm": gating_gradient_norm(model),
+            }
+            if lola_corrections is not None:
+                w_corr, b_corr = lola_corrections
+                lola_norm = (w_corr.pow(2).sum() + b_corr.pow(2).sum()).sqrt().item()
+                regular_norm = (
+                    (
+                        (model.gating_function.weight.grad - w_corr).pow(2).sum()
+                        + (model.gating_function.bias.grad - b_corr).pow(2).sum()
+                    )
+                    .sqrt()
+                    .item()
+                )
+                log_dict["gating_grad_norm_lola"] = lola_norm
+                log_dict["gating_grad_norm_regular"] = regular_norm
+            wandb.log(log_dict)
 
         # ===== VISUALIZATION SNAPSHOT =====
         if step % cfg.logging.anim_sampling_rate == 0:

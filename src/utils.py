@@ -129,7 +129,7 @@ def apply_lola_router_shaping(
     targets: torch.Tensor,
     alpha: float,
     x: torch.Tensor,
-) -> None:
+) -> tuple[torch.Tensor, torch.Tensor] | None:
     """
     Add a LOLA-style shaping correction to the router (gating) gradients.
 
@@ -143,14 +143,20 @@ def apply_lola_router_shaping(
         targets: (B, output_dim) regression targets for the current batch.
         alpha: LOLA inner-step coefficient. Set to 0 to disable.
         x: (B, input_dim) model inputs for the current batch.
+
+    Returns:
+        (weight_correction, bias_correction) tensors that were added to the
+        gating gradients, or None when the correction is a no-op (alpha == 0
+        or top_k <= 1). The caller can use these to separate LOLA from the
+        regular gradient after loss.backward().
     """
     if alpha == 0:
-        return
+        return None
 
     selected = output["selected_experts"]  # (B, top_k)
     B, top_k = selected.shape
     if top_k <= 1:
-        return
+        return None
 
     # expert_outputs are fixed w.r.t. gating params -> detach to avoid leaking
     expert_outputs = output["expert_outputs"].detach()  # (B, E, output_dim)
@@ -170,6 +176,7 @@ def apply_lola_router_shaping(
 
     # Pure per-sample loss as a function of gating params only.
     # Routing is treated as fixed based on the input selected experts.
+    # The suffix "_b" indicates that a variable stores a value for a single sample.
     def _single_sample_loss(
         gating_weight, gating_bias, input_b, expert_out_b, target_b, selected_b
     ):
@@ -187,6 +194,8 @@ def apply_lola_router_shaping(
     # Function to compute the gradient of the loss with respect to the gating function parameters.
     _grad_loss = fgrad(_single_sample_loss, argnums=(0, 1))
 
+    # Function to compute the LOLA correction for a single sample.
+    # The suffix "_b" indicates that a variable stores a value for a single sample.
     def _single_sample_correction(
         gating_weight,
         gating_bias,
@@ -245,7 +254,6 @@ def apply_lola_router_shaping(
         -(alpha / B) * (all_bias_corrections * others_mask).sum(0).detach()
     )
 
-    # Apply LOLA correction to the gating function parameters gradient.
     if gating_w.grad is None:
         gating_w.grad = weight_correction
     else:
@@ -254,6 +262,11 @@ def apply_lola_router_shaping(
         gating_bias.grad = bias_correction
     else:
         gating_bias.grad = gating_bias.grad + bias_correction
+
+    # Clone before returning: gating_w.grad and weight_correction are the same
+    # tensor object when grad was None, so backward's in-place add_ would
+    # otherwise mutate the returned tensors and make the regular norm always 0.
+    return weight_correction.clone(), bias_correction.clone()
 
 
 def per_expert_gradient_norm(model: nn.Module) -> list[float]:
