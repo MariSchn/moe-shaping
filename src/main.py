@@ -11,6 +11,7 @@ import wandb
 from models import Model
 from targets import ModelTarget, PiecewiseLinearTarget
 from utils import (
+    apply_lola_router_shaping,
     calculate_load_balancing_loss,
     calculate_per_expert_loss,
     gating_gradient_norm,
@@ -234,7 +235,11 @@ def main() -> None:
             loss += training_cfg.load_balancing_loss_weight * load_balancing_loss
 
         optimizer.zero_grad()
-        loss.backward()
+
+        # Inter Router LOLA shaping
+        lola_alpha = training_cfg.get("inter_router_lola_weight", 0.0)
+        apply_lola_router_shaping(model, output, y, lola_alpha)
+        loss.backward(retain_graph=(lola_alpha != 0))
 
         # ===== LOGGING =====
         per_expert_grad_norms = per_expert_gradient_norm(model)

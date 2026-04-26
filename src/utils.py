@@ -122,6 +122,123 @@ def calculate_per_expert_loss(
     return per_expert_loss
 
 
+def apply_lola_router_shaping(
+    model: nn.Module,
+    output: dict,
+    targets: torch.Tensor,
+    alpha: float,
+) -> None:
+    """
+    Add a LOLA-style shaping correction to the router (gating) gradients.
+
+    For each sample b, let `top_b` be the most-chosen selected expert (highest
+    gating score among the top-k selected) and `others_b` the remaining selected
+    experts. For each j in `others_b`, the correction added to j's gating-weight
+    row is
+
+        delta W_j = -alpha * ( d^2 L_b / (dW_j dW_{top_b}) ) * (dL_b / dW_{top_b})
+
+    and analogously for the bias. The top expert's row is left untouched; the
+    "others" shape themselves with respect to how they couple to `top_b`. This
+    is computed as the gradient (w.r.t. W_j) of the LOLA-DiCE shaping scalar
+
+        S_b = (dL_b / dW_{top_b}) . stop_grad(dL_b / dW_{top_b}),
+
+    which yields the same Hessian-vector product. The correction is averaged
+    over the batch to match the scale of `MSELoss` (mean reduction), and is
+    *added* to whatever is already in `gating_function.{weight,bias}.grad`, so
+    it can be applied either before or after the standard `loss.backward()`
+    call (caller is responsible for `retain_graph=True` if needed).
+
+    No-op when `alpha == 0` or `top_k <= 1` (no "others" to shape from).
+
+    Args:
+        model: A `Model` instance with a `.gating_function` Linear.
+        output: The dict returned by `Model.forward` for the current batch.
+            Must contain `predictions`, `gating_scores`, `selected_experts`.
+        targets: (B, output_dim) regression targets for the current batch.
+        alpha: LOLA inner-step coefficient. Set to 0 to disable.
+    """
+    if alpha == 0:
+        return
+
+    selected = output["selected_experts"]  # (B, top_k)
+    B, top_k = selected.shape
+    if top_k <= 1:
+        return
+
+    gating_scores = output["gating_scores"]  # (B, num_experts)
+    predictions = output["predictions"]  # (B, output_dim)
+
+    # Identify the top-1 expert per sample within the selected set.
+    top_k_scores = torch.gather(gating_scores, 1, selected)  # (B, top_k)
+    top_idx_within_selected = top_k_scores.argmax(dim=1)  # (B,)
+    top_per_sample = torch.gather(
+        selected, 1, top_idx_within_selected.unsqueeze(1)
+    ).squeeze(1)  # (B,)
+
+    # Per-sample MSE loss (mean over output_dim, matching MSELoss(reduction='mean')).
+    per_sample_loss = (predictions - targets).pow(2).mean(dim=-1)  # (B,)
+
+    gating_w = model.gating_function.weight  # (num_experts, input_dim)
+    gating_bias = model.gating_function.bias  # (num_experts,)
+
+    weight_correction = torch.zeros_like(gating_w)
+    bias_correction = torch.zeros_like(gating_bias)
+
+    selected_list = selected.tolist()
+    top_list = top_per_sample.tolist()
+
+    # Per-sample loop. The "top" expert varies per sample, so the correction is
+    # naturally per-sample; vectorizing across the batch would require torch.func
+    # / vmap which is not used here for clarity.
+    for b in range(B):
+        top_b = top_list[b]
+        others_b = [e for e in selected_list[b] if e != top_b]
+        if not others_b:
+            continue
+
+        # First-order grads of L_b wrt the full gating weight + bias.
+        gW, gb = torch.autograd.grad(
+            per_sample_loss[b],
+            (gating_w, gating_bias),
+            create_graph=True,
+            retain_graph=True,
+        )
+
+        # LOLA shaping scalar built from the *top* expert's first-order grad.
+        # dS/dW_j = d^2 L_b / (dW_j dW_top) * stop_grad(dL_b / dW_top), which is
+        # the LOLA correction for the non-top selected experts.
+        S = (gW[top_b] * gW[top_b].detach()).sum() + (gb[top_b] * gb[top_b].detach())
+
+        # Hessian-vector product: dS/dW gives the correction; we keep only the
+        # rows corresponding to the *other* selected experts for this sample.
+        cW, cb = torch.autograd.grad(
+            S,
+            (gating_w, gating_bias),
+            retain_graph=True,
+        )
+        for j in others_b:
+            weight_correction[j] = weight_correction[j] - alpha * cW[j]
+            bias_correction[j] = bias_correction[j] - alpha * cb[j]
+
+    # Match the per-batch scaling of mean-reduced MSELoss.
+    weight_correction = weight_correction / B
+    bias_correction = bias_correction / B
+
+    weight_correction = weight_correction.detach()
+    bias_correction = bias_correction.detach()
+
+    if gating_w.grad is None:
+        gating_w.grad = weight_correction
+    else:
+        gating_w.grad = gating_w.grad + weight_correction
+    if gating_bias.grad is None:
+        gating_bias.grad = bias_correction
+    else:
+        gating_bias.grad = gating_bias.grad + bias_correction
+
+
 def per_expert_gradient_norm(model: nn.Module) -> list[float]:
     """L2 norm of each expert submodule's parameter gradients, one scalar per expert."""
     norms: list[float] = []
