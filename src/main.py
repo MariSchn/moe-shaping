@@ -251,11 +251,7 @@ def main() -> None:
         ).cpu()
 
         if use_wandb:
-            log_dict = {
-                "loss": loss.item(),
-                "expert_imbalance": load_balancing_loss.item(),
-                "gating_grad_norm": gating_gradient_norm(model),
-            }
+            total_grad_norm = gating_gradient_norm(model)
             if lola_corrections is not None:
                 w_corr, b_corr = lola_corrections
                 lola_norm = (w_corr.pow(2).sum() + b_corr.pow(2).sum()).sqrt().item()
@@ -267,9 +263,18 @@ def main() -> None:
                     .sqrt()
                     .item()
                 )
-                log_dict["gating_grad_norm_lola"] = lola_norm
-                log_dict["gating_grad_norm_regular"] = regular_norm
-            wandb.log(log_dict)
+            else:
+                lola_norm = 0.0
+                regular_norm = total_grad_norm
+            wandb.log(
+                {
+                    "loss": loss.item(),
+                    "expert_imbalance": load_balancing_loss.item(),
+                    "gating_grad_norm": total_grad_norm,
+                    "gating_grad_norm_lola": lola_norm,
+                    "gating_grad_norm_regular": regular_norm,
+                }
+            )
 
         # ===== VISUALIZATION SNAPSHOT =====
         if step % cfg.logging.anim_sampling_rate == 0:
