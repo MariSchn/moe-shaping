@@ -288,3 +288,37 @@ def gating_gradient_norm(model: nn.Module) -> float:
         if p.grad is not None:
             sum_sq += float(p.grad.detach().pow(2).sum().item())
     return sum_sq**0.5
+
+
+def per_expert_lola_regular_cosine_similarity(
+    lola_weight_grad: torch.Tensor,
+    lola_bias_grad: torch.Tensor,
+    regular_weight_grad: torch.Tensor,
+    regular_bias_grad: torch.Tensor,
+    eps: float = 1e-12,
+) -> tuple[float, float]:
+    """
+    Per-expert cosine similarity between the LOLA gradient and the regular
+    gradient, averaged over experts that received a non-zero LOLA update.
+    Returns NaN for the average if no expert has a LOLA update in this batch.
+
+    Weight rows are treated as vectors of length input_dim. Per-expert biases
+    are scalars, so their cosine similarity collapses to sign agreement (±1).
+    """
+    lola_w_norm = lola_weight_grad.norm(dim=-1)
+    reg_w_norm = regular_weight_grad.norm(dim=-1)
+    cos_w = (lola_weight_grad * regular_weight_grad).sum(dim=-1) / (
+        lola_w_norm * reg_w_norm
+    ).clamp(min=eps)
+    mask_w = lola_w_norm > eps
+    cos_w_mean = cos_w[mask_w].mean().item() if mask_w.any() else float("nan")
+
+    lola_b_abs = lola_bias_grad.abs()
+    reg_b_abs = regular_bias_grad.abs()
+    cos_b = (lola_bias_grad * regular_bias_grad) / (lola_b_abs * reg_b_abs).clamp(
+        min=eps
+    )
+    mask_b = lola_b_abs > eps
+    cos_b_mean = cos_b[mask_b].mean().item() if mask_b.any() else float("nan")
+
+    return cos_w_mean, cos_b_mean

@@ -17,6 +17,7 @@ from utils import (
     gating_gradient_norm,
     get_device,
     per_expert_gradient_norm,
+    per_expert_lola_regular_cosine_similarity,
     sample_uniformly,
     set_seed,
 )
@@ -254,18 +255,22 @@ def main() -> None:
             total_grad_norm = gating_gradient_norm(model)
             if lola_corrections is not None:
                 w_corr, b_corr = lola_corrections
+                regular_w_grad = model.gating_function.weight.grad - w_corr
+                regular_b_grad = model.gating_function.bias.grad - b_corr
                 lola_norm = (w_corr.pow(2).sum() + b_corr.pow(2).sum()).sqrt().item()
                 regular_norm = (
-                    (
-                        (model.gating_function.weight.grad - w_corr).pow(2).sum()
-                        + (model.gating_function.bias.grad - b_corr).pow(2).sum()
-                    )
+                    (regular_w_grad.pow(2).sum() + regular_b_grad.pow(2).sum())
                     .sqrt()
                     .item()
+                )
+                cos_w, cos_b = per_expert_lola_regular_cosine_similarity(
+                    w_corr, b_corr, regular_w_grad, regular_b_grad
                 )
             else:
                 lola_norm = 0.0
                 regular_norm = total_grad_norm
+                cos_w = float("nan")
+                cos_b = float("nan")
             wandb.log(
                 {
                     "loss": loss.item(),
@@ -273,6 +278,8 @@ def main() -> None:
                     "gating_grad_norm": total_grad_norm,
                     "gating_grad_norm_lola": lola_norm,
                     "gating_grad_norm_regular": regular_norm,
+                    "lola_regular_cos_sim_weight": cos_w,
+                    "lola_regular_cos_sim_bias": cos_b,
                 }
             )
 
