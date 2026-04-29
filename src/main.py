@@ -239,7 +239,10 @@ def main() -> None:
 
         # Inter Router LOLA shaping
         lola_alpha = training_cfg.get("inter_router_lola_weight", 0.0)
-        lola_corrections = apply_lola_router_shaping(model, output, y, lola_alpha, x)
+        lola_naive_learner = training_cfg.get("lola_naive_learner", "top1")
+        lola_corrections = apply_lola_router_shaping(
+            model, output, y, lola_alpha, x, naive_learner=lola_naive_learner
+        )
         loss.backward(retain_graph=(lola_alpha != 0))
 
         # ===== LOGGING =====

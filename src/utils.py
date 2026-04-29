@@ -123,18 +123,39 @@ def calculate_per_expert_loss(
     return per_expert_loss
 
 
+def _select_naive_per_sample(
+    gating_scores: torch.Tensor,
+    selected: torch.Tensor,
+    naive_learner: str,
+) -> torch.Tensor:
+    """Pick the naive learner index (in expert space) per sample from the selected set."""
+    top_k_scores = torch.gather(gating_scores, 1, selected)  # (B, top_k)
+    if naive_learner == "top1":
+        idx = top_k_scores.argmax(dim=1)
+    elif naive_learner == "bottom1":
+        idx = top_k_scores.argmin(dim=1)
+    else:
+        raise ValueError(
+            f"naive_learner must be 'top1' or 'bottom1', got {naive_learner!r}"
+        )
+    return torch.gather(selected, 1, idx.unsqueeze(1)).squeeze(1)  # (B,)
+
+
 def apply_lola_router_shaping(
     model: nn.Module,
     output: dict,
     targets: torch.Tensor,
     alpha: float,
     x: torch.Tensor,
+    naive_learner: str = "top1",
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """
     Add a LOLA-style shaping correction to the router (gating) gradients.
 
-    This function models the top-1 expert as a naive learner and the remaining
-    top-k experts as LOLA learners, shaping the top-1 expert.
+    One of the selected experts per sample is treated as a naive learner (its
+    gating row gets only the regular gradient); the remaining selected experts
+    are LOLA learners whose gating-row gradients are corrected to anticipate
+    the naive learner's update.
 
     Args:
         model: A `Model` instance with a `.gating_function` Linear.
@@ -143,6 +164,9 @@ def apply_lola_router_shaping(
         targets: (B, output_dim) regression targets for the current batch.
         alpha: LOLA inner-step coefficient. Set to 0 to disable.
         x: (B, input_dim) model inputs for the current batch.
+        naive_learner: How to pick the naive learner per sample from the
+            selected experts. "top1" picks the highest-scoring; "bottom1"
+            picks the lowest-scoring.
 
     Returns:
         (weight_correction, bias_correction) tensors that were added to the
@@ -162,12 +186,9 @@ def apply_lola_router_shaping(
     expert_outputs = output["expert_outputs"].detach()  # (B, E, output_dim)
     gating_scores = output["gating_scores"]  # (B, num_experts)
 
-    # Identify the top-1 expert per sample within the selected set.
-    top_k_scores = torch.gather(gating_scores, 1, selected)  # (B, top_k)
-    top_idx_within_selected = top_k_scores.argmax(dim=1)  # (B,)
-    top_per_sample = torch.gather(
-        selected, 1, top_idx_within_selected.unsqueeze(1)
-    ).squeeze(1)  # (B,)
+    naive_per_sample = _select_naive_per_sample(
+        gating_scores, selected, naive_learner
+    )  # (B,)
 
     # Extract the gating function
     gating_w = model.gating_function.weight  # (E, input_dim)
@@ -203,19 +224,19 @@ def apply_lola_router_shaping(
         expert_out_b,
         target_b,
         selected_b,
-        top_expert_b,
+        naive_expert_b,
     ):
-        # First-order grads; stop-grad the top expert's rows to form the HVP direction v.
+        # First-order grads; stop-grad the naive learner's row to form the HVP direction v.
         grad_weight_b, grad_bias_b = _grad_loss(
             gating_weight, gating_bias, input_b, expert_out_b, target_b, selected_b
         )
 
         # unsqueeze to keep as 1-D index — avoids .item() calls inside vmap.
-        top_idx = top_expert_b.unsqueeze(0)  # (1,)
-        v_weight = grad_weight_b[top_idx].squeeze(0).detach()  # (input_dim,)
-        v_bias = grad_bias_b[top_idx].squeeze(0).detach()  # ()
+        naive_idx = naive_expert_b.unsqueeze(0)  # (1,)
+        v_weight = grad_weight_b[naive_idx].squeeze(0).detach()  # (input_dim,)
+        v_bias = grad_bias_b[naive_idx].squeeze(0).detach()  # ()
 
-        # S_b = v . grad_weight_b[top] + v_bias * grad_bias_b[top]
+        # S_b = v . grad_weight_b[naive] + v_bias * grad_bias_b[naive]
         # grad(S_b) gives the Hessian-vector product used as the LOLA correction.
         def _shaping_scalar(gating_weight_, gating_bias_):
             grad_weight_b_, grad_bias_b_ = _grad_loss(
@@ -227,24 +248,24 @@ def apply_lola_router_shaping(
                 selected_b,
             )
             return (
-                v_weight * grad_weight_b_[top_idx].squeeze(0)
-            ).sum() + v_bias * grad_bias_b_[top_idx].squeeze(0)
+                v_weight * grad_weight_b_[naive_idx].squeeze(0)
+            ).sum() + v_bias * grad_bias_b_[naive_idx].squeeze(0)
 
         return fgrad(_shaping_scalar, argnums=(0, 1))(gating_weight, gating_bias)
 
     # Vectorise over the batch dimension; gating params are shared across samples.
     all_weight_corrections, all_bias_corrections = vmap(
         _single_sample_correction, in_dims=(None, None, 0, 0, 0, 0, 0)
-    )(gating_w, gating_bias, x, expert_outputs, targets, selected, top_per_sample)
+    )(gating_w, gating_bias, x, expert_outputs, targets, selected, naive_per_sample)
     # all_weight_corrections: (B, E, input_dim),  all_bias_corrections: (B, E)
 
-    # The top expert's row is left untouched; zero its contribution before summing.
+    # The naive learner's row is left untouched; zero its contribution before summing.
     num_experts = gating_w.shape[0]
-    top_expert_mask = torch.zeros(
+    naive_expert_mask = torch.zeros(
         B, num_experts, dtype=gating_w.dtype, device=gating_w.device
     )
-    top_expert_mask[torch.arange(B), top_per_sample] = 1.0  # (B, E)
-    others_mask = 1.0 - top_expert_mask  # (B, E)
+    naive_expert_mask[torch.arange(B), naive_per_sample] = 1.0  # (B, E)
+    others_mask = 1.0 - naive_expert_mask  # (B, E)
 
     weight_correction = (
         -(alpha / B)

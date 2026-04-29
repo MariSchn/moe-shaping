@@ -41,9 +41,9 @@ model:
   freeze_experts: false
 
 training:
-  num_steps: 2500
+  num_steps: 5000
   batch_size: 128
-  learning_rate: 0.01
+  learning_rate: 1e-2
   # One of: SGD, Adam, AdamW
   optimizer: Adam
   # Controls the weight of the Switch Transformer-style load balancing loss (1e-2 default from paper).
@@ -52,6 +52,8 @@ training:
   auxiliarly_loss_free_load_balancing_gamma: 0.0
   # Inter Router LOLA shaping weight. For each sample, the non-top selected experts
   inter_router_lola_weight: 0.0
+  # Which selected expert plays the naive learner per sample: "top1" or "bottom1".
+  lola_naive_learner: top1
 
 logging:
   anim_sampling_rate: 50

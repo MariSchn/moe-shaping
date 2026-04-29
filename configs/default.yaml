@@ -6,14 +6,14 @@ target:
   domain: [-1, 1]
   kwargs:
     num_experts: 4
-    input_dim: 1
+    input_dim: 8
     output_dim: 1
     router_top_k: 2
     router_activation: softmax
 
 model:
   num_experts: 4
-  input_dim: 1
+  input_dim: 8
   output_dim: 1
   router_top_k: 2
   router_activation: softmax
@@ -21,7 +21,7 @@ model:
   freeze_experts: false
 
 training:
-  num_steps: 2500
+  num_steps: 5000
   batch_size: 128
   learning_rate: 0.01
   # One of: SGD, Adam, AdamW
@@ -31,7 +31,9 @@ training:
   # DeepSeek V3 auxiliary loss-free load balancing gamma, controlling how much is added/subtracted to under/over-utilized experts (1e-3 default from paper)
   auxiliarly_loss_free_load_balancing_gamma: 0.0
   # Inter Router LOLA shaping weight. For each sample, the non-top selected experts
-  inter_router_lola_weight: 0.0
+  inter_router_lola_weight: 1.0
+  # Which selected expert plays the naive learner per sample: "top1" or "bottom1".
+  lola_naive_learner: top1
 
 logging:
   anim_sampling_rate: 50
@@ -40,5 +42,5 @@ wandb:
   enabled: true
   project: moe-shaping
   entity: mari-schn
-  run_name: Default
+  run_name: Input Dim 8 LOLA=1.0
   run_tags: []
