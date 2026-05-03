@@ -32,8 +32,9 @@ training:
   auxiliarly_loss_free_load_balancing_gamma: 0.0
   # Inter Router LOLA shaping weight. For each sample, the non-top selected experts
   inter_router_lola_weight: 1.0
-  # Which selected expert plays the naive learner per sample: "top1" or "bottom1".
-  lola_naive_learner: top1
+  # Naive learner role: "top1" / "bottom1" pick one selected expert per sample;
+  # "none" makes every selected expert a LOLA learner shaping the others.
+  lola_naive_learner: none
 
 logging:
   anim_sampling_rate: 50
@@ -42,5 +43,5 @@ wandb:
   enabled: true
   project: moe-shaping
   entity: mari-schn
-  run_name: Input Dim 8 LOLA=1.0
+  run_name: Default
   run_tags: []

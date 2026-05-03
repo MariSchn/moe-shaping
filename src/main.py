@@ -88,7 +88,6 @@ def main() -> None:
                 for name, path in sorted(leaf_paths)
                 if OmegaConf.select(cfg, path) is not None
             ]
-            print("Parts:", parts)
             if parts:
                 wandb.run.name = "_".join(parts)
                 cfg.output_dir = os.path.join(
