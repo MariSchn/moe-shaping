@@ -123,47 +123,58 @@ def calculate_per_expert_loss(
     return per_expert_loss
 
 
-def _naive_role_indices(
+def _lola_naive_indices(
     gating_scores: torch.Tensor,
     selected: torch.Tensor,
-    naive_learner: str,
+    lola_learner: str,
 ) -> torch.Tensor:
     """
-    Indices (in expert space) of the experts that play the naive role per sample.
+    Naive-role indices (in expert space) implied by the `lola_learner` spec.
 
-    Returns (B, K) where K=1 for "top1"/"bottom1" and K=top_k for "none" (every
-    selected expert is a naive learner in turn).
+    The for-loops in the shaping functions iterate over naive roles per sample
+    and apply the correction to the LOLA-learner rows (i.e. the selected
+    experts that aren't playing the naive role in that iteration). This helper
+    returns those naive indices given which selected expert(s) the user
+    designates as LOLA learners.
+
+    Returns (B, K) where K=1 for "top1"/"bottom1" and K=top_k for "all"
+    (every selected expert plays the naive role in turn while the others
+    act as LOLA learners shaping each other).
     """
-    if naive_learner == "none":
+    if lola_learner == "all":
         return selected
     top_k_scores = torch.gather(gating_scores, 1, selected)  # (B, top_k)
-    if naive_learner == "top1":
-        idx = top_k_scores.argmax(dim=1)
-    elif naive_learner == "bottom1":
+    # `lola_learner == "top1"` means the top-scoring selected expert is the
+    # LOLA learner, so the naive role goes to the bottom-scoring one (and vice
+    # versa). For top_k=2 this is symmetric; for top_k>2 the helper still
+    # picks a single naive index per sample.
+    if lola_learner == "top1":
         idx = top_k_scores.argmin(dim=1)
+    elif lola_learner == "bottom1":
+        idx = top_k_scores.argmax(dim=1)
     else:
         raise ValueError(
-            f"naive_learner must be one of ('top1', 'bottom1', 'none'), got {naive_learner!r}"
+            f"lola_learner must be one of ('top1', 'bottom1', 'all'), got {lola_learner!r}"
         )
     return torch.gather(selected, 1, idx.unsqueeze(1))  # (B, 1)
 
 
-def apply_lola_router_shaping(
+def apply_router_router_lola_shaping(
     model: nn.Module,
     output: dict,
     targets: torch.Tensor,
     alpha: float,
     x: torch.Tensor,
-    naive_learner: str = "top1",
+    lola_learner: str = "all",
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """
-    Add a LOLA-style shaping correction to the router (gating) gradients.
+    Router-router LOLA shaping: routers shape routers via gating gradients.
 
-    Some selected experts play the naive-learner role (their gating row gets
-    only the regular gradient) and the remaining selected experts are LOLA
-    learners whose gating-row gradients are corrected to anticipate the naive
-    learners' update. Whether a single expert or all selected experts play
-    the naive role is controlled by `naive_learner` — see below.
+    Some selected experts play the LOLA-learner role (their gating row is
+    corrected to anticipate the naive learners' update) and the remaining
+    selected experts are naive learners (their gating row gets only the
+    regular gradient). Which selected expert(s) act as LOLA learners is
+    controlled by `lola_learner` — see below.
 
     Args:
         model: A `Model` instance with a `.gating_function` Linear.
@@ -172,12 +183,12 @@ def apply_lola_router_shaping(
         targets: (B, output_dim) regression targets for the current batch.
         alpha: LOLA inner-step coefficient. Set to 0 to disable.
         x: (B, input_dim) model inputs for the current batch.
-        naive_learner: How to pick the naive learner per sample from the
-            selected experts. "top1" picks the highest-scoring; "bottom1"
-            picks the lowest-scoring; "none" makes every selected expert a
-            LOLA learner that shapes the others (no naive learner) — the
-            correction is summed over each selected expert's shaping role,
-            so its magnitude scales with top_k.
+        lola_learner: Which selected expert(s) are LOLA learners per sample.
+            "top1" picks the highest-scoring; "bottom1" picks the
+            lowest-scoring; "all" makes every selected expert a LOLA
+            learner that shapes the others — the correction is summed over
+            each selected expert's shaping role, so its magnitude scales
+            with top_k.
 
     Returns:
         (weight_correction, bias_correction) tensors that were added to the
@@ -197,9 +208,9 @@ def apply_lola_router_shaping(
     expert_outputs = output["expert_outputs"].detach()  # (B, E, output_dim)
     gating_scores = output["gating_scores"]  # (B, num_experts)
 
-    naive_indices = _naive_role_indices(
-        gating_scores, selected, naive_learner
-    )  # (B, K) — K=1 for top1/bottom1, K=top_k for "none"
+    naive_indices = _lola_naive_indices(
+        gating_scores, selected, lola_learner
+    )  # (B, K) — K=1 for top1/bottom1, K=top_k for "all"
 
     # Extract the gating function
     gating_w = model.gating_function.weight  # (E, input_dim)
@@ -303,21 +314,21 @@ def apply_lola_router_shaping(
     return weight_correction.clone(), bias_correction.clone()
 
 
-def apply_lola_expert_shaping(
+def apply_expert_expert_lola_shaping(
     model: nn.Module,
     output: dict,
     targets: torch.Tensor,
     alpha: float,
     x: torch.Tensor,
-    naive_learner: str = "top1",
+    lola_learner: str = "top1",
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """
-    Add a LOLA-style shaping correction to the expert (FFN) gradients.
+    Expert-expert LOLA shaping: experts shape experts via FFN gradients.
 
-    Per sample, one or more selected experts play the naive-learner
-    role (their parameters are taken to descend along their own loss
-    gradient); the remaining selected experts are LOLA learners whose
-    parameter gradients are corrected to anticipate the naive learners' step.
+    Per sample, one or more selected experts act as LOLA learners whose
+    parameter gradients are corrected to anticipate the naive learners' step;
+    the remaining selected experts are naive learners (their parameters
+    descend along their own loss gradient).
 
     Args:
         model: A `Model` instance with `model.experts` an `nn.ModuleList` of
@@ -327,8 +338,8 @@ def apply_lola_expert_shaping(
         targets: (B, output_dim) regression targets for the current batch.
         alpha: LOLA inner-step coefficient. Set to 0 to disable.
         x: (B, input_dim) model inputs for the current batch.
-        naive_learner: How to pick the naive learner per sample from the
-            selected experts. Same semantics as `apply_lola_router_shaping`.
+        lola_learner: Which selected expert(s) are LOLA learners per sample.
+            Same semantics as `apply_router_router_lola_shaping`.
 
     Returns:
         (weight_correction, bias_correction) tensors that were added to the
@@ -357,9 +368,9 @@ def apply_lola_expert_shaping(
         gate_probs = sig / sig.sum(dim=1, keepdim=True).clamp(min=1e-9)
     gate_probs = gate_probs.detach()  # (B, top_k)
 
-    naive_indices = _naive_role_indices(
-        gating_scores, selected, naive_learner
-    )  # (B, K) — K=1 for top1/bottom1, K=top_k for "none"
+    naive_indices = _lola_naive_indices(
+        gating_scores, selected, lola_learner
+    )  # (B, K) — K=1 for top1/bottom1, K=top_k for "all"
 
     # Stack expert params into a single (E, ...) tensor so we can vmap over samples and take grads w.r.t. all experts at once.
     experts_w = torch.stack([e.weight for e in model.experts], dim=0)

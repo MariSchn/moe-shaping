@@ -11,8 +11,8 @@ import wandb
 from models import Model
 from targets import ModelTarget, PiecewiseLinearTarget
 from utils import (
-    apply_lola_expert_shaping,
-    apply_lola_router_shaping,
+    apply_expert_expert_lola_shaping,
+    apply_router_router_lola_shaping,
     calculate_load_balancing_loss,
     calculate_per_expert_loss,
     gating_gradient_norm,
@@ -237,25 +237,27 @@ def main() -> None:
 
         optimizer.zero_grad()
 
-        # Inter Router LOLA shaping
-        lola_alpha = training_cfg.get("inter_router_lola_weight", 0.0)
-        lola_naive_learner = training_cfg.get("lola_naive_learner", "top1")
-        lola_corrections = apply_lola_router_shaping(
-            model, output, y, lola_alpha, x, naive_learner=lola_naive_learner
+        # Router-Router LOLA shaping
+        lola_alpha = training_cfg.get("router_router_lola_weight", 0.0)
+        router_router_lola_learner = training_cfg.get(
+            "router_router_lola_learner", "all"
+        )
+        lola_corrections = apply_router_router_lola_shaping(
+            model, output, y, lola_alpha, x, lola_learner=router_router_lola_learner
         )
 
-        # Inter Expert LOLA shaping
-        expert_lola_alpha = training_cfg.get("inter_expert_lola_weight", 0.0)
-        expert_lola_naive_learner = training_cfg.get(
-            "expert_lola_naive_learner", "top1"
+        # Expert-Expert LOLA shaping
+        expert_lola_alpha = training_cfg.get("expert_expert_lola_weight", 0.0)
+        expert_expert_lola_learner = training_cfg.get(
+            "expert_expert_lola_learner", "all"
         )
-        expert_lola_corrections = apply_lola_expert_shaping(
+        expert_lola_corrections = apply_expert_expert_lola_shaping(
             model,
             output,
             y,
             expert_lola_alpha,
             x,
-            naive_learner=expert_lola_naive_learner,
+            lola_learner=expert_expert_lola_learner,
         )
 
         loss.backward(retain_graph=(lola_alpha != 0 or expert_lola_alpha != 0))
