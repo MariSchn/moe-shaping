@@ -303,6 +303,153 @@ def apply_lola_router_shaping(
     return weight_correction.clone(), bias_correction.clone()
 
 
+def apply_lola_expert_shaping(
+    model: nn.Module,
+    output: dict,
+    targets: torch.Tensor,
+    alpha: float,
+    x: torch.Tensor,
+    naive_learner: str = "top1",
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """
+    Add a LOLA-style shaping correction to the expert (FFN) gradients.
+
+    Per sample, one or more selected experts play the naive-learner
+    role (their parameters are taken to descend along their own loss
+    gradient); the remaining selected experts are LOLA learners whose
+    parameter gradients are corrected to anticipate the naive learners' step.
+
+    Args:
+        model: A `Model` instance with `model.experts` an `nn.ModuleList` of
+            `nn.Linear` and `model.router_activation` set.
+        output: The dict returned by `Model.forward` for the current batch.
+            Must contain `gating_scores` and `selected_experts`.
+        targets: (B, output_dim) regression targets for the current batch.
+        alpha: LOLA inner-step coefficient. Set to 0 to disable.
+        x: (B, input_dim) model inputs for the current batch.
+        naive_learner: How to pick the naive learner per sample from the
+            selected experts. Same semantics as `apply_lola_router_shaping`.
+
+    Returns:
+        (weight_correction, bias_correction) tensors that were added to the
+        per-expert parameter gradients, with shapes
+        (num_experts, output_dim, input_dim) and (num_experts, output_dim);
+        or None when the correction is a no-op (alpha == 0 or top_k <= 1).
+    """
+    if alpha == 0:
+        return None
+
+    selected = output["selected_experts"]  # (B, top_k)
+    B, top_k = selected.shape
+    if top_k <= 1:
+        return None
+
+    gating_scores = output["gating_scores"]  # (B, num_experts)
+    router_activation = model.router_activation
+
+    # Gating probabilities over the selected experts.
+    # Detached, since for the expert-shaping loss the gates are treated as fixed.
+    selected_scores = torch.gather(gating_scores, 1, selected)  # (B, top_k)
+    if router_activation == "softmax":
+        gate_probs = torch.softmax(selected_scores, dim=1)
+    else:
+        sig = torch.sigmoid(selected_scores)
+        gate_probs = sig / sig.sum(dim=1, keepdim=True).clamp(min=1e-9)
+    gate_probs = gate_probs.detach()  # (B, top_k)
+
+    naive_indices = _naive_role_indices(
+        gating_scores, selected, naive_learner
+    )  # (B, K) — K=1 for top1/bottom1, K=top_k for "none"
+
+    # Stack expert params into a single (E, ...) tensor so we can vmap over samples and take grads w.r.t. all experts at once.
+    experts_w = torch.stack([e.weight for e in model.experts], dim=0)
+    experts_b = torch.stack([e.bias for e in model.experts], dim=0)
+    num_experts = experts_w.shape[0]
+
+    # Per-sample loss as a function of expert params only. Routing (which
+    # experts and with what gate weight) is fixed via `selected` and
+    # `gate_probs_b` — the loss varies only `experts_w` and `experts_b`.
+    def _single_sample_loss(
+        experts_w, experts_b, input_b, gate_probs_b, target_b, selected_b
+    ):
+        sel_w = experts_w[selected_b]  # (top_k, output_dim, input_dim)
+        sel_b = experts_b[selected_b]  # (top_k, output_dim)
+        sel_outs = sel_w @ input_b + sel_b  # (top_k, output_dim)
+        prediction = (sel_outs * gate_probs_b.unsqueeze(-1)).sum(dim=0)
+        return (prediction - target_b).pow(2).mean()
+
+    _grad_loss = fgrad(_single_sample_loss, argnums=(0, 1))
+
+    def _single_sample_correction(
+        experts_w,
+        experts_b,
+        input_b,
+        gate_probs_b,
+        target_b,
+        selected_b,
+        naive_expert_b,
+    ):
+        grad_w_b, grad_b_b = _grad_loss(
+            experts_w, experts_b, input_b, gate_probs_b, target_b, selected_b
+        )
+
+        naive_idx = naive_expert_b.unsqueeze(0)  # (1,)
+        v_w = grad_w_b[naive_idx].squeeze(0).detach()  # (output_dim, input_dim)
+        v_b = grad_b_b[naive_idx].squeeze(0).detach()  # (output_dim,)
+
+        def _shaping_scalar(experts_w_, experts_b_):
+            gw, gb = _grad_loss(
+                experts_w_,
+                experts_b_,
+                input_b,
+                gate_probs_b,
+                target_b,
+                selected_b,
+            )
+            return (v_w * gw[naive_idx].squeeze(0)).sum() + (
+                v_b * gb[naive_idx].squeeze(0)
+            ).sum()
+
+        return fgrad(_shaping_scalar, argnums=(0, 1))(experts_w, experts_b)
+
+    arange_B = torch.arange(B, device=experts_w.device)
+    weight_correction = torch.zeros_like(experts_w)
+    bias_correction = torch.zeros_like(experts_b)
+    for naive_per_sample in naive_indices.unbind(dim=1):  # each (B,)
+        all_w, all_b = vmap(
+            _single_sample_correction, in_dims=(None, None, 0, 0, 0, 0, 0)
+        )(experts_w, experts_b, x, gate_probs, targets, selected, naive_per_sample)
+        # all_w: (B, E, output_dim, input_dim), all_b: (B, E, output_dim)
+        naive_mask = torch.zeros(
+            B, num_experts, dtype=experts_w.dtype, device=experts_w.device
+        )
+        naive_mask[arange_B, naive_per_sample] = 1.0  # (B, E)
+        others_mask = 1.0 - naive_mask
+        weight_correction = (
+            weight_correction
+            - (alpha / B)
+            * (all_w * others_mask.view(B, num_experts, 1, 1)).sum(0).detach()
+        )
+        bias_correction = (
+            bias_correction
+            - (alpha / B)
+            * (all_b * others_mask.view(B, num_experts, 1)).sum(0).detach()
+        )
+
+    # Distribute the per-expert correction back to each Linear's .grad.
+    for i, expert in enumerate(model.experts):
+        if expert.weight.grad is None:
+            expert.weight.grad = weight_correction[i].clone()
+        else:
+            expert.weight.grad = expert.weight.grad + weight_correction[i]
+        if expert.bias.grad is None:
+            expert.bias.grad = bias_correction[i].clone()
+        else:
+            expert.bias.grad = expert.bias.grad + bias_correction[i]
+
+    return weight_correction.clone(), bias_correction.clone()
+
+
 def per_expert_gradient_norm(model: nn.Module) -> list[float]:
     """L2 norm of each expert submodule's parameter gradients, one scalar per expert."""
     norms: list[float] = []
@@ -336,23 +483,21 @@ def per_expert_lola_regular_cosine_similarity(
     gradient, averaged over experts that received a non-zero LOLA update.
     Returns NaN for the average if no expert has a LOLA update in this batch.
 
-    Weight rows are treated as vectors of length input_dim. Per-expert biases
-    are scalars, so their cosine similarity collapses to sign agreement (±1).
+    Inputs may be any shape with the leading dim equal to num_experts; trailing
+    dims are flattened into a single per-expert vector. For 1-D bias of shape
+    (num_experts,), this collapses to sign agreement (±1).
     """
-    lola_w_norm = lola_weight_grad.norm(dim=-1)
-    reg_w_norm = regular_weight_grad.norm(dim=-1)
-    cos_w = (lola_weight_grad * regular_weight_grad).sum(dim=-1) / (
-        lola_w_norm * reg_w_norm
-    ).clamp(min=eps)
-    mask_w = lola_w_norm > eps
-    cos_w_mean = cos_w[mask_w].mean().item() if mask_w.any() else float("nan")
 
-    lola_b_abs = lola_bias_grad.abs()
-    reg_b_abs = regular_bias_grad.abs()
-    cos_b = (lola_bias_grad * regular_bias_grad) / (lola_b_abs * reg_b_abs).clamp(
-        min=eps
+    def _per_expert_cos(lola: torch.Tensor, regular: torch.Tensor) -> float:
+        lola_flat = lola.reshape(lola.shape[0], -1)
+        reg_flat = regular.reshape(regular.shape[0], -1)
+        lola_norm = lola_flat.norm(dim=-1)
+        reg_norm = reg_flat.norm(dim=-1)
+        cos = (lola_flat * reg_flat).sum(dim=-1) / (lola_norm * reg_norm).clamp(min=eps)
+        mask = lola_norm > eps
+        return cos[mask].mean().item() if mask.any() else float("nan")
+
+    return (
+        _per_expert_cos(lola_weight_grad, regular_weight_grad),
+        _per_expert_cos(lola_bias_grad, regular_bias_grad),
     )
-    mask_b = lola_b_abs > eps
-    cos_b_mean = cos_b[mask_b].mean().item() if mask_b.any() else float("nan")
-
-    return cos_w_mean, cos_b_mean

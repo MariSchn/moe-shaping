@@ -11,6 +11,7 @@ import wandb
 from models import Model
 from targets import ModelTarget, PiecewiseLinearTarget
 from utils import (
+    apply_lola_expert_shaping,
     apply_lola_router_shaping,
     calculate_load_balancing_loss,
     calculate_per_expert_loss,
@@ -242,7 +243,22 @@ def main() -> None:
         lola_corrections = apply_lola_router_shaping(
             model, output, y, lola_alpha, x, naive_learner=lola_naive_learner
         )
-        loss.backward(retain_graph=(lola_alpha != 0))
+
+        # Inter Expert LOLA shaping
+        expert_lola_alpha = training_cfg.get("inter_expert_lola_weight", 0.0)
+        expert_lola_naive_learner = training_cfg.get(
+            "expert_lola_naive_learner", "top1"
+        )
+        expert_lola_corrections = apply_lola_expert_shaping(
+            model,
+            output,
+            y,
+            expert_lola_alpha,
+            x,
+            naive_learner=expert_lola_naive_learner,
+        )
+
+        loss.backward(retain_graph=(lola_alpha != 0 or expert_lola_alpha != 0))
 
         # ===== LOGGING =====
         per_expert_grad_norms = per_expert_gradient_norm(model)
@@ -273,6 +289,36 @@ def main() -> None:
                 regular_norm = total_grad_norm
                 cos_w = float("nan")
                 cos_b = float("nan")
+
+            # Expert-side LOLA decomposition.
+            expert_total_norm = sum(n * n for n in per_expert_grad_norms) ** 0.5
+            if expert_lola_corrections is not None:
+                ew_corr, eb_corr = expert_lola_corrections
+                experts_w_grad = torch.stack(
+                    [e.weight.grad for e in model.experts], dim=0
+                )
+                experts_b_grad = torch.stack(
+                    [e.bias.grad for e in model.experts], dim=0
+                )
+                regular_ew_grad = experts_w_grad - ew_corr
+                regular_eb_grad = experts_b_grad - eb_corr
+                expert_lola_norm = (
+                    (ew_corr.pow(2).sum() + eb_corr.pow(2).sum()).sqrt().item()
+                )
+                expert_regular_norm = (
+                    (regular_ew_grad.pow(2).sum() + regular_eb_grad.pow(2).sum())
+                    .sqrt()
+                    .item()
+                )
+                expert_cos_w, expert_cos_b = per_expert_lola_regular_cosine_similarity(
+                    ew_corr, eb_corr, regular_ew_grad, regular_eb_grad
+                )
+            else:
+                expert_lola_norm = 0.0
+                expert_regular_norm = expert_total_norm
+                expert_cos_w = float("nan")
+                expert_cos_b = float("nan")
+
             wandb.log(
                 {
                     "loss": loss.item(),
@@ -282,6 +328,11 @@ def main() -> None:
                     "gating_grad_norm_regular": regular_norm,
                     "lola_regular_cos_sim_weight": cos_w,
                     "lola_regular_cos_sim_bias": cos_b,
+                    "expert_grad_norm": expert_total_norm,
+                    "expert_grad_norm_lola": expert_lola_norm,
+                    "expert_grad_norm_regular": expert_regular_norm,
+                    "expert_lola_regular_cos_sim_weight": expert_cos_w,
+                    "expert_lola_regular_cos_sim_bias": expert_cos_b,
                 }
             )
 

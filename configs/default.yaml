@@ -30,11 +30,15 @@ training:
   load_balancing_loss_weight: 0.0
   # DeepSeek V3 auxiliary loss-free load balancing gamma, controlling how much is added/subtracted to under/over-utilized experts (1e-3 default from paper)
   auxiliarly_loss_free_load_balancing_gamma: 0.0
-  # Inter Router LOLA shaping weight. For each sample, the non-top selected experts
-  inter_router_lola_weight: 1.0
+  # Inter Router LOLA shaping weight.
+  inter_router_lola_weight: 0.0
   # Naive learner role: "top1" / "bottom1" pick one selected expert per sample;
   # "none" makes every selected expert a LOLA learner shaping the others.
   lola_naive_learner: none
+  # Inter Expert LOLA shaping weight.
+  inter_expert_lola_weight: 1.0
+  # Naive learner role for inter-expert LOLA: "top1" / "bottom1" / "none".
+  expert_lola_naive_learner: top1
 
 logging:
   anim_sampling_rate: 50
