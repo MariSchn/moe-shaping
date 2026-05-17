@@ -34,12 +34,14 @@ training:
   router_router_lola_weight: 0.0
   # Which selected expert(s) act as LOLA learners (shaped to anticipate the
   # naive learners' update): "top1" / "bottom1" pick one per sample; "all"
-  # makes every selected expert a LOLA learner shaping the others.
+  # makes every selected expert a LOLA learner shaping the others; "fixed:N"
+  # pins expert N as the sole LOLA learner (samples where N isn't selected
+  # contribute zero correction).
   router_router_lola_learner: all
   # Expert-Expert LOLA shaping weight.
   expert_expert_lola_weight: 0.0
   # Which selected expert(s) act as LOLA learners for expert-expert shaping:
-  # "top1" / "bottom1" / "all".
+  # "top1" / "bottom1" / "all" / "fixed:N".
   expert_expert_lola_learner: all
 
 logging:

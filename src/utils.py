@@ -137,11 +137,19 @@ def _lola_naive_indices(
     returns those naive indices given which selected expert(s) the user
     designates as LOLA learners.
 
-    Returns (B, K) where K=1 for "top1"/"bottom1" and K=top_k for "all"
-    (every selected expert plays the naive role in turn while the others
-    act as LOLA learners shaping each other).
+    Returns (B, K) where K=1 for "top1"/"bottom1" and K=top_k for "all" and
+    "fixed:N" (every selected expert plays the naive role in turn while the
+    others act as LOLA learners shaping each other; for "fixed:N" the
+    iteration where naive == N self-cancels via the recipient mask).
     """
-    if lola_learner == "all":
+    fixed_n = _parse_fixed_lola_learner(lola_learner)
+    if lola_learner == "all" or fixed_n is not None:
+        if fixed_n is not None:
+            num_experts = gating_scores.shape[1]
+            if not 0 <= fixed_n < num_experts:
+                raise ValueError(
+                    f"fixed lola_learner index {fixed_n} out of range [0, {num_experts})"
+                )
         return selected
     top_k_scores = torch.gather(gating_scores, 1, selected)  # (B, top_k)
     # `lola_learner == "top1"` means the top-scoring selected expert is the
@@ -154,9 +162,60 @@ def _lola_naive_indices(
         idx = top_k_scores.argmax(dim=1)
     else:
         raise ValueError(
-            f"lola_learner must be one of ('top1', 'bottom1', 'all'), got {lola_learner!r}"
+            f"lola_learner must be one of ('top1', 'bottom1', 'all', 'fixed:N'), got {lola_learner!r}"
         )
     return torch.gather(selected, 1, idx.unsqueeze(1))  # (B, 1)
+
+
+def _parse_fixed_lola_learner(lola_learner: str) -> int | None:
+    """Return the integer N if `lola_learner` is `fixed:N`, else None.
+
+    Raises ValueError on a malformed `fixed:` string (e.g. non-integer suffix).
+    Range checking against `num_experts` is done by the caller.
+    """
+    if not isinstance(lola_learner, str) or not lola_learner.startswith("fixed:"):
+        return None
+    suffix = lola_learner[len("fixed:") :]
+    try:
+        return int(suffix)
+    except ValueError:
+        raise ValueError(
+            f"fixed lola_learner must be of form 'fixed:N' with N an integer, got {lola_learner!r}"
+        )
+
+
+def _lola_recipient_mask(
+    lola_learner: str,
+    selected: torch.Tensor,
+    naive_per_sample: torch.Tensor,
+    num_experts: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """(B, E) mask of experts that should receive the LOLA correction.
+
+    For non-fixed modes this is `1 - naive_mask` — every non-naive expert
+    (non-selected experts have zero gradient anyway, so the correction lands
+    only on the other selected experts).
+
+    For `fixed:N`, only expert N receives the correction, and only for samples
+    where N is in `selected`. The iteration where naive == N self-cancels
+    because expert N is then both the recipient and the naive expert.
+    """
+    B = selected.shape[0]
+    device = selected.device
+    arange_B = torch.arange(B, device=device)
+    naive_mask = torch.zeros(B, num_experts, dtype=dtype, device=device)
+    naive_mask[arange_B, naive_per_sample] = 1.0
+
+    n = _parse_fixed_lola_learner(lola_learner)
+    if n is None:
+        return 1.0 - naive_mask
+
+    fixed_one_hot = torch.zeros(num_experts, dtype=dtype, device=device)
+    fixed_one_hot[n] = 1.0
+    is_selected = (selected == n).any(dim=1, keepdim=True).to(dtype)  # (B, 1)
+    recipient = fixed_one_hot.unsqueeze(0).expand(B, -1) * is_selected  # (B, E)
+    return recipient * (1.0 - naive_mask)
 
 
 def apply_router_router_lola_shaping(
@@ -188,7 +247,9 @@ def apply_router_router_lola_shaping(
             lowest-scoring; "all" makes every selected expert a LOLA
             learner that shapes the others — the correction is summed over
             each selected expert's shaping role, so its magnitude scales
-            with top_k.
+            with top_k. "fixed:N" pins expert N as the sole LOLA learner
+            regardless of gating scores; samples where N is not in the
+            selected experts contribute zero correction.
 
     Returns:
         (weight_correction, bias_correction) tensors that were added to the
@@ -279,18 +340,15 @@ def apply_router_router_lola_shaping(
     # the batch and accumulate the correction with the naive's own row masked
     # out — i.e. each expert is shaped only by the other selected experts.
     num_experts = gating_w.shape[0]
-    arange_B = torch.arange(B, device=gating_w.device)
     weight_correction = torch.zeros_like(gating_w)
     bias_correction = torch.zeros_like(gating_bias)
     for naive_per_sample in naive_indices.unbind(dim=1):  # each (B,)
         all_w, all_b = vmap(
             _single_sample_correction, in_dims=(None, None, 0, 0, 0, 0, 0)
         )(gating_w, gating_bias, x, expert_outputs, targets, selected, naive_per_sample)
-        naive_mask = torch.zeros(
-            B, num_experts, dtype=gating_w.dtype, device=gating_w.device
+        others_mask = _lola_recipient_mask(
+            lola_learner, selected, naive_per_sample, num_experts, gating_w.dtype
         )
-        naive_mask[arange_B, naive_per_sample] = 1.0  # (B, E)
-        others_mask = 1.0 - naive_mask
         weight_correction = (
             weight_correction
             - (alpha / B) * (all_w * others_mask.unsqueeze(-1)).sum(0).detach()
@@ -423,7 +481,6 @@ def apply_expert_expert_lola_shaping(
 
         return fgrad(_shaping_scalar, argnums=(0, 1))(experts_w, experts_b)
 
-    arange_B = torch.arange(B, device=experts_w.device)
     weight_correction = torch.zeros_like(experts_w)
     bias_correction = torch.zeros_like(experts_b)
     for naive_per_sample in naive_indices.unbind(dim=1):  # each (B,)
@@ -431,11 +488,9 @@ def apply_expert_expert_lola_shaping(
             _single_sample_correction, in_dims=(None, None, 0, 0, 0, 0, 0)
         )(experts_w, experts_b, x, gate_probs, targets, selected, naive_per_sample)
         # all_w: (B, E, output_dim, input_dim), all_b: (B, E, output_dim)
-        naive_mask = torch.zeros(
-            B, num_experts, dtype=experts_w.dtype, device=experts_w.device
+        others_mask = _lola_recipient_mask(
+            lola_learner, selected, naive_per_sample, num_experts, experts_w.dtype
         )
-        naive_mask[arange_B, naive_per_sample] = 1.0  # (B, E)
-        others_mask = 1.0 - naive_mask
         weight_correction = (
             weight_correction
             - (alpha / B)
