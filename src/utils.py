@@ -516,6 +516,408 @@ def apply_expert_expert_lola_shaping(
     return weight_correction.clone(), bias_correction.clone()
 
 
+def _cross_recipient_mask(
+    pairing: str,
+    lola_learner: str,
+    selected: torch.Tensor,
+    naive_per_sample: torch.Tensor,
+    num_experts: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """(B, E) recipient mask for cross-shaping (router-expert / expert-router).
+
+    Unlike inter-router and inter-expert, the diagonal pairing i = j is not
+    self-shaping here: w_Gi and W_i are disjoint parameter sets. We therefore
+    expose three pairing modes via `pairing`:
+
+    - "off_diagonal" (i != j): same convention as `_lola_recipient_mask` for
+      the existing inter-router/expert shapings — every non-naive selected
+      expert receives the LOLA correction.
+    - "diagonal" (i == j): only the naive expert's own pair receives the
+      correction (the qualitatively new case from the derivation; see
+      report §A.5, "Note on the i=j case").
+    - "all": every selected expert receives the correction (union of the
+      above two; recipients are the entire selected set).
+
+    For `fixed:N` lola_learner, the mask is further restricted to expert N,
+    matching `_lola_recipient_mask`'s fixed-mode behaviour.
+    """
+    B = selected.shape[0]
+    device = selected.device
+    arange_B = torch.arange(B, device=device)
+    naive_mask = torch.zeros(B, num_experts, dtype=dtype, device=device)
+    naive_mask[arange_B, naive_per_sample] = 1.0
+
+    if pairing == "off_diagonal":
+        base = 1.0 - naive_mask
+    elif pairing == "diagonal":
+        base = naive_mask
+    elif pairing == "all":
+        base = torch.ones(B, num_experts, dtype=dtype, device=device)
+    else:
+        raise ValueError(
+            f"pairing must be one of ('off_diagonal', 'diagonal', 'all'), got {pairing!r}"
+        )
+
+    n = _parse_fixed_lola_learner(lola_learner)
+    if n is None:
+        return base
+
+    fixed_one_hot = torch.zeros(num_experts, dtype=dtype, device=device)
+    fixed_one_hot[n] = 1.0
+    is_selected = (selected == n).any(dim=1, keepdim=True).to(dtype)  # (B, 1)
+    return base * fixed_one_hot.unsqueeze(0).expand(B, -1) * is_selected
+
+
+def apply_router_expert_lola_shaping(
+    model: nn.Module,
+    output: dict,
+    targets: torch.Tensor,
+    alpha: float,
+    x: torch.Tensor,
+    lola_learner: str = "all",
+    pairing: str = "diagonal",
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """
+    Router-Expert LOLA shaping (Direction A): a router row w_Gi is the LOLA
+    learner that anticipates an expert's naive step on W_j (and b_j).
+
+    The closed-form correction derived in report §A.5 is
+
+        Delta w_Gi = -4 alpha G_j^2 (||x||^2 + 1) (r^T v_ij) x
+        Delta b_Gi = -4 alpha G_j^2 (||x||^2 + 1) (r^T v_ij)
+
+    with v_ij = (delta_{ji} - G_i) r + G_i delta_i. This function realises the
+    same correction without that closed form, by computing the HVP
+
+        -alpha * grad_{router} [ v^T grad_{W_j, b_j} L ]
+
+    via torch.func.grad / vmap — same pattern as the existing inter-router and
+    inter-expert shaping functions in this module. The closed-form formula is
+    verified against this autograd implementation in
+    `debug_cross_shaping.py` at the repo root.
+
+    Args:
+        model, output, targets, alpha, x, lola_learner: same semantics as
+            `apply_router_router_lola_shaping`.
+        pairing: how to pair the LOLA router index i with the naive expert
+            index j per sample. See `_cross_recipient_mask`. Defaults to
+            "diagonal" (i = j) — the qualitatively new cross-shaping case
+            from the derivation, where each selected expert's router row is
+            shaped to anticipate that same expert's weight update.
+
+    Returns:
+        (weight_correction, bias_correction) tensors added to the router's
+        gradients, with shapes (num_experts, input_dim) and (num_experts,);
+        or None when the correction is a no-op (alpha == 0, or pairing is
+        "off_diagonal" with top_k <= 1).
+    """
+    if alpha == 0:
+        return None
+
+    selected = output["selected_experts"]  # (B, top_k)
+    B, top_k = selected.shape
+    if pairing == "off_diagonal" and top_k <= 1:
+        return None  # off-diagonal pairing needs at least two selected experts
+
+    gating_scores = output["gating_scores"]
+    router_activation = model.router_activation
+
+    naive_indices = _lola_naive_indices(
+        gating_scores, selected, lola_learner
+    )  # (B, K) — which expert plays the naive role per sample
+
+    gating_w = model.gating_function.weight  # (E, input_dim)
+    gating_bias = model.gating_function.bias  # (E,)
+    experts_w = torch.stack(
+        [e.weight for e in model.experts], dim=0
+    )  # (E, output_dim, input_dim)
+    experts_b = torch.stack([e.bias for e in model.experts], dim=0)  # (E, output_dim)
+    num_experts = gating_w.shape[0]
+
+    # Per-sample loss as a function of BOTH router and expert params.
+    # The cross-Hessian is non-zero precisely because of this joint dependence.
+    def _single_sample_loss(
+        gating_weight,
+        gating_bias_,
+        experts_w_,
+        experts_b_,
+        input_b,
+        target_b,
+        selected_b,
+    ):
+        all_gating_scores = input_b @ gating_weight.T + gating_bias_  # (E,)
+        selected_scores = all_gating_scores[selected_b]  # (top_k,)
+        if router_activation == "softmax":
+            gate_probs = torch.softmax(selected_scores, dim=0)
+        else:
+            sig = torch.sigmoid(selected_scores)
+            gate_probs = sig / sig.sum().clamp(min=1e-9)
+        sel_w = experts_w_[selected_b]  # (top_k, output_dim, input_dim)
+        sel_b = experts_b_[selected_b]  # (top_k, output_dim)
+        sel_outs = sel_w @ input_b + sel_b  # (top_k, output_dim)
+        prediction = (sel_outs * gate_probs.unsqueeze(-1)).sum(dim=0)
+        return (prediction - target_b).pow(2).mean()
+
+    # Naive-side gradient: w.r.t. expert params (argnums 2, 3).
+    _grad_naive = fgrad(_single_sample_loss, argnums=(2, 3))
+
+    def _single_sample_correction(
+        gating_weight,
+        gating_bias_,
+        experts_w_,
+        experts_b_,
+        input_b,
+        target_b,
+        selected_b,
+        naive_expert_b,
+    ):
+        # Detached naive gradient direction v = (grad_{W_j, b_j} L).
+        grad_W_full, grad_b_full = _grad_naive(
+            gating_weight,
+            gating_bias_,
+            experts_w_,
+            experts_b_,
+            input_b,
+            target_b,
+            selected_b,
+        )
+        naive_idx = naive_expert_b.unsqueeze(0)  # (1,)
+        v_W = grad_W_full[naive_idx].squeeze(0).detach()  # (output_dim, input_dim)
+        v_b = grad_b_full[naive_idx].squeeze(0).detach()  # (output_dim,)
+
+        # Shaping scalar S(gating_w, gating_b) = v . grad_{W_j, b_j} L(gating_w, gating_b).
+        # grad(S) gives the cross-HVP used as the LOLA correction.
+        def _shaping_scalar(gating_weight_, gating_bias_2):
+            gW, gB = _grad_naive(
+                gating_weight_,
+                gating_bias_2,
+                experts_w_,
+                experts_b_,
+                input_b,
+                target_b,
+                selected_b,
+            )
+            return (v_W * gW[naive_idx].squeeze(0)).sum() + (
+                v_b * gB[naive_idx].squeeze(0)
+            ).sum()
+
+        return fgrad(_shaping_scalar, argnums=(0, 1))(gating_weight, gating_bias_)
+
+    weight_correction = torch.zeros_like(gating_w)
+    bias_correction = torch.zeros_like(gating_bias)
+    for naive_per_sample in naive_indices.unbind(dim=1):  # each (B,)
+        all_w, all_b = vmap(
+            _single_sample_correction, in_dims=(None, None, None, None, 0, 0, 0, 0)
+        )(
+            gating_w,
+            gating_bias,
+            experts_w,
+            experts_b,
+            x,
+            targets,
+            selected,
+            naive_per_sample,
+        )
+        # all_w: (B, E, input_dim), all_b: (B, E)
+        mask = _cross_recipient_mask(
+            pairing,
+            lola_learner,
+            selected,
+            naive_per_sample,
+            num_experts,
+            gating_w.dtype,
+        )
+        weight_correction = (
+            weight_correction
+            - (alpha / B) * (all_w * mask.unsqueeze(-1)).sum(0).detach()
+        )
+        bias_correction = bias_correction - (alpha / B) * (all_b * mask).sum(0).detach()
+
+    if gating_w.grad is None:
+        gating_w.grad = weight_correction
+    else:
+        gating_w.grad = gating_w.grad + weight_correction
+    if gating_bias.grad is None:
+        gating_bias.grad = bias_correction
+    else:
+        gating_bias.grad = gating_bias.grad + bias_correction
+
+    return weight_correction.clone(), bias_correction.clone()
+
+
+def apply_expert_router_lola_shaping(
+    model: nn.Module,
+    output: dict,
+    targets: torch.Tensor,
+    alpha: float,
+    x: torch.Tensor,
+    lola_learner: str = "all",
+    pairing: str = "diagonal",
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """
+    Expert-Router LOLA shaping (Direction B): an expert W_j is the LOLA
+    learner that anticipates a router row's naive step on w_Gi (and b_Gi).
+
+    The closed-form correction derived in report §A.5 is
+
+        Delta W_j = -4 alpha G_i G_j (||x||^2 + 1) (r^T delta_i) v_ij x^T
+        Delta b_j = -4 alpha G_i G_j (||x||^2 + 1) (r^T delta_i) v_ij
+
+    with v_ij = (delta_{ji} - G_i) r + G_i delta_i, where Schwarz's symmetry
+    gives the same cross-Hessian as Direction A — we just contract it over
+    the w_Gi axis instead of the W_j axes. Verified against this autograd
+    implementation in `debug_cross_shaping.py`.
+
+    Args:
+        model, output, targets, alpha, x, lola_learner: same semantics as
+            `apply_expert_expert_lola_shaping`.
+        pairing: how to pair the LOLA expert index j with the naive router
+            index i. See `_cross_recipient_mask`. Defaults to "diagonal"
+            (j = i) — each selected expert's weights are shaped to
+            anticipate that same expert's router row update.
+
+    Returns:
+        (weight_correction, bias_correction) tensors added to the per-expert
+        gradients, with shapes (num_experts, output_dim, input_dim) and
+        (num_experts, output_dim); or None when the correction is a no-op
+        (alpha == 0, or pairing is "off_diagonal" with top_k <= 1).
+    """
+    if alpha == 0:
+        return None
+
+    selected = output["selected_experts"]  # (B, top_k)
+    B, top_k = selected.shape
+    if pairing == "off_diagonal" and top_k <= 1:
+        return None
+
+    gating_scores = output["gating_scores"]
+    router_activation = model.router_activation
+
+    naive_indices = _lola_naive_indices(
+        gating_scores, selected, lola_learner
+    )  # (B, K) — which expert plays the naive role per sample
+
+    gating_w = model.gating_function.weight
+    gating_bias = model.gating_function.bias
+    experts_w = torch.stack([e.weight for e in model.experts], dim=0)
+    experts_b = torch.stack([e.bias for e in model.experts], dim=0)
+    num_experts = gating_w.shape[0]
+
+    # Same joint loss as Direction A.
+    def _single_sample_loss(
+        gating_weight,
+        gating_bias_,
+        experts_w_,
+        experts_b_,
+        input_b,
+        target_b,
+        selected_b,
+    ):
+        all_gating_scores = input_b @ gating_weight.T + gating_bias_
+        selected_scores = all_gating_scores[selected_b]
+        if router_activation == "softmax":
+            gate_probs = torch.softmax(selected_scores, dim=0)
+        else:
+            sig = torch.sigmoid(selected_scores)
+            gate_probs = sig / sig.sum().clamp(min=1e-9)
+        sel_w = experts_w_[selected_b]
+        sel_b = experts_b_[selected_b]
+        sel_outs = sel_w @ input_b + sel_b
+        prediction = (sel_outs * gate_probs.unsqueeze(-1)).sum(dim=0)
+        return (prediction - target_b).pow(2).mean()
+
+    # Naive-side gradient: w.r.t. router params (argnums 0, 1).
+    _grad_naive = fgrad(_single_sample_loss, argnums=(0, 1))
+
+    def _single_sample_correction(
+        gating_weight,
+        gating_bias_,
+        experts_w_,
+        experts_b_,
+        input_b,
+        target_b,
+        selected_b,
+        naive_expert_b,
+    ):
+        # Detached naive gradient v = (grad_{w_Gi, b_Gi} L) at the current params.
+        grad_w_full, grad_b_full = _grad_naive(
+            gating_weight,
+            gating_bias_,
+            experts_w_,
+            experts_b_,
+            input_b,
+            target_b,
+            selected_b,
+        )
+        naive_idx = naive_expert_b.unsqueeze(0)
+        v_w = grad_w_full[naive_idx].squeeze(0).detach()  # (input_dim,)
+        v_b = grad_b_full[naive_idx].squeeze(0).detach()  # ()
+
+        # Shaping scalar S(experts_w, experts_b); its grad gives the cross-HVP.
+        def _shaping_scalar(experts_w_2, experts_b_2):
+            gw, gB = _grad_naive(
+                gating_weight,
+                gating_bias_,
+                experts_w_2,
+                experts_b_2,
+                input_b,
+                target_b,
+                selected_b,
+            )
+            return (v_w * gw[naive_idx].squeeze(0)).sum() + v_b * gB[naive_idx].squeeze(
+                0
+            )
+
+        return fgrad(_shaping_scalar, argnums=(0, 1))(experts_w_, experts_b_)
+
+    weight_correction = torch.zeros_like(experts_w)
+    bias_correction = torch.zeros_like(experts_b)
+    for naive_per_sample in naive_indices.unbind(dim=1):
+        all_w, all_b = vmap(
+            _single_sample_correction, in_dims=(None, None, None, None, 0, 0, 0, 0)
+        )(
+            gating_w,
+            gating_bias,
+            experts_w,
+            experts_b,
+            x,
+            targets,
+            selected,
+            naive_per_sample,
+        )
+        # all_w: (B, E, output_dim, input_dim), all_b: (B, E, output_dim)
+        mask = _cross_recipient_mask(
+            pairing,
+            lola_learner,
+            selected,
+            naive_per_sample,
+            num_experts,
+            experts_w.dtype,
+        )
+        weight_correction = (
+            weight_correction
+            - (alpha / B) * (all_w * mask.view(B, num_experts, 1, 1)).sum(0).detach()
+        )
+        bias_correction = (
+            bias_correction
+            - (alpha / B) * (all_b * mask.view(B, num_experts, 1)).sum(0).detach()
+        )
+
+    # Distribute the per-expert correction back to each Linear's .grad.
+    for i, expert in enumerate(model.experts):
+        if expert.weight.grad is None:
+            expert.weight.grad = weight_correction[i].clone()
+        else:
+            expert.weight.grad = expert.weight.grad + weight_correction[i]
+        if expert.bias.grad is None:
+            expert.bias.grad = bias_correction[i].clone()
+        else:
+            expert.bias.grad = expert.bias.grad + bias_correction[i]
+
+    return weight_correction.clone(), bias_correction.clone()
+
+
 def per_expert_gradient_norm(model: nn.Module) -> list[float]:
     """L2 norm of each expert submodule's parameter gradients, one scalar per expert."""
     norms: list[float] = []
