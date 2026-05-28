@@ -969,3 +969,32 @@ def per_expert_lola_regular_cosine_similarity(
         _per_expert_cos(lola_weight_grad, regular_weight_grad),
         _per_expert_cos(lola_bias_grad, regular_bias_grad),
     )
+
+
+class BilevelOptimizer:
+    """Alternates router-only and expert-only gradient steps.
+
+    Exposes the same zero_grad() / step() interface as a regular PyTorch
+    optimizer so the training loop needs no changes.
+    """
+
+    def __init__(
+        self, router_optimizer, expert_optimizer, router_steps: int, expert_steps: int
+    ):
+        self._opts = (router_optimizer, expert_optimizer)
+        self._cycle = router_steps + expert_steps
+        self._router_steps = router_steps
+        self._step = 0
+
+    @property
+    def in_router_phase(self) -> bool:
+        return (self._step % self._cycle) < self._router_steps
+
+    def zero_grad(self):
+        for opt in self._opts:
+            opt.zero_grad()
+
+    def step(self):
+        active = self._opts[0] if self.in_router_phase else self._opts[1]
+        active.step()
+        self._step += 1

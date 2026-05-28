@@ -11,6 +11,7 @@ import wandb
 from models import Model
 from targets import ModelTarget, PiecewiseLinearTarget
 from utils import (
+    BilevelOptimizer,
     apply_expert_expert_lola_shaping,
     apply_router_router_lola_shaping,
     calculate_load_balancing_loss,
@@ -137,10 +138,29 @@ def main() -> None:
             p.requires_grad_(False)
 
     training_cfg = cfg.training
-    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
     optimizer_type = training_cfg.get("optimizer", "SGD")
     optimizer_cls = getattr(torch.optim, optimizer_type)
-    optimizer = optimizer_cls(trainable_params, lr=training_cfg.learning_rate)
+
+    bilevel_cfg = training_cfg.get("bilevel", None)
+    bilevel_router_steps = bilevel_cfg.router_steps if bilevel_cfg is not None else 0
+    bilevel_expert_steps = bilevel_cfg.expert_steps if bilevel_cfg is not None else 1
+    if bilevel_router_steps > 0:
+        router_lr = bilevel_cfg.get("router_lr") or training_cfg.learning_rate
+        expert_lr = bilevel_cfg.get("expert_lr") or training_cfg.learning_rate
+        router_opt = optimizer_cls(
+            [p for p in model.gating_function.parameters() if p.requires_grad],
+            lr=router_lr,
+        )
+        expert_opt = optimizer_cls(
+            [p for p in model.experts.parameters() if p.requires_grad],
+            lr=expert_lr,
+        )
+        optimizer = BilevelOptimizer(
+            router_opt, expert_opt, bilevel_router_steps, bilevel_expert_steps
+        )
+    else:
+        trainable_params = filter(lambda p: p.requires_grad, model.parameters())
+        optimizer = optimizer_cls(trainable_params, lr=training_cfg.learning_rate)
     loss_fn = nn.MSELoss()
 
     viz_frames = []
@@ -335,6 +355,11 @@ def main() -> None:
                     "expert_grad_norm_regular": expert_regular_norm,
                     "expert_lola_regular_cos_sim_weight": expert_cos_w,
                     "expert_lola_regular_cos_sim_bias": expert_cos_b,
+                    "bilevel_phase": (
+                        int(not optimizer.in_router_phase)
+                        if isinstance(optimizer, BilevelOptimizer)
+                        else -1
+                    ),
                 }
             )
 
