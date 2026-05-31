@@ -136,6 +136,11 @@ def main() -> None:
     if freeze_experts:
         for p in model.experts.parameters():
             p.requires_grad_(False)
+    if use_wandb:
+        wandb.summary["num_parameters"] = sum(p.numel() for p in model.parameters())
+        wandb.summary["num_trainable_parameters"] = sum(
+            p.numel() for p in model.parameters() if p.requires_grad
+        )
 
     training_cfg = cfg.training
     optimizer_type = training_cfg.get("optimizer", "SGD")
