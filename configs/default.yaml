@@ -43,6 +43,14 @@ training:
   # Which selected expert(s) act as LOLA learners for expert-expert shaping:
   # "top1" / "bottom1" / "all" / "fixed:N".
   expert_expert_lola_learner: all
+  bilevel:
+    # Set router_steps > 0 to enable bilevel optimization.
+    # Each cycle does router_steps router-only gradient updates then expert_steps expert-only updates.
+    router_steps: 0
+    expert_steps: 1
+    # Per-component learning rates; fall back to training.learning_rate if null.
+    router_lr: null
+    expert_lr: null
 
 logging:
   anim_sampling_rate: 50
