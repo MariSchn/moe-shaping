@@ -346,16 +346,16 @@ def main() -> None:
                     "loss": loss.item(),
                     "expert_imbalance": load_balancing_loss.item(),
                     "gating_grad_norm": total_grad_norm,
-                    "gating_grad_norm_lola": lola_norm,
-                    "gating_grad_norm_regular": regular_norm,
-                    "lola_regular_cos_sim_weight": cos_w,
-                    "lola_regular_cos_sim_bias": cos_b,
                     "expert_grad_norm": expert_total_norm,
-                    "expert_grad_norm_lola": expert_lola_norm,
-                    "expert_grad_norm_regular": expert_regular_norm,
-                    "expert_lola_regular_cos_sim_weight": expert_cos_w,
-                    "expert_lola_regular_cos_sim_bias": expert_cos_b,
-                    "bilevel_phase": (
+                    "lola/gating_grad_norm_lola": lola_norm,
+                    "lola/gating_grad_norm_regular": regular_norm,
+                    "lola/lola_regular_cos_sim_weight": cos_w,
+                    "lola/lola_regular_cos_sim_bias": cos_b,
+                    "lola/expert_grad_norm_lola": expert_lola_norm,
+                    "lola/expert_grad_norm_regular": expert_regular_norm,
+                    "lola/expert_lola_regular_cos_sim_weight": expert_cos_w,
+                    "lola/expert_lola_regular_cos_sim_bias": expert_cos_b,
+                    "bilevel/phase": (
                         int(not optimizer.in_router_phase)
                         if isinstance(optimizer, BilevelOptimizer)
                         else -1
