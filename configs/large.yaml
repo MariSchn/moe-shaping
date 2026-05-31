@@ -1,0 +1,67 @@
+output_dir: "./outputs/large"
+seed: 0
+
+target:
+  type: model  # "piecewise_linear" or "model"
+  domain: [-1, 1]
+  kwargs:
+    num_experts: 128
+    input_dim: 1024
+    output_dim: 1024
+    router_top_k: 8
+    router_activation: softmax
+    expert_hidden_dim: 1024
+    expert_num_layers: 6
+
+model:
+  num_experts: 64
+  input_dim: 1024
+  output_dim: 1024
+  router_top_k: 8
+  router_activation: softmax
+  expert_hidden_dim: 512
+  expert_num_layers: 2
+  freeze_router: false
+  freeze_experts: false
+
+training:
+  num_steps: 10000
+  batch_size: 8
+  learning_rate: 1e-3
+  # One of: SGD, Adam, AdamW
+  optimizer: Adam
+  # Controls the weight of the Switch Transformer-style load balancing loss (1e-2 default from paper).
+  load_balancing_loss_weight: 0.0
+  # DeepSeek V3 auxiliary loss-free load balancing gamma, controlling how much is added/subtracted to under/over-utilized experts (1e-3 default from paper)
+  auxiliarly_loss_free_load_balancing_gamma: 0.0
+  # Router-Router LOLA shaping weight.
+  router_router_lola_weight: 0.0
+  # Which selected expert(s) act as LOLA learners (shaped to anticipate the
+  # naive learners' update): "top1" / "bottom1" pick one per sample; "all"
+  # makes every selected expert a LOLA learner shaping the others; "fixed:N"
+  # pins expert N as the sole LOLA learner (samples where N isn't selected
+  # contribute zero correction).
+  router_router_lola_learner: all
+  # Expert-Expert LOLA shaping weight.
+  expert_expert_lola_weight: 0.0
+  # Which selected expert(s) act as LOLA learners for expert-expert shaping:
+  # "top1" / "bottom1" / "all" / "fixed:N".
+  expert_expert_lola_learner: all
+  bilevel:
+    # Set router_steps > 0 to enable bilevel optimization.
+    # Each cycle does router_steps router-only gradient updates then expert_steps expert-only updates.
+    router_steps: 0
+    expert_steps: 1
+    # Per-component learning rates; fall back to training.learning_rate if null.
+    router_lr: null
+    expert_lr: null
+
+logging:
+  anim_sampling_rate: 25000
+
+wandb:
+  enabled: true
+  project: moe-shaping
+  entity: mari-schn
+  run_name: Large Experts
+  run_tags: []
