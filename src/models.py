@@ -3,6 +3,71 @@ import torch.nn as nn
 from typing import Tuple
 
 
+class Expert(nn.Module):
+    """A single expert mapping ``input_dim -> output_dim``.
+
+    For ``num_layers == 1`` this is exactly a single ``nn.Linear(input_dim,
+    output_dim)``, so its behavior — and its ``.weight`` / ``.bias`` parameters —
+    are identical to the plain linear experts used previously. For
+    ``num_layers > 1`` it is a standard MLP with ``hidden_dim`` hidden units and
+    ReLU non-linearities between consecutive linear layers.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dim: int | None = None,
+        num_layers: int = 1,
+    ):
+        super().__init__()
+
+        if num_layers < 1:
+            raise ValueError(f"num_layers must be >= 1, got {num_layers}")
+        if num_layers > 1 and hidden_dim is None:
+            raise ValueError("hidden_dim must be set when num_layers > 1")
+
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+
+        if num_layers == 1:
+            layers = [nn.Linear(input_dim, output_dim, bias=True)]
+        else:
+            layers = [nn.Linear(input_dim, hidden_dim, bias=True), nn.ReLU()]
+            for _ in range(num_layers - 2):
+                layers += [nn.Linear(hidden_dim, hidden_dim, bias=True), nn.ReLU()]
+            layers += [nn.Linear(hidden_dim, output_dim, bias=True)]
+
+        self.net = nn.Sequential(*layers)
+
+    @property
+    def is_linear(self) -> bool:
+        return self.num_layers == 1
+
+    @property
+    def weight(self) -> torch.Tensor:
+        # Exposed for backward compatibility (e.g. LoLA shaping), which assumes a
+        # single linear expert. Only well-defined for single-layer experts.
+        if not self.is_linear:
+            raise AttributeError(
+                "Expert.weight is only defined for single-layer (num_layers=1) experts"
+            )
+        return self.net[0].weight
+
+    @property
+    def bias(self) -> torch.Tensor:
+        if not self.is_linear:
+            raise AttributeError(
+                "Expert.bias is only defined for single-layer (num_layers=1) experts"
+            )
+        return self.net[0].bias
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class Model(nn.Module):
     def __init__(
         self,
@@ -11,6 +76,8 @@ class Model(nn.Module):
         output_dim: int,
         router_top_k: int,
         router_activation: str = "softmax",
+        expert_hidden_dim: int | None = None,
+        expert_num_layers: int = 1,
         initial_expert_weights: list[list[float]] = None,
         initial_expert_biases: list[list[float]] = None,
         initial_gating_weights: list[list[float]] = None,
@@ -29,8 +96,19 @@ class Model(nn.Module):
         self.router_top_k = router_top_k
         self.router_activation = router_activation
 
+        self.expert_hidden_dim = expert_hidden_dim
+        self.expert_num_layers = expert_num_layers
+
         self.experts = nn.ModuleList(
-            [nn.Linear(input_dim, output_dim, bias=True) for _ in range(num_experts)]
+            [
+                Expert(
+                    input_dim,
+                    output_dim,
+                    hidden_dim=expert_hidden_dim,
+                    num_layers=expert_num_layers,
+                )
+                for _ in range(num_experts)
+            ]
         )
         self.gating_function = nn.Linear(input_dim, num_experts, bias=True)
 
