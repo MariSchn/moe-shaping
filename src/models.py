@@ -47,6 +47,11 @@ class Expert(nn.Module):
         return self.num_layers == 1
 
     @property
+    def linears(self) -> list[nn.Linear]:
+        """The expert's linear layers in order (length == num_layers)."""
+        return [m for m in self.net if isinstance(m, nn.Linear)]
+
+    @property
     def weight(self) -> torch.Tensor:
         # Exposed for backward compatibility (e.g. LoLA shaping), which assumes a
         # single linear expert. Only well-defined for single-layer experts.
@@ -194,6 +199,32 @@ class Model(nn.Module):
         # Update the routing biases
         self.routing_biases += bias_updates
 
+    def _compute_expert_outputs(self, x: torch.Tensor) -> torch.Tensor:
+        """Run all experts on ``x`` in a single batched pass.
+
+        ``(B, input_dim) -> (B, num_experts, output_dim)``.
+
+        All experts share the same architecture, so instead of looping over the
+        expert modules (one set of small matmuls per expert) we stack each
+        linear layer's weights across experts and evaluate the whole bank with
+        batched matmuls. This is numerically equivalent to running the experts
+        individually but launches far fewer kernels. Gradients still flow back
+        to each expert's own parameters via the stack.
+        """
+        h = x  # (B, input_dim)
+        for li in range(self.expert_num_layers):
+            # (E, out, in) and (E, out) stacked across experts for this layer.
+            weight = torch.stack([e.linears[li].weight for e in self.experts], dim=0)
+            bias = torch.stack([e.linears[li].bias for e in self.experts], dim=0)
+            if li == 0:
+                # First layer: x is shared across experts -> (B, E, out).
+                h = torch.einsum("bi,eoi->beo", h, weight) + bias
+            else:
+                h = torch.einsum("bei,eoi->beo", h, weight) + bias
+            if li < self.expert_num_layers - 1:
+                h = torch.relu(h)
+        return h  # (B, num_experts, output_dim)
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
         assert x.ndim == 2, f"Input must be a 2D tensor (B, D), got {x.ndim}D"
@@ -208,9 +239,9 @@ class Model(nn.Module):
         )  # (B, top_k) each
         top_k_scores = torch.gather(gating_scores, dim=1, index=top_k_indices)
 
-        # Run all experts on the input (inefficient, but simple)
+        # Run all experts on the input as a single batched pass.
         # Shape: (B, num_experts, output_dim)
-        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=1)
+        expert_outputs = self._compute_expert_outputs(x)
 
         # Get the outputs from the top k experts.
         top_k_expanded = top_k_indices.unsqueeze(-1).expand(
