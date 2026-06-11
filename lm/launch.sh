@@ -16,6 +16,7 @@
 #            ROUTER_LR / EXPERT_LR per-phase LRs (default: --lr for both)
 #   Schedule/eval: LR EVAL_INTERVAL EVAL_ITERS LR_WARMUP_ITERS TIME
 #   Cluster: SBATCH_ACCOUNT PARTITION (empty = cluster default, e.g. PARTITION=debug)
+#   W&B: RUN_NAME (run/TB name)  |  MoE LB: LB_TYPE (aux_loss|...|none) AUX_LOSS_COEFF
 #
 # Baseline vs bilevel runs get distinct job/log/W&B names (RUN_TAG: joint vs
 # bl-r<R>e<E>), so their TensorBoard dirs and runs do not clobber each other.
@@ -90,6 +91,19 @@ fi
 
 JOB_NAME="moe-${RUN_TAG}-${STEPS}s-${NODES}n"
 
+# W&B run name + TensorBoard subdir (override with RUN_NAME=...).
+RUN_NAME=${RUN_NAME:-moe-${RUN_TAG}-${NODES}n}
+
+# ---- MoE load balancing ----
+# LB_TYPE: aux_loss (default) | seq_aux_loss | global_aux_loss | sinkhorn | none.
+#          LB_TYPE=none disables load balancing entirely.
+# AUX_LOSS_COEFF: weight of the aux load-balancing loss (ignored when LB_TYPE=none).
+LB_TYPE=${LB_TYPE:-aux_loss}
+AUX_LOSS_COEFF=${AUX_LOSS_COEFF:-0.01}
+MOE_LB_LINES="    --moe-router-load-balancing-type ${LB_TYPE}"
+[ "$LB_TYPE" != none ] && MOE_LB_LINES="${MOE_LB_LINES}
+    --moe-aux-loss-coeff ${AUX_LOSS_COEFF}"
+
 ################ W&B block ################
 WANDB_BLOCK='
 # WANDB
@@ -155,7 +169,7 @@ TRAINING_STEPS=${STEPS}
 
 # Logging
 PROJECT_NAME=${WANDB_PROJECT}
-EXP_NAME=moe-${RUN_TAG}-\${SLURM_NNODES}n
+EXP_NAME=${RUN_NAME}
 LOG_DIR=/iopsstor/scratch/cscs/\$USER/moe-shaping/\$PROJECT_NAME/\$EXP_NAME
 TENSORBOARD_DIR=\$LOG_DIR/tensorboard
 CONFIGS
@@ -205,8 +219,7 @@ NETWORK_SIZE_ARGS=(
 # Top-2 routing (Megatron default moe_router_topk=2); per-expert FFN = --ffn-hidden-size.
 MOE_ARGS=(
     --num-experts ${NUM_EXPERTS}
-    --moe-router-load-balancing-type aux_loss
-    --moe-aux-loss-coeff 0.01
+${MOE_LB_LINES}
 )
 
 # Bilevel router/expert alternation (consumed by the patched training.py).
