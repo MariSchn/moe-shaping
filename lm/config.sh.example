@@ -1,0 +1,15 @@
+# Copy this file to config.sh and fill in your values.
+# config.sh is git-ignored so your personal paths are never committed.
+
+# The SBATCH_ACCOUNT variable name is reserved by Slurm and automatically passed
+# as the account to sbatch.
+export SBATCH_ACCOUNT="a145"
+
+# Optional: set to log metrics (incl. bilevel/phase) to W&B; leave empty for
+# TensorBoard-only.
+export WANDB_API_KEY=""
+
+# WORKDIR is auto-derived from the launcher's own location (this lm/ dir) and
+# normally does not need setting. Only override it if you run Megatron from a
+# different checkout (e.g. a copy on scratch):
+# export WORKDIR="/iopsstor/scratch/cscs/your_cscs_account/moe-shaping/lm"

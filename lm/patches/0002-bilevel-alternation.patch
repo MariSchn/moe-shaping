@@ -1,0 +1,192 @@
+# Patch: Bilevel / alternating MoE optimization (router vs expert phases)
+#
+# Problem:
+#   moe-shaping studies a bilevel training procedure that alternates optimizer
+#   updates between the MoE *router* params and the MoE *expert* params. Megatron
+#   has native MoE but only a single, joint optimizer step. We need to (a) split
+#   router and expert params into their own optimizer param groups and (b)
+#   alternate which group actually moves, on a configurable cycle.
+#
+# What this patch does:
+#   1. megatron/training/arguments.py (moe arg group): adds
+#        --bilevel-router-steps  (router-only steps per cycle; 0 = disabled)
+#        --bilevel-expert-steps  (expert-only steps per cycle)
+#        --router-lr / --expert-lr (optional per-phase learning rates)
+#   2. megatron/training/training.py, get_megatron_optimizer_config(): when
+#      bilevel is enabled, adds two config_overrides keyed by param name glob
+#        ParamKey(name='*.router.*')  -> {'bilevel_role': 'router', [max_lr]}
+#        ParamKey(name='*.experts.*') -> {'bilevel_role': 'expert', [max_lr]}
+#      The custom 'bilevel_role' key makes each override tuple distinct, which
+#      forces router and expert into separate param groups even when the LRs are
+#      equal. ('*.experts.*' deliberately does NOT match '*.shared_experts.*'.)
+#   3. megatron/training/training.py: module-level bilevel helpers + train_step()
+#      hook. Right before optimizer.step(), the inactive role's param groups have
+#      their lr masked to 0 (Adam update is lr * m_hat/(sqrt(v_hat)+eps), so lr=0
+#      => no param change and no AdamW decoupled decay); lr is restored right
+#      after the step and a module-level phase counter is advanced. The backbone
+#      (attention/embeddings/norms/lm-head) trains every step.
+#   4. megatron/training/training.py, training_log(): logs 'bilevel/phase'
+#      (1 = router step, 0 = expert step) to TensorBoard and W&B.
+#
+# Caveats (acceptable for the current research milestone):
+#   * The inactive group's Adam moments still update from their real grads; an
+#     exact two-optimizer scheme would freeze the moments too.
+#   * Global grad-norm clipping sees the inactive group's grads.
+#   * Param groups split by 'bilevel_role' share the same checkpoint param-group
+#     identifier keys (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr), so
+#     resuming a bilevel run from a distributed checkpoint needs care. Checkpoint
+#     saving is currently disabled on GH200 anyway.
+#
+# How to find the right location in a future Megatron version:
+#   - args: search for the 'moe' argument group (parser.add_argument_group(
+#     title="moe")) and the '--num-experts' argument.
+#   - overrides: search for get_standard_config_overrides in
+#     get_megatron_optimizer_config().
+#   - mask: search for 'optimizer.step()' inside train_step().
+#   - logging: search for "samples vs steps" in training_log().
+#
+# Applied to: Megatron-LM core_v0.16.1 (commit 55ac7082)
+#
+diff --git a/megatron/training/arguments.py b/megatron/training/arguments.py
+index 46f3c28b1..36eef251b 100644
+--- a/megatron/training/arguments.py
++++ b/megatron/training/arguments.py
+@@ -2690,6 +2690,20 @@ def _add_moe_args(parser):
+     # General arguments
+     group.add_argument('--num-experts', type=int, default=None,
+                        help='Number of Experts in MoE (None means no MoE)')
++    # --- Bilevel / alternating MoE optimization (moe-shaping) ---
++    group.add_argument('--bilevel-router-steps', type=int, default=0,
++                       help='Bilevel alternation: number of consecutive optimizer steps that '
++                            'update ONLY the MoE router params (*.router.*) per cycle. '
++                            '0 disables alternation (joint training).')
++    group.add_argument('--bilevel-expert-steps', type=int, default=1,
++                       help='Bilevel alternation: number of consecutive optimizer steps that '
++                            'update ONLY the MoE expert params (*.experts.*) per cycle.')
++    group.add_argument('--router-lr', type=float, default=None,
++                       help='Per-phase learning rate for the MoE router params. '
++                            'Defaults to --lr when unset. Only used with --bilevel-router-steps>0.')
++    group.add_argument('--expert-lr', type=float, default=None,
++                       help='Per-phase learning rate for the MoE expert params. '
++                            'Defaults to --lr when unset. Only used with --bilevel-router-steps>0.')
+     group.add_argument('--moe-layer-freq', type=moe_freq_type, default=1,
+                        help='Frequency between MoE layers and Dense layers. Accepts either: '
+                             '- An integer N: Represents a 1:N ratio, meaning one expert layer for every N-1 dense layers '
+diff --git a/megatron/training/training.py b/megatron/training/training.py
+index d61b9357a..8daca2b9c 100644
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -1432,6 +1432,21 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
+     #  can be added to as needed by the user, or replaced entirely with a custom override.
+     config_overrides = get_standard_config_overrides(config=config)
+ 
++    # Bilevel / alternating MoE optimization (moe-shaping): place the MoE router
++    # params and expert params into their own optimizer param groups, tagged with
++    # a 'bilevel_role' so train_step() can mask the inactive group's lr each phase.
++    # The custom 'bilevel_role' key makes each override tuple distinct, which forces
++    # a separate param group even when router_lr == expert_lr == lr.
++    if getattr(args, 'bilevel_router_steps', 0) and args.bilevel_router_steps > 0:
++        router_override = {'bilevel_role': 'router'}
++        expert_override = {'bilevel_role': 'expert'}
++        if getattr(args, 'router_lr', None) is not None:
++            router_override['max_lr'] = args.router_lr
++        if getattr(args, 'expert_lr', None) is not None:
++            expert_override['max_lr'] = args.expert_lr
++        config_overrides[ParamKey(name='*.router.*')] = router_override
++        config_overrides[ParamKey(name='*.experts.*')] = expert_override
++
+     return config, config_overrides
+ 
+ 
+@@ -1600,6 +1615,61 @@ def dummy_train_step(data_iterator):
+             batch = get_batch_on_this_cp_rank(batch)
+ 
+ 
++# ---------------------------------------------------------------------------
++# Bilevel / alternating MoE optimization (moe-shaping).
++#
++# Alternates optimizer updates between MoE router params (*.router.*) and MoE
++# expert params (*.experts.*) over a fixed cycle of length
++# (bilevel_router_steps + bilevel_expert_steps). The transformer backbone
++# (attention, embeddings, norms, lm-head) trains every step.
++#
++# The inactive role is "frozen" for the step by masking its optimizer param
++# group(s) learning rate to 0 (Adam's update is lr * m_hat / (sqrt(v_hat)+eps),
++# so lr=0 => no parameter change and, for AdamW, no decoupled weight decay
++# either). Router/expert params were placed in their own param groups, tagged
++# 'bilevel_role', in get_megatron_optimizer_config().
++#
++# Caveats (acceptable for this research use; revisit if exact fidelity needed):
++#   * The inactive group's Adam moments still update from their (real) grads;
++#     a strict two-optimizer scheme would freeze the moments too.
++#   * Global grad-norm clipping sees the inactive group's grads.
++# ---------------------------------------------------------------------------
++_bilevel_step_count = 0
++
++
++def bilevel_enabled(args):
++    """True if router/expert alternation is active."""
++    return bool(getattr(args, 'bilevel_router_steps', 0)) and args.bilevel_router_steps > 0
++
++
++def bilevel_in_router_phase(args):
++    """True if the current optimizer step is a router-only step."""
++    cycle = args.bilevel_router_steps + args.bilevel_expert_steps
++    return (_bilevel_step_count % cycle) < args.bilevel_router_steps
++
++
++def bilevel_apply_lr_mask(optimizer, args):
++    """Zero the lr of the inactive role's param groups before optimizer.step().
++
++    Returns (saved_lrs, phase) where saved_lrs restores the original lrs and
++    phase is 1 for the router phase, 0 for the expert phase.
++    """
++    router_phase = bilevel_in_router_phase(args)
++    inactive_role = 'expert' if router_phase else 'router'
++    saved = []
++    for group in optimizer.param_groups:
++        if group.get('bilevel_role') == inactive_role:
++            saved.append((group, group['lr']))
++            group['lr'] = 0.0
++    return saved, (1 if router_phase else 0)
++
++
++def bilevel_restore_lr(saved):
++    """Restore lrs masked by bilevel_apply_lr_mask()."""
++    for group, lr in saved:
++        group['lr'] = lr
++
++
+ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
+     """Single training step."""
+     args = get_args()
+@@ -1700,7 +1770,16 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
+     # Update parameters.
+ 
+     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
++    # Bilevel alternation: freeze the inactive role's params for this step by
++    # masking their lr to 0, then restore and advance the phase counter.
++    _bilevel_saved = None
++    if bilevel_enabled(args):
++        _bilevel_saved, args.bilevel_phase = bilevel_apply_lr_mask(optimizer, args)
+     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
++    if _bilevel_saved is not None:
++        global _bilevel_step_count
++        bilevel_restore_lr(_bilevel_saved)
++        _bilevel_step_count += 1
+ 
+     # get max attention logit for logging and run clip_qk()
+     # Part of MuonClip Optimizer step
+@@ -1879,6 +1958,12 @@ def training_log(
+     if writer and (iteration % args.tensorboard_log_interval == 0):
+         if wandb_writer:
+             wandb_writer.log({'samples vs steps': args.consumed_train_samples}, iteration)
++        # Bilevel alternation phase indicator (1 = router-only step, 0 = expert-only step).
++        if bilevel_enabled(args):
++            bilevel_phase = getattr(args, 'bilevel_phase', 0)
++            writer.add_scalar('bilevel/phase', bilevel_phase, iteration)
++            if wandb_writer:
++                wandb_writer.log({'bilevel/phase': bilevel_phase}, iteration)
+         if learning_rate is not None:
+             writer.add_scalar('learning-rate', learning_rate, iteration)
+             writer.add_scalar('learning-rate vs samples', learning_rate, args.consumed_train_samples)
