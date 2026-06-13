@@ -96,8 +96,10 @@ RUN_NAME=${RUN_NAME:-moe-${RUN_TAG}-${NODES}n}
 
 # ---- MoE load balancing ----
 # LB_TYPE: aux_loss (default) | seq_aux_loss | global_aux_loss | sinkhorn | none.
-#          LB_TYPE=none disables load balancing entirely.
 # AUX_LOSS_COEFF: weight of the aux load-balancing loss (ignored when LB_TYPE=none).
+# Monitoring: 'expert_imbalance' is always logged for aux-loss routing (patch 0003),
+#   so AUX_LOSS_COEFF=0 trains with NO load balancing yet still tracks imbalance;
+#   LB_TYPE=none turns load balancing AND imbalance monitoring fully off.
 LB_TYPE=${LB_TYPE:-aux_loss}
 AUX_LOSS_COEFF=${AUX_LOSS_COEFF:-0.01}
 MOE_LB_LINES="    --moe-router-load-balancing-type ${LB_TYPE}"

@@ -117,8 +117,8 @@ cd Megatron-LM && git apply --check ../patches/0002-bilevel-alternation.patch
 | Patch | Description |
 |-------|-------------|
 | `0001-log-tokens-per-sec-to-wandb.patch` | Logs tokens/sec/GPU to stdout, TensorBoard, W&B |
-| `0002-bilevel-alternation.patch` | Router/expert param-group split + per-phase LR masking; adds `--bilevel-*` / `--router-lr` / `--expert-lr` args |
-| `0003-bilevel-logging.patch` | Logs `bilevel/phase` and per-expert load to W&B |
+| `0002-bilevel-alternation.patch` | Router/expert param-group split + per-phase LR masking; adds `--bilevel-*` / `--router-lr` / `--expert-lr` args; logs `bilevel/phase` |
+| `0003-log-expert-imbalance.patch` | Always logs `expert_imbalance` (raw load-balance loss, monitor-only) even when the aux-loss coefficient is 0 |
 
 ## Dependencies
 
