@@ -1,0 +1,167 @@
+# Patch: Always log expert load imbalance as "expert_imbalance"
+#
+# Problem:
+#   We want to monitor MoE expert load imbalance even when load balancing is
+#   turned off (moe_aux_loss_coeff == 0). Stock Megatron only computes/logs the
+#   aux loss ("load_balancing_loss") when a coefficient > 0 is applied
+#   (Router._apply_aux_loss early-returns at coeff 0, and the whole aux block is
+#   gated by is_aux_loss_enabled(), which requires a coeff > 0). So at coeff 0
+#   there is no imbalance signal at all.
+#
+# What this patch does (megatron/core/transformer/moe/router.py):
+#   1. Adds Router._log_expert_imbalance(): computes the switch load-balancing
+#      loss with coefficient 1.0 (the raw, coefficient-independent imbalance) and
+#      logs it to the MoE aux-loss tracker under the name "expert_imbalance".
+#      It is detached / never attached to the gradient (monitor-only).
+#   2. In the routing forward, computes the aux-loss routing scores whenever the
+#      routing type is aux-loss based (aux_loss/seq_aux_loss/global_aux_loss),
+#      regardless of coefficient, and calls _log_expert_imbalance every step.
+#      The real aux loss is still applied only when is_aux_loss_enabled()
+#      (coeff > 0), so "load_balancing_loss" remains a faithful indicator of what
+#      was actually added to training, kept SEPARATE from "expert_imbalance".
+#
+#   The tracker name flows automatically to TensorBoard and W&B via
+#   track_moe_metrics() (it logs every tracker entry by name), so a new
+#   "expert_imbalance" scalar appears with no extra wiring.
+#
+# Usage:
+#   Keep --moe-router-load-balancing-type aux_loss and set --moe-aux-loss-coeff 0
+#   (launcher: LB_TYPE=aux_loss AUX_LOSS_COEFF=0) to train with NO load balancing
+#   while still logging expert_imbalance. (LB_TYPE=none disables monitoring too.)
+#
+# How to find the right location in a future Megatron version:
+#   In router.py, search for is_aux_loss_enabled() in the routing forward (the
+#   block that calls compute_routing_scores_for_aux_loss + _apply_aux_loss), and
+#   for _apply_aux_loss / switch_load_balancing_loss_func.
+#
+# Applied to: Megatron-LM core_v0.16.1 (commit 55ac7082)
+#
+diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
+index 4be974017..99d1dd00a 100644
+--- a/megatron/core/transformer/moe/router.py
++++ b/megatron/core/transformer/moe/router.py
+@@ -272,6 +272,46 @@ class TopKRouter(Router):
+                 return True
+         return False
+ 
++    def _log_expert_imbalance(
++        self,
++        scores_for_aux_loss: torch.Tensor,
++        routing_map: torch.Tensor,
++        with_padding_mask: bool = False,
++    ):
++        """Log the (unscaled) switch load-balancing loss as "expert_imbalance".
++
++        This is a monitor-only metric: it tracks expert load imbalance independent of
++        moe_aux_loss_coeff and is never attached to the gradient, so imbalance can be
++        watched even when load balancing is off (coefficient 0). It is kept separate
++        from "load_balancing_loss" so that metric is present only when a non-zero aux
++        loss was actually added to training.
++        """
++        global_tokens_per_expert, _, total_num_tokens = get_tokens_per_expert_and_token_count(
++            routing_map=routing_map,
++            reduce_group=self.tp_cp_group,
++            topk=self.topk,
++            with_padding_mask=with_padding_mask,
++        )
++        imbalance = switch_load_balancing_loss_func(
++            probs=scores_for_aux_loss,
++            tokens_per_expert=global_tokens_per_expert,
++            total_num_tokens=total_num_tokens,
++            topk=self.topk,
++            num_experts=self.config.num_moe_experts,
++            moe_aux_loss_coeff=1.0,
++            fused=self.config.moe_router_fusion,
++        )
++        num_layers = self.config.num_layers
++        if self.config.mtp_num_layers is not None:
++            num_layers += self.config.mtp_num_layers
++        save_to_aux_losses_tracker(
++            "expert_imbalance",
++            imbalance.detach(),
++            self.layer_number,
++            num_layers,
++            reduce_group=self.tp_cp_group,
++        )
++
+     def _apply_aux_loss(
+         self,
+         probs: torch.Tensor,
+@@ -594,8 +634,22 @@ class TopKRouter(Router):
+                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
+             )
+ 
++        # Always monitor expert imbalance for aux-loss-based routing, even when the aux
++        # loss coefficient is 0. It is logged as "expert_imbalance" (kept separate from
++        # "load_balancing_loss", which only appears when a coefficient > 0 is actually
++        # applied) and is never attached to the gradient. The real aux loss is applied
++        # only when is_aux_loss_enabled() (some coefficient > 0).
++        _routing_types = (
++            self.routing_type if isinstance(self.routing_type, (list, tuple))
++            else [self.routing_type]
++        )
++        _monitor_imbalance = self.training and torch.is_grad_enabled() and any(
++            t in ("aux_loss", "seq_aux_loss", "global_aux_loss") for t in _routing_types
++        )
+         # Apply each aux loss type and attach aux loss autograd function to probs
+-        if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
++        if self.training and torch.is_grad_enabled() and (
++            self.is_aux_loss_enabled() or _monitor_imbalance
++        ):
+             # Calculate scores and routing_map for aux loss
+             routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
+                 logits,
+@@ -604,26 +658,33 @@ class TopKRouter(Router):
+                 fused=self.config.moe_router_fusion,
+                 padding_mask=padding_mask,
+             )
+-            probs = self._apply_aux_loss(
+-                probs,
+-                scores_for_aux_loss,
+-                routing_map_for_aux_loss,
+-                with_padding_mask=padding_mask is not None,
+-            )
+-            probs = self._apply_seq_aux_loss(
+-                probs,
+-                scores_for_aux_loss,
+-                routing_map_for_aux_loss,
+-                seq_length,
+-                bsz,
+-                with_padding_mask=padding_mask is not None,
+-            )
+-            probs = self._apply_global_aux_loss(
+-                probs,
+-                scores_for_aux_loss,
+-                routing_map_for_aux_loss,
+-                with_padding_mask=padding_mask is not None,
+-            )
++            if _monitor_imbalance:
++                self._log_expert_imbalance(
++                    scores_for_aux_loss,
++                    routing_map_for_aux_loss,
++                    with_padding_mask=padding_mask is not None,
++                )
++            if self.is_aux_loss_enabled():
++                probs = self._apply_aux_loss(
++                    probs,
++                    scores_for_aux_loss,
++                    routing_map_for_aux_loss,
++                    with_padding_mask=padding_mask is not None,
++                )
++                probs = self._apply_seq_aux_loss(
++                    probs,
++                    scores_for_aux_loss,
++                    routing_map_for_aux_loss,
++                    seq_length,
++                    bsz,
++                    with_padding_mask=padding_mask is not None,
++                )
++                probs = self._apply_global_aux_loss(
++                    probs,
++                    scores_for_aux_loss,
++                    routing_map_for_aux_loss,
++                    with_padding_mask=padding_mask is not None,
++                )
+ 
+         # Optionally apply expert bias
+         self._apply_expert_bias(routing_map, padding_mask=padding_mask)
