@@ -23,6 +23,8 @@
 #   Schedule/eval: LR EVAL_INTERVAL EVAL_ITERS LR_WARMUP_ITERS TIME
 #   Cluster: SBATCH_ACCOUNT PARTITION (empty = cluster default, e.g. PARTITION=debug)
 #   W&B: RUN_NAME (run/TB name)  |  MoE LB: LB_TYPE (aux_loss|...|none) AUX_LOSS_COEFF
+#   Aux-loss-free LB: EXPERT_BIAS=1 (DeepSeek-V3 per-expert bias; forces sigmoid
+#                     router) [BIAS_UPDATE_RATE] | SCORE_FUNCTION (softmax|sigmoid)
 #
 # Baseline vs bilevel runs get distinct job/log/W&B names (RUN_TAG: joint vs
 # bl-r<R>e<E>), so their TensorBoard dirs and runs do not clobber each other.
@@ -133,6 +135,26 @@ AUX_LOSS_COEFF=${AUX_LOSS_COEFF:-0.01}
 MOE_LB_LINES="    --moe-router-load-balancing-type ${LB_TYPE}"
 [ "$LB_TYPE" != none ] && MOE_LB_LINES="${MOE_LB_LINES}
     --moe-aux-loss-coeff ${AUX_LOSS_COEFF}"
+
+# ---- Aux-loss-free load balancing (DeepSeek-V3 expert bias) ----
+# EXPERT_BIAS=1 adds a dynamic per-expert routing bias that balances expert load
+# WITHOUT an aux loss; Megatron requires the sigmoid score function for it, so we
+# force SCORE_FUNCTION=sigmoid below. For pure aux-loss-free balancing, pair it
+# with LB_TYPE=none AUX_LOSS_COEFF=0 (no aux loss at all). BIAS_UPDATE_RATE is the
+# bias step size (Megatron default 1e-3). SCORE_FUNCTION can also be set on its own
+# (softmax default | sigmoid) for a sigmoid router without the bias.
+# Set a distinct RUN_NAME/JOB_NAME to keep these runs' logs separate.
+EXPERT_BIAS=${EXPERT_BIAS:-0}
+BIAS_UPDATE_RATE=${BIAS_UPDATE_RATE:-1e-3}
+SCORE_FUNCTION=${SCORE_FUNCTION:-softmax}
+if [ "$EXPERT_BIAS" = 1 ]; then
+    SCORE_FUNCTION=sigmoid   # required by Megatron for expert-bias routing
+    MOE_LB_LINES="${MOE_LB_LINES}
+    --moe-router-enable-expert-bias
+    --moe-router-bias-update-rate ${BIAS_UPDATE_RATE}"
+fi
+[ "$SCORE_FUNCTION" != softmax ] && MOE_LB_LINES="${MOE_LB_LINES}
+    --moe-router-score-function ${SCORE_FUNCTION}"
 
 ################ W&B block ################
 WANDB_BLOCK='
