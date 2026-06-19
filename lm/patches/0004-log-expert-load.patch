@@ -1,0 +1,230 @@
+# Patch: Log the per-expert load distribution as "load/min", "load/max" and quantiles
+#
+# Goal:
+#   See, at a glance, the spread of expert load across the whole model. For an expert e in an
+#   MoE layer, load_e = (tokens routed to e) / (tokens in the batch). With top-k routing the
+#   per-layer loads sum to topk, so perfect balance is topk/num_experts per expert; load/max
+#   -> 1.0 means a layer funnels (almost) every token to one expert, load/min -> 0.0 means an
+#   expert is (nearly) dead. The quantiles load/p10..load/p90 fill in the shape of the
+#   distribution between those extremes (load/min == p0, load/max == p100).
+#
+# What this patch does:
+#   1. megatron/core/transformer/moe/router.py (TopKRouter._log_expert_imbalance):
+#      reuses the already-reduced global_tokens_per_expert / total_num_tokens that the
+#      expert-imbalance monitor computes, and saves to the MoE tracker:
+#        - expert_load.max()/.min() under "load/max" / "load/min" (reduce_op max/min);
+#        - the full expert_load vector under "load" (reduce_op "collect"), from which
+#          track_moe_metrics derives the pooled quantiles "load/p10".."load/p90".
+#      Monitor-only (detached); piggybacks on the same aux-loss routing gate as
+#      expert_imbalance (patch 0003), so it is logged for aux_loss/seq_aux_loss/global_aux_loss
+#      routing even at moe_aux_loss_coeff == 0.
+#   2. megatron/core/transformer/moe/moe_utils.py: teaches the MoE layer-wise tracker a
+#      per-metric "reduce_op". Default "sum" is byte-for-byte the old behavior.
+#        - "max"/"min": seed slots with -/+inf, accumulate across micro-batches with max/min
+#          (not +=); clear resets to -/+inf; track_moe_metrics aggregates across MoE layers
+#          with max()/min(). Untouched dense layers keep their -/+inf seed and are ignored, so
+#          the value is the true extreme over all experts of all MoE layers.
+#        - "collect": store the full per-expert vector per layer (shape num_layers x
+#          num_experts), accumulate across micro-batches with += and clear to 0. In
+#          track_moe_metrics the rows are scaled by loss_scale (1/num_microbatches) to the mean
+#          per-expert load, dense layers (all-zero rows) are dropped, the remaining experts of
+#          all MoE layers are pooled, and torch.quantile reports each entry of _LOAD_QUANTILES
+#          as "load/pXX". (Quantiles are not an associative scalar reduction, hence storing the
+#          distribution rather than a per-layer scalar the way max/min do.)
+#
+#   "load/*" flow to TensorBoard and W&B automatically via track_moe_metrics (it logs every
+#   tracker entry by name); the "load/" prefix puts them all in their own panel.
+#
+# Scope / caveats:
+#   Like "expert_imbalance" (patch 0003) these names are not added to track_names, so
+#   reduce_aux_losses_tracker_across_ranks does not cross-rank-reduce them: the value is the
+#   logging rank's local view. This is exact for the launcher's config (TP=PP=CP=EP=1,
+#   data-parallel only, every layer MoE); with PP>1 it would only cover the logging rank's
+#   pipeline stage. Quantiles are pooled over the logging rank's experts only.
+#
+# How to find the right location in a future Megatron version:
+#   router.py: the save_to_aux_losses_tracker("expert_imbalance", ...) call added by 0003.
+#   moe_utils.py: save_to_aux_losses_tracker / clear_aux_losses_tracker / track_moe_metrics.
+#   To change which quantiles are logged, edit the _LOAD_QUANTILES tuple in moe_utils.py.
+#
+# Applied to: Megatron-LM core_v0.16.1 (commit 55ac7082), on top of patches 0001-0003.
+#
+diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
+index 61c7f8d2c..c477da764 100644
+--- a/megatron/core/transformer/moe/moe_utils.py
++++ b/megatron/core/transformer/moe/moe_utils.py
+@@ -863,6 +863,18 @@ def apply_router_token_dropping(
+     return final_probs, final_map
+ 
+ 
++# Seed value for a freshly-initialized / cleared tracker slot, per reduction op. It is the
++# identity element of the op so that a layer which never writes does not affect the result
++# ("sum" -> 0, "max" -> -inf, "min" -> +inf, the latter two being ignored by max()/min();
++# "collect" -> 0, dense layers stay all-zero and are dropped before pooling quantiles).
++_AUX_LOSS_TRACKER_INIT = {"sum": 0.0, "max": float("-inf"), "min": float("inf"), "collect": 0.0}
++
++# Quantiles (in [0, 1]) of the per-expert load distribution, pooled over all experts of all MoE
++# layers and logged as "load/p10".."load/p90" alongside "load/min" (the p0 extreme) and
++# "load/max" (p100). Edit this tuple to change which quantiles are reported.
++_LOAD_QUANTILES = (0.10, 0.25, 0.50, 0.75, 0.90)
++
++
+ def save_to_aux_losses_tracker(
+     name: str,
+     loss: torch.Tensor,
+@@ -871,6 +883,7 @@ def save_to_aux_losses_tracker(
+     reduce_group: Optional[torch.distributed.ProcessGroup] = None,
+     avg_group: Optional[torch.distributed.ProcessGroup] = None,
+     reduce_group_has_dp: bool = False,
++    reduce_op: str = "sum",
+ ) -> None:
+     """Save the auxiliary loss for logging.
+     Args:
+@@ -885,6 +898,13 @@ def save_to_aux_losses_tracker(
+         reduce_group_has_dp (bool, optional): Whether the reduce group has data parallel ranks.
+             Set this to True if the reduce group has data parallel ranks. This flag is used to
+             ensure the correct reduction in aux loss tracking. Defaults to False.
++        reduce_op (str, optional): How per-layer slots accumulate across micro-batches and are
++            later aggregated across MoE layers in track_moe_metrics: "sum" (default, additive
++            losses), "max" or "min" (extremes, e.g. per-expert load), or "collect" (store the
++            full per-expert vector per layer, averaged over micro-batches, then report pooled
++            quantiles over all experts of all MoE layers). For "max"/"min" untouched (dense)
++            layers keep their -/+inf seed and are ignored by the final max()/min(); for "collect"
++            they keep the all-zero seed and are dropped before pooling. Defaults to "sum".
+     """
+     # Skip aux loss logging if layer_number is None.
+     if layer_number is None:
+@@ -893,8 +913,26 @@ def save_to_aux_losses_tracker(
+     tracker = get_moe_layer_wise_logging_tracker()
+     if name not in tracker:
+         tracker[name] = {}
+-        tracker[name]["values"] = torch.zeros(num_layers, device=loss.device)
+-    tracker[name]["values"][layer_number - 1] += loss.detach()  # Aggregate the loss for the layer.
++        if reduce_op == "collect":
++            # Keep the full per-expert vector for each layer so true quantiles can be computed
++            # over the pooled experts of all MoE layers at logging time. Dense layers never
++            # write, so their all-zero row (row-sum 0) is dropped before pooling.
++            tracker[name]["values"] = torch.zeros(num_layers, loss.numel(), device=loss.device)
++        else:
++            tracker[name]["values"] = torch.full(
++                (num_layers,), _AUX_LOSS_TRACKER_INIT[reduce_op], device=loss.device
++            )
++        tracker[name]["reduce_op"] = reduce_op
++    idx = layer_number - 1
++    value = loss.detach()
++    if reduce_op == "max":
++        tracker[name]["values"][idx] = torch.maximum(tracker[name]["values"][idx], value)
++    elif reduce_op == "min":
++        tracker[name]["values"][idx] = torch.minimum(tracker[name]["values"][idx], value)
++    else:
++        # "sum": additive losses; "collect": accumulate the per-expert vector across
++        # micro-batches (averaged by loss_scale in track_moe_metrics).
++        tracker[name]["values"][idx] += value
+     tracker[name]["reduce_group"] = reduce_group
+     tracker[name]["avg_group"] = avg_group
+     tracker[name]["reduce_group_has_dp"] = reduce_group_has_dp
+@@ -904,7 +942,9 @@ def clear_aux_losses_tracker() -> None:
+     """Clear the auxiliary losses."""
+     tracker = get_moe_layer_wise_logging_tracker()
+     for name in tracker:
+-        tracker[name]["values"].zero_()
++        # Reset to the reduction's identity so the next window starts clean
++        # ("sum" -> 0, "max" -> -inf, "min" -> +inf).
++        tracker[name]["values"].fill_(_AUX_LOSS_TRACKER_INIT[tracker[name].get("reduce_op", "sum")])
+ 
+ 
+ def reduce_aux_losses_tracker_across_ranks(
+@@ -1016,18 +1056,48 @@ def track_moe_metrics(
+     if mtp_num_layers is not None:
+         num_moe_layers += mtp_num_layers
+ 
+-    aux_losses = {k: v['values'].float() * loss_scale for k, v in tracker.items()}
+-    for name, loss_list in aux_losses.items():
++    for name, entry in tracker.items():
++        reduce_op = entry.get("reduce_op", "sum")
++        if reduce_op == "collect":
++            # Pooled quantiles of the per-expert load over all experts of all MoE layers.
++            # entry["values"] is (num_layers, num_experts) accumulated across micro-batches;
++            # loss_scale (1/num_microbatches) turns it into the mean per-expert load. Dense
++            # layers never wrote, so their all-zero rows are dropped before pooling so they do
++            # not bias the quantiles. p0/p100 of this pool equal "load/min"/"load/max".
++            dist = entry["values"].float() * loss_scale
++            pooled = dist[dist.sum(dim=1) > 0].flatten()
++            for q in _LOAD_QUANTILES:
++                qname = f"{name}/p{int(round(q * 100))}"
++                qval = torch.quantile(pooled, q)
++                if total_loss_dict is not None:
++                    if qname not in total_loss_dict:
++                        total_loss_dict[qname] = qval
++                    else:
++                        total_loss_dict[qname] += qval
++                if writer is not None:
++                    writer.add_scalar(qname, qval, iteration)
++                if wandb_writer:
++                    wandb_writer.log({qname: qval}, iteration)
++            continue
++        if reduce_op in ("max", "min"):
++            # Extremes (e.g. per-expert load) over all MoE layers. Values are already
++            # max/min-reduced across micro-batches and dense layers keep their -/+inf seed,
++            # so loss_scale (1/num_microbatches) and per-layer averaging do not apply here.
++            loss_list = entry["values"].float()
++            aggregate = loss_list.max() if reduce_op == "max" else loss_list.min()
++        else:
++            loss_list = entry["values"].float() * loss_scale
++            aggregate = loss_list.sum() / num_moe_layers
+         if total_loss_dict is not None:
+             if name not in total_loss_dict:
+-                total_loss_dict[name] = loss_list.sum() / num_moe_layers
++                total_loss_dict[name] = aggregate
+             else:
+-                total_loss_dict[name] += loss_list.sum() / num_moe_layers
++                total_loss_dict[name] += aggregate
+         if writer is not None:
+             # currently when using add_scalars,
+             # torch.utils.add_scalars makes each timer its own run, which
+             # polutes the runs list, so we just add each as a scalar
+-            writer.add_scalar(name, loss_list.sum() / num_moe_layers, iteration)
++            writer.add_scalar(name, aggregate, iteration)
+             if per_layer_logging:
+                 for i, loss in enumerate(loss_list.tolist()):
+                     writer.add_scalar(f"moe/{name}_layer_{i}", loss, iteration)
+@@ -1036,7 +1106,7 @@ def track_moe_metrics(
+             # As a workaround, we log each scalar individually first, then we can create
+             # a custom panel to manually group them to a single plot.
+             if wandb_writer:
+-                wandb_writer.log({f"{name}": loss_list.sum() / num_moe_layers}, iteration)
++                wandb_writer.log({f"{name}": aggregate}, iteration)
+                 if per_layer_logging:
+                     wandb_writer.log(
+                         {
+diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
+index 99d1dd00a..8fbe1ae88 100644
+--- a/megatron/core/transformer/moe/router.py
++++ b/megatron/core/transformer/moe/router.py
+@@ -312,6 +312,26 @@ class TopKRouter(Router):
+             reduce_group=self.tp_cp_group,
+         )
+ 
++        # Per-expert load = tokens routed to the expert / tokens in the batch (with top-k
++        # routing the loads sum to topk; perfect balance is topk/num_experts per expert).
++        # Log the most- and least-loaded expert across the whole model as "load/max" and
++        # "load/min" (own wandb panel). global_tokens_per_expert / total_num_tokens are
++        # already reduced over the TP/CP group; reduce_op max/min then aggregates the
++        # per-layer extremes into a single model-wide extreme over all MoE layers.
++        expert_load = global_tokens_per_expert / total_num_tokens
++        save_to_aux_losses_tracker(
++            "load/max", expert_load.max().detach(), self.layer_number, num_layers, reduce_op="max"
++        )
++        save_to_aux_losses_tracker(
++            "load/min", expert_load.min().detach(), self.layer_number, num_layers, reduce_op="min"
++        )
++        # Also keep the full per-expert load vector ("collect") so track_moe_metrics can report
++        # pooled quantiles "load/p10".."load/p90" across all experts of all MoE layers, filling
++        # in the distribution between load/min (p0) and load/max (p100) in the same wandb panel.
++        save_to_aux_losses_tracker(
++            "load", expert_load.detach(), self.layer_number, num_layers, reduce_op="collect"
++        )
++
+     def _apply_aux_loss(
+         self,
+         probs: torch.Tensor,
