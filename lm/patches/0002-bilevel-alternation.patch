@@ -13,7 +13,8 @@
 #        --bilevel-expert-steps  (expert-only steps per cycle)
 #        --router-lr / --expert-lr (optional per-phase learning rates)
 #   2. megatron/training/training.py, get_megatron_optimizer_config(): when
-#      bilevel is enabled, adds two config_overrides keyed by param name glob
+#      alternation OR per-group --router-lr/--expert-lr is set, adds 2 overrides
+#      keyed by param name glob
 #        ParamKey(name='*.router.*')  -> {'bilevel_role': 'router', [max_lr]}
 #        ParamKey(name='*.experts.*') -> {'bilevel_role': 'expert', [max_lr]}
 #      The custom 'bilevel_role' key makes each override tuple distinct, which
@@ -64,11 +65,11 @@ index 46f3c28b1..36eef251b 100644
 +                       help='Bilevel alternation: number of consecutive optimizer steps that '
 +                            'update ONLY the MoE expert params (*.experts.*) per cycle.')
 +    group.add_argument('--router-lr', type=float, default=None,
-+                       help='Per-phase learning rate for the MoE router params. '
-+                            'Defaults to --lr when unset. Only used with --bilevel-router-steps>0.')
++                       help='Per-group learning rate for the MoE router params. '
++                            'Defaults to --lr when unset. Splits the router into its own param group (with or without alternation).')
 +    group.add_argument('--expert-lr', type=float, default=None,
-+                       help='Per-phase learning rate for the MoE expert params. '
-+                            'Defaults to --lr when unset. Only used with --bilevel-router-steps>0.')
++                       help='Per-group learning rate for the MoE expert params. '
++                            'Defaults to --lr when unset. Splits the experts into their own param group (with or without alternation).')
      group.add_argument('--moe-layer-freq', type=moe_freq_type, default=1,
                         help='Frequency between MoE layers and Dense layers. Accepts either: '
                              '- An integer N: Represents a 1:N ratio, meaning one expert layer for every N-1 dense layers '
@@ -84,8 +85,8 @@ index d61b9357a..8daca2b9c 100644
 +    # params and expert params into their own optimizer param groups, tagged with
 +    # a 'bilevel_role' so train_step() can mask the inactive group's lr each phase.
 +    # The custom 'bilevel_role' key makes each override tuple distinct, which forces
-+    # a separate param group even when router_lr == expert_lr == lr.
-+    if getattr(args, 'bilevel_router_steps', 0) and args.bilevel_router_steps > 0:
++    # distinct groups; the split fires for alternation OR per-group router_lr/expert_lr.
++    if (getattr(args, 'bilevel_router_steps', 0) or 0) > 0 or getattr(args, 'router_lr', None) is not None or getattr(args, 'expert_lr', None) is not None:
 +        router_override = {'bilevel_role': 'router'}
 +        expert_override = {'bilevel_role': 'expert'}
 +        if getattr(args, 'router_lr', None) is not None:
