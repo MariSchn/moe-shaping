@@ -14,6 +14,7 @@ from utils import (
     BilevelOptimizer,
     apply_expert_expert_lola_shaping,
     apply_router_router_lola_shaping,
+    calculate_last_layer_regret,
     calculate_load_balancing_loss,
     calculate_per_expert_loss,
     expert_load_metrics,
@@ -298,6 +299,15 @@ def main() -> None:
         ).cpu()
 
         if use_wandb:
+            regret_gating, regret_optimal = calculate_last_layer_regret(
+                output["expert_outputs"].detach(),
+                output["gating_scores"].detach(),
+                output["predictions"].detach(),
+                y,
+                model_cfg.router_activation,
+                combo_size=model_cfg.router_top_k,
+            )
+
             total_grad_norm = gating_gradient_norm(model)
             if lola_corrections is not None:
                 w_corr, b_corr = lola_corrections
@@ -350,6 +360,8 @@ def main() -> None:
             wandb.log(
                 {
                     "loss": loss.item(),
+                    "bandit/last_layer_regret_gating": regret_gating,
+                    "bandit/last_layer_regret_optimal": regret_optimal,
                     "expert_imbalance": load_balancing_loss.item(),
                     **expert_load_metrics(
                         output["selected_experts"], model.num_experts

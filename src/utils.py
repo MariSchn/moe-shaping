@@ -184,6 +184,94 @@ def calculate_per_expert_loss(
     return per_expert_loss
 
 
+def calculate_last_layer_regret(
+    expert_outputs: torch.Tensor,
+    gating_scores: torch.Tensor,
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    router_activation: str = "softmax",
+    combo_size: int = 2,
+) -> Tuple[float, float]:
+    """
+    Bandit-style routing regret for the (last) MoE layer.
+
+    Treats each sample as a context, the router's choice of which ``combo_size``
+    experts to combine as the action, and negative MSE as the reward. Regret is
+    the router's actual prediction loss minus the loss of the best candidate
+    expert combination, averaged over the batch (per-sample regret).
+
+    Two oracles are returned, differing in how a candidate combination is mixed:
+
+    - ``regret_gating``: candidate experts mixed with the router's own gating
+      logits, renormalized over the combination (matches ``Model.forward``).
+      Isolates the routing *choice* regret with the gating mechanism fixed.
+    - ``regret_optimal``: candidate experts mixed with the loss-minimizing convex
+      weight (closed form, ``combo_size == 2`` only). Stronger oracle that also
+      captures weighting suboptimality. Returns ``nan`` if ``combo_size != 2``.
+
+    By construction ``regret_optimal >= regret_gating >= 0``.
+
+    Args:
+        expert_outputs: (B, num_experts, output_dim)
+        gating_scores: (B, num_experts) raw router logits
+        predictions: (B, output_dim) router's actual combined output
+        targets: (B, output_dim)
+        router_activation: "softmax" or "sigmoid" (mirrors the model).
+        combo_size: Number of experts per candidate combination (top-k).
+
+    Returns:
+        (regret_gating, regret_optimal) as Python floats.
+    """
+    import itertools
+
+    assert expert_outputs.ndim == 3, (
+        f"Expert outputs must be a 3D tensor (B, num_experts, output_dim), got {expert_outputs.shape}"
+    )
+
+    _, num_experts, _ = expert_outputs.shape
+    device = expert_outputs.device
+
+    # Router's actual per-sample loss (the action it took).
+    chosen_loss = ((predictions - targets) ** 2).mean(dim=-1)  # (B,)
+
+    # All candidate combinations of experts -> (C, combo_size).
+    combos = list(itertools.combinations(range(num_experts), combo_size))
+    combo_idx = torch.tensor(combos, dtype=torch.long, device=device)  # (C, combo_size)
+
+    # Gather scores/outputs for every combination.
+    sc = gating_scores[:, combo_idx]  # (B, C, combo_size)
+    outs = expert_outputs[:, combo_idx, :]  # (B, C, combo_size, output_dim)
+    y = targets[:, None, :]  # (B, 1, output_dim)
+
+    # ----- Gating oracle: renormalize the router's logits over the combination.
+    if router_activation == "softmax":
+        probs = torch.softmax(sc, dim=-1)
+    else:  # "sigmoid": sigmoid + sum-normalization (mirrors Model.forward)
+        sig = torch.sigmoid(sc)
+        probs = sig / sig.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+    gating_pred = (outs * probs.unsqueeze(-1)).sum(dim=2)  # (B, C, output_dim)
+    gating_losses = ((gating_pred - y) ** 2).mean(dim=-1)  # (B, C)
+    gating_best = gating_losses.min(dim=1).values  # (B,)
+    regret_gating = torch.relu(chosen_loss - gating_best).mean().item()
+
+    # ----- Optimal oracle: best convex weight per pair (combo_size == 2 only).
+    if combo_size == 2:
+        a = outs[:, :, 0, :]  # (B, C, output_dim)
+        b = outs[:, :, 1, :]
+        d = a - b
+        num = (d * (y - b)).sum(dim=-1)  # (B, C)
+        den = (d * d).sum(dim=-1).clamp(min=1e-12)  # (B, C)
+        w = (num / den).clamp(0.0, 1.0).unsqueeze(-1)  # (B, C, 1)
+        optimal_pred = w * a + (1.0 - w) * b  # (B, C, output_dim)
+        optimal_losses = ((optimal_pred - y) ** 2).mean(dim=-1)  # (B, C)
+        optimal_best = optimal_losses.min(dim=1).values  # (B,)
+        regret_optimal = torch.relu(chosen_loss - optimal_best).mean().item()
+    else:
+        regret_optimal = float("nan")
+
+    return regret_gating, regret_optimal
+
+
 def _lola_naive_indices(
     gating_scores: torch.Tensor,
     selected: torch.Tensor,
