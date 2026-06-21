@@ -16,6 +16,7 @@ from utils import (
     apply_router_router_lola_shaping,
     calculate_load_balancing_loss,
     calculate_per_expert_loss,
+    expert_load_metrics,
     gating_gradient_norm,
     get_device,
     per_expert_gradient_norm,
@@ -350,6 +351,9 @@ def main() -> None:
                 {
                     "loss": loss.item(),
                     "expert_imbalance": load_balancing_loss.item(),
+                    **expert_load_metrics(
+                        output["selected_experts"], model.num_experts
+                    ),
                     "gating_grad_norm": total_grad_norm,
                     "expert_grad_norm": expert_total_norm,
                     "lola/gating_grad_norm_lola": lola_norm,

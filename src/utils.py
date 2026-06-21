@@ -72,6 +72,67 @@ def calculate_load_balancing_loss(
     return num_experts * (f * P).sum()
 
 
+# Quantiles (in [0, 1]) of the per-expert load distribution, logged as
+# "load/p10".."load/p90" alongside "load/min" (the p0 extreme) and "load/max"
+# (p100). Mirrors _LOAD_QUANTILES in the Megatron-LM patch (lm/patches/0004).
+LOAD_QUANTILES = (0.10, 0.25, 0.50, 0.75, 0.90)
+
+
+def calculate_expert_load(
+    selected_experts: torch.Tensor,
+    num_experts: int,
+) -> torch.Tensor:
+    """Per-expert load = fraction of the batch's tokens routed to each expert.
+
+    With top-k routing the loads sum to top_k, so perfect balance is
+    top_k/num_experts per expert; load -> 1 means an expert funnels (almost)
+    every token, load -> 0 means it is (nearly) dead.
+
+    Args:
+        selected_experts: (B, top_k) indices of the selected experts.
+        num_experts: total number of experts E.
+
+    Returns:
+        (num_experts,) load per expert.
+    """
+    B = selected_experts.shape[0]
+    expert_counts = torch.zeros(num_experts, device=selected_experts.device)
+    expert_counts.scatter_add_(
+        0,
+        selected_experts.flatten(),
+        torch.ones(selected_experts.numel(), device=selected_experts.device),
+    )
+    return expert_counts / B
+
+
+def expert_load_metrics(
+    selected_experts: torch.Tensor,
+    num_experts: int,
+) -> dict[str, float]:
+    """Per-expert load distribution summary: "load/min", "load/max", "load/pXX".
+
+    Mirrors the Megatron-LM expert-load logging (lm/patches/0004). The toy model
+    has a single MoE layer, so the per-expert load vector is itself the pool over
+    which the quantiles are taken (load/min == p0, load/max == p100).
+
+    Args:
+        selected_experts: (B, top_k) indices of the selected experts.
+        num_experts: total number of experts E.
+
+    Returns:
+        A dict of scalar load metrics keyed by name (own "load/" wandb panel).
+    """
+    load = calculate_expert_load(selected_experts, num_experts)
+    metrics = {
+        "load/max": load.max().item(),
+        "load/min": load.min().item(),
+    }
+    quantiles = torch.quantile(load, torch.tensor(LOAD_QUANTILES, device=load.device))
+    for q, qv in zip(LOAD_QUANTILES, quantiles.tolist()):
+        metrics[f"load/p{int(round(q * 100))}"] = qv
+    return metrics
+
+
 def calculate_per_expert_loss(
     expert_outputs: torch.Tensor,
     selected_experts: torch.Tensor,
