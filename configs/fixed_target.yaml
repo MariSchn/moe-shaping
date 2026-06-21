@@ -66,9 +66,9 @@ training:
   # "top1" / "bottom1" / "all".
   expert_expert_lola_learner: all
   bilevel:
-    router_steps: 1
+    router_steps: 0
     router_lr: null
-    expert_steps: 1
+    expert_steps: 0
     expert_lr: null
 
 logging:

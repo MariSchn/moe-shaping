@@ -51,7 +51,7 @@ training:
     # Set router_steps > 0 to enable bilevel optimization.
     # Each cycle does router_steps router-only gradient updates then expert_steps expert-only updates.
     router_steps: 0
-    expert_steps: 1
+    expert_steps: 0
     # Per-component learning rates; fall back to training.learning_rate if null.
     router_lr: null
     expert_lr: null
