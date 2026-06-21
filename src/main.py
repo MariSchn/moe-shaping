@@ -244,6 +244,10 @@ def main() -> None:
 
     log_static_visualizations(init_dir, "initialization")
 
+    # Running sums of per-step routing regret (cumulative bandit regret).
+    cumulative_regret_gating = 0.0
+    cumulative_regret_optimal = 0.0
+
     pbar = tqdm(range(training_cfg.num_steps), desc="Training")
     for step in pbar:
         # ===== TRAINING =====
@@ -307,6 +311,8 @@ def main() -> None:
                 model_cfg.router_activation,
                 combo_size=model_cfg.router_top_k,
             )
+            cumulative_regret_gating += regret_gating
+            cumulative_regret_optimal += regret_optimal
 
             total_grad_norm = gating_gradient_norm(model)
             if lola_corrections is not None:
@@ -360,8 +366,8 @@ def main() -> None:
             wandb.log(
                 {
                     "loss": loss.item(),
-                    "bandit/last_layer_regret_gating": regret_gating,
-                    "bandit/last_layer_regret_optimal": regret_optimal,
+                    "bandit/last_layer_regret_gating": cumulative_regret_gating,
+                    "bandit/last_layer_regret_optimal": cumulative_regret_optimal,
                     "expert_imbalance": load_balancing_loss.item(),
                     **expert_load_metrics(
                         output["selected_experts"], model.num_experts
