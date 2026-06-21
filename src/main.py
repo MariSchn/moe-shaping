@@ -150,10 +150,23 @@ def main() -> None:
 
     bilevel_cfg = training_cfg.get("bilevel", None)
     bilevel_router_steps = bilevel_cfg.router_steps if bilevel_cfg is not None else 0
-    bilevel_expert_steps = bilevel_cfg.expert_steps if bilevel_cfg is not None else 1
-    if bilevel_router_steps > 0:
-        router_lr = bilevel_cfg.get("router_lr") or training_cfg.learning_rate
-        expert_lr = bilevel_cfg.get("expert_lr") or training_cfg.learning_rate
+    bilevel_expert_steps = bilevel_cfg.expert_steps if bilevel_cfg is not None else 0
+    bilevel_router_lr = (
+        bilevel_cfg.get("router_lr") if bilevel_cfg is not None else None
+    )
+    bilevel_expert_lr = (
+        bilevel_cfg.get("expert_lr") if bilevel_cfg is not None else None
+    )
+
+    use_bilevel = (
+        bilevel_router_steps > 0
+        or bilevel_expert_steps > 0
+        or bilevel_router_lr is not None
+        or bilevel_expert_lr is not None
+    )
+    if use_bilevel:
+        router_lr = bilevel_router_lr or training_cfg.learning_rate
+        expert_lr = bilevel_expert_lr or training_cfg.learning_rate
         router_opt = optimizer_cls(
             [p for p in model.gating_function.parameters() if p.requires_grad],
             lr=router_lr,
