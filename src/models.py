@@ -225,7 +225,20 @@ class Model(nn.Module):
                 h = torch.relu(h)
         return h  # (B, num_experts, output_dim)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        selection_bonus: torch.Tensor | None = None,
+        detach_gates: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: (B, input_dim) inputs.
+            selection_bonus: optional (B, num_experts) perturbation of the top-k
+                selection scores only; the mixing weights are unaffected.
+            detach_gates: mix with detached logits, so the task loss carries no
+                gradient into the router.
+        """
 
         assert x.ndim == 2, f"Input must be a 2D tensor (B, D), got {x.ndim}D"
         assert x.shape[1] == self.input_dim, (
@@ -234,10 +247,14 @@ class Model(nn.Module):
 
         # Routing
         gating_scores = self.gating_function(x)  # (B, num_experts)
+        selection_scores = gating_scores + self.routing_biases
+        if selection_bonus is not None:
+            selection_scores = selection_scores + selection_bonus
         _, top_k_indices = torch.topk(
-            gating_scores + self.routing_biases, self.router_top_k, dim=1
+            selection_scores, self.router_top_k, dim=1
         )  # (B, top_k) each
-        top_k_scores = torch.gather(gating_scores, dim=1, index=top_k_indices)
+        mixing_scores = gating_scores.detach() if detach_gates else gating_scores
+        top_k_scores = torch.gather(mixing_scores, dim=1, index=top_k_indices)
 
         # Run all experts on the input as a single batched pass.
         # Shape: (B, num_experts, output_dim)

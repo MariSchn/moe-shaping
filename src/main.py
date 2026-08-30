@@ -8,6 +8,7 @@ from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 import wandb
+from bandit import BanditConfig, BanditRouter
 from models import Model
 from targets import ModelTarget, PiecewiseLinearTarget
 from utils import (
@@ -183,6 +184,19 @@ def main() -> None:
         optimizer = optimizer_cls(trainable_params, lr=training_cfg.learning_rate)
     loss_fn = nn.MSELoss()
 
+    bandit_cfg = BanditConfig.from_dict(
+        OmegaConf.to_container(training_cfg.get("bandit"), resolve=True)
+        if training_cfg.get("bandit") is not None
+        else None
+    )
+    if bandit_cfg.enabled and training_cfg.load_balancing_loss_weight > 0:
+        raise ValueError(
+            "The Switch auxiliary load-balancing loss acts on the router through "
+            "its gradient, which bandit routing removes. Use the auxiliary-free "
+            "bias (auxiliarly_loss_free_load_balancing_gamma) instead."
+        )
+    bandit_router = BanditRouter(bandit_cfg, model)
+
     viz_frames = []
 
     viz_num_points = 200
@@ -269,7 +283,11 @@ def main() -> None:
         )
         y = target_function(x)
 
-        output = model(x)
+        output = model(
+            x,
+            selection_bonus=bandit_router.selection_bonus(x),
+            detach_gates=bandit_cfg.enabled,
+        )
         loss = loss_fn(output["predictions"], y)
 
         # Always calculate load balancing loss for logging, but only add it to the loss if the weight is positive.
@@ -305,6 +323,8 @@ def main() -> None:
         )
 
         loss.backward(retain_graph=(lola_alpha != 0 or expert_lola_alpha != 0))
+
+        bandit_metrics = bandit_router.compute_router_gradient(x, output, y)
 
         # ===== LOGGING =====
         per_expert_grad_norms = per_expert_gradient_norm(model)
@@ -400,6 +420,7 @@ def main() -> None:
                         if isinstance(optimizer, BilevelOptimizer)
                         else -1
                     ),
+                    **bandit_metrics,
                 }
             )
 

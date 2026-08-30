@@ -55,6 +55,11 @@ training:
     # Per-component learning rates; fall back to training.learning_rate if null.
     router_lr: null
     expert_lr: null
+  # Replaces the router's task-loss gradient with a contextual bandit update.
+  # See src/bandit.py.
+  bandit:
+    enabled: false
+    epsilon: 0.0
 
 logging:
   anim_sampling_rate: 50
