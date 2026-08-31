@@ -33,7 +33,8 @@
 #                     BANDIT_COEFF BANDIT_ADV_NORM BANDIT_ENTROPY
 #                     BANDIT_CRITIC_COEFF BANDIT_KEEP_TASK_GRAD
 #                     BANDIT_GRAD_ALIGN_INTERVAL
-#   Frozen router: ROUTER_LR=0 (control arm: router never leaves its init)
+#   Frozen router: ROUTER_LR=0 (control arm: router never leaves its init).
+#                     ROUTER_LR/EXPERT_LR take effect with or without BILEVEL=1.
 #
 # Baseline vs bilevel runs get distinct job/log/W&B names (RUN_TAG: joint vs
 # bl-r<R>e<E>), so their TensorBoard dirs and runs do not clobber each other.
@@ -118,6 +119,19 @@ if [ "$BILEVEL" = 1 ]; then
         [ -n "$EXPERT_LR" ] && BILEVEL_LINES="${BILEVEL_LINES}
     --expert-lr ${EXPERT_LR}"
     fi
+    BILEVEL_ARGS_BLOCK="BILEVEL_ARGS=(
+${BILEVEL_LINES}
+)"
+elif [ -n "$ROUTER_LR" ] || [ -n "$EXPERT_LR" ]; then
+    # Per-group learning rates without any alternation. Patch 0002 splits the
+    # router/expert params into their own optimizer groups as soon as either is
+    # set, so this needs no --bilevel-* flags. ROUTER_LR=0 is the frozen-router
+    # control arm: the router keeps its initialization for the whole run.
+    RUN_TAG="splitlr-r${ROUTER_LR:-lr}-e${EXPERT_LR:-lr}"
+    BILEVEL_LINES=""
+    [ -n "$ROUTER_LR" ] && BILEVEL_LINES="    --router-lr ${ROUTER_LR}"
+    [ -n "$EXPERT_LR" ] && BILEVEL_LINES="${BILEVEL_LINES:+${BILEVEL_LINES}
+}    --expert-lr ${EXPERT_LR}"
     BILEVEL_ARGS_BLOCK="BILEVEL_ARGS=(
 ${BILEVEL_LINES}
 )"

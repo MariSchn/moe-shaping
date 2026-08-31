@@ -36,13 +36,20 @@ export LR=2e-3
 export EVAL_INTERVAL=100
 export TIME=11:00:00
 
+# NOTE: this uses an exporting subshell rather than `env VAR=x ./launch.sh`. A
+# shim earlier in PATH than GNU env (~/.local/bin/env) swallows that form
+# silently -- it exits 0 having run nothing.
 run() {
     local arm="$1"; shift
     for seed in 42 43 44; do
         local name="s2-${arm}-s${seed}"
         echo "=== $name ==="
-        env "$@" JOB_NAME="$name" RUN_NAME="$name" SEED=$seed LR=$LR \
-            EVAL_INTERVAL=$EVAL_INTERVAL TIME=$TIME ./launch.sh $STEPS
+        (
+            export JOB_NAME="$name" RUN_NAME="$name" SEED="$seed" LR="$LR" \
+                   EVAL_INTERVAL="$EVAL_INTERVAL" TIME="$TIME"
+            for assignment in "$@"; do export "$assignment"; done
+            ./launch.sh "$STEPS"
+        )
     done
 }
 
