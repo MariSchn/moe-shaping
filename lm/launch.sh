@@ -228,7 +228,25 @@ if [ ! -f "$MEGATRON_SNAPSHOT/.snapshot-complete" ]; then
     mkdir -p "$SNAPSHOT_ROOT"
     STAGING=$(mktemp -d "$SNAPSHOT_ROOT/.staging-XXXXXX")
     git -C "$WORKDIR/Megatron-LM" archive HEAD | tar -x -C "$STAGING"
+    # The staging dir sits inside this repo's work tree, and `git apply` run from
+    # a subdirectory SILENTLY IGNORES patched paths that resolve outside that
+    # subdirectory -- it exits 0 having changed nothing, producing a snapshot of
+    # unpatched Megatron. Giving the staging tree its own repo makes the patch
+    # paths resolve against it, and the check below refuses to publish a snapshot
+    # unless every file the patches name actually changed.
+    git init -q "$STAGING"
+    git -C "$STAGING" add -A
+    git -C "$STAGING" -c user.email=snapshot@local -c user.name=snapshot commit -qm base
     ( cd "$STAGING" && git apply "$WORKDIR"/patches/*.patch )
+    EXPECTED=$(grep -h '^+++ b/' "$WORKDIR"/patches/*.patch | sed 's|^+++ b/||' | sort -u)
+    ACTUAL=$( { git -C "$STAGING" diff --name-only
+                git -C "$STAGING" ls-files --others --exclude-standard; } | sort -u)
+    if [ "$EXPECTED" != "$ACTUAL" ]; then
+        echo "ERROR: patch set did not apply as expected in $STAGING" >&2
+        diff <(echo "$EXPECTED") <(echo "$ACTUAL") >&2 || true
+        exit 1
+    fi
+    rm -rf "$STAGING/.git"
     touch "$STAGING/.snapshot-complete"
     mv -T "$STAGING" "$MEGATRON_SNAPSHOT"
 fi
