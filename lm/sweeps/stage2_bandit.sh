@@ -35,6 +35,7 @@ for seed in 42 43 44; do
                BANDIT_ENTROPY="${BANDIT_ENTROPY:-0.0}" \
                BANDIT_CRITIC_COEFF="${BANDIT_CRITIC_COEFF:-0.01}" \
                BANDIT_KEEP_TASK_GRAD="${BANDIT_KEEP_TASK_GRAD:-0}" \
+               BANDIT_GRAD_ALIGN_INTERVAL="${BANDIT_GRAD_ALIGN_INTERVAL:-50}" \
                JOB_NAME="$name" RUN_NAME="$name" SEED="$seed" LR="$LR" \
                EVAL_INTERVAL="$EVAL_INTERVAL" TIME="$TIME"
         ./launch.sh "$STEPS"

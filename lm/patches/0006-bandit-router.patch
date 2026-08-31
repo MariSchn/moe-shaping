@@ -81,9 +81,24 @@
 #   --bandit-grad-align-interval N logs "bandit/grad_alignment", the cosine
 #   similarity between the task gradient and the REINFORCE gradient w.r.t. the
 #   router logits -- i.e. how much of the true routing gradient the bandit
-#   estimator actually recovers. It needs a task path to the logits, so it requires
-#   --bandit-keep-task-gradient, and it costs two extra backward passes on the
-#   iterations it fires.
+#   estimator actually recovers. Near zero means the estimator carries essentially
+#   none of the signal at this batch size.
+#
+#   Neither gradient is obtained with an extra backward pass. The task one is read
+#   off the *normal* backward with a hook on the mixing branch's graph node, which
+#   nothing else flows through -- so it works even in a pure bandit run, where
+#   BlockTaskGradient sits immediately below that node and stops the gradient from
+#   travelling further. The REINFORCE one is closed-form:
+#     d/dlogits [-advantage * log pi(selected)]
+#       = -advantage * (onehot(selected) - topk * softmax(logits)).
+#   An earlier version called torch.autograd.grad twice instead; do not go back to
+#   that. Transformer Engine's fused-op backward releases its saved tensors on the
+#   first traversal, so the second call dies inside te/pytorch/ops/fuser.py with
+#   "TypeError: slice() argument after * must be an iterable, not NoneType", even
+#   with retain_graph=True.
+#
+#   Because the task gradient only arrives during the backward pass, the cosine for
+#   a step is assembled in pop_metrics() and reported with that step's metrics.
 #
 # Scope / caveats:
 #   * "bandit/*" metrics are the logging rank's local view (no cross-rank reduce),
@@ -105,10 +120,10 @@
 #
 diff --git a/megatron/core/transformer/moe/bandit.py b/megatron/core/transformer/moe/bandit.py
 new file mode 100644
-index 000000000..d61fdabb4
+index 000000000..fcfdd9972
 --- /dev/null
 +++ b/megatron/core/transformer/moe/bandit.py
-@@ -0,0 +1,368 @@
+@@ -0,0 +1,408 @@
 +"""Contextual-bandit (REINFORCE) training of the MoE router (moe-shaping).
 +
 +The router normally learns from the task gradient that flows back through the
@@ -165,7 +180,9 @@ index 000000000..d61fdabb4
 +    log_prob: torch.Tensor  # [num_tokens], differentiable w.r.t. the router weight
 +    entropy: torch.Tensor  # [num_tokens], differentiable
 +    value: Optional[torch.Tensor] = None  # [num_tokens], critic prediction of the loss
-+    logits: Optional[torch.Tensor] = None  # [num_tokens, num_experts], for grad alignment
++    # [num_tokens, num_experts] d/dlogits of the selected set's log-probability,
++    # i.e. onehot(selected) - topk * softmax(logits). Only on probe steps.
++    score_shape: Optional[torch.Tensor] = None
 +
 +
 +@dataclass
@@ -176,6 +193,10 @@ index 000000000..d61fdabb4
 +    iteration: int = 0
 +    microbatch: int = 0  # index within the current step, reset by reset_records()
 +    adv_ema_var: Optional[torch.Tensor] = None
++    # Per-layer gradients w.r.t. the router logits, for the alignment probe: the
++    # task's, captured by a backward hook, and REINFORCE's, computed in closed form.
++    align_task: Dict[int, torch.Tensor] = field(default_factory=dict)
++    align_policy: Dict[int, torch.Tensor] = field(default_factory=dict)
 +    metric_sums: Dict[str, Any] = field(default_factory=dict)
 +    metric_counts: Dict[str, int] = field(default_factory=dict)
 +
@@ -264,12 +285,44 @@ index 000000000..d61fdabb4
 +    _STATE.microbatch = 0
 +
 +
++def should_probe() -> bool:
++    """True on the forward pass the gradient-alignment probe measures.
++
++    The step's first micro-batch only, so the probe costs one extra [tokens x
++    experts] tensor per layer rather than one per micro-batch.
++    """
++    cfg = _STATE.config
++    return (
++        cfg.grad_align_interval > 0
++        and _STATE.microbatch == 0
++        and _STATE.iteration % cfg.grad_align_interval == 0
++    )
++
++
++def capture_task_gradient(layer_number: int, mixing_logits: torch.Tensor) -> None:
++    """Hook the mixing branch so the backward pass hands us the task gradient.
++
++    mixing_logits is the node the routing *weights* are computed from, and nothing
++    else flows through it, so the gradient arriving there is the task loss's
++    gradient w.r.t. this layer's router logits -- including in a pure bandit run,
++    where BlockTaskGradient sits immediately below and stops it from going any
++    further. Reading it from the normal backward pass costs nothing extra, and is
++    the only way to get it: Transformer Engine's fused-op backward releases its
++    saved tensors on the first traversal, so a second torch.autograd.grad over the
++    same subgraph raises "slice() argument after * must be an iterable".
++    """
++    _STATE.align_task.pop(layer_number, None)
++    mixing_logits.register_hook(
++        lambda grad: _STATE.align_task.__setitem__(layer_number, grad.detach().float())
++    )
++
++
 +def record(
 +    layer_number: int,
 +    log_prob: torch.Tensor,
 +    entropy: torch.Tensor,
 +    value: Optional[torch.Tensor] = None,
-+    logits: Optional[torch.Tensor] = None,
++    score_shape: Optional[torch.Tensor] = None,
 +) -> None:
 +    """Store one layer's routing action for the current micro-batch."""
 +    _STATE.records.append(
@@ -278,7 +331,7 @@ index 000000000..d61fdabb4
 +            log_prob=log_prob,
 +            entropy=entropy,
 +            value=value,
-+            logits=logits,
++            score_shape=score_shape,
 +        )
 +    )
 +
@@ -300,6 +353,10 @@ index 000000000..d61fdabb4
 +    This is the only place tensor diagnostics are read back to the host, so the
 +    training step itself never blocks on a device synchronization for logging.
 +    """
++    alignment = _pop_grad_alignment()
++    if alignment is not None:
++        _accumulate_metric("bandit/grad_alignment", alignment)
++
 +    if not _STATE.metric_sums:
 +        return {}
 +    metrics = {
@@ -340,28 +397,26 @@ index 000000000..d61fdabb4
 +    return var.sqrt().clamp_min(1e-6)
 +
 +
-+def _grad_alignment(
-+    records: List[_Record], task_loss: torch.Tensor, policy_loss: torch.Tensor
-+) -> Optional[float]:
-+    """Cosine similarity of the task and REINFORCE gradients w.r.t. the router logits.
++def _pop_grad_alignment() -> Optional[float]:
++    """Cosine similarity of the task and REINFORCE gradients on the router logits.
 +
-+    Answers whether the bandit estimator points the same way the true task
-+    gradient does. Requires --bandit-keep-task-gradient, since with the task
-+    gradient blocked there is no task path to the logits to compare against.
++    Near zero means the bandit estimator carries essentially none of the signal
++    the task gradient would have given the router at this batch size, which is the
++    thing worth knowing about bandit routing at LM scale. Pooled over all layers so
++    a single number summarizes the model.
 +    """
-+    logits = [r.logits for r in records if r.logits is not None]
-+    if not logits:
++    layers = sorted(set(_STATE.align_task) & set(_STATE.align_policy))
++    task, policy = _STATE.align_task, _STATE.align_policy
++    if not layers:
++        task.clear()
++        policy.clear()
 +        return None
 +
-+    task_grads = torch.autograd.grad(
-+        task_loss, logits, retain_graph=True, allow_unused=True, materialize_grads=True
-+    )
-+    policy_grads = torch.autograd.grad(
-+        policy_loss, logits, retain_graph=True, allow_unused=True, materialize_grads=True
-+    )
++    flat_task = torch.cat([task[layer].flatten() for layer in layers])
++    flat_policy = torch.cat([policy[layer].flatten() for layer in layers])
++    task.clear()
++    policy.clear()
 +
-+    flat_task = torch.cat([g.float().flatten() for g in task_grads])
-+    flat_policy = torch.cat([g.float().flatten() for g in policy_grads])
 +    denom = flat_task.norm() * flat_policy.norm()
 +    if denom == 0:
 +        return None
@@ -376,7 +431,7 @@ index 000000000..d61fdabb4
 +    Args:
 +        per_token_loss: [batch, seq] language-model loss, the negative reward.
 +        loss_mask: [batch, seq] 1.0 for tokens that count.
-+        task_loss: the scalar summed LM loss, used only by the grad-alignment probe.
++        task_loss: unused; kept so the call site reads symmetrically.
 +
 +    Returns:
 +        A scalar to add to the summed task loss. It is normalized the same way
@@ -464,21 +519,21 @@ index 000000000..d61fdabb4
 +            "bandit/critic_mse", (critic_loss / total_weight / num_layers).detach()
 +        )
 +
-+    # Two extra full backward passes, so fire on the step's first micro-batch only.
-+    if (
-+        cfg.grad_align_interval > 0
-+        and cfg.keep_task_gradient
-+        and _STATE.microbatch == 0
-+        and _STATE.iteration % cfg.grad_align_interval == 0
-+    ):
-+        cosine = _grad_alignment(records, task_loss, policy_loss)
-+        if cosine is not None:
-+            _accumulate_metric("bandit/grad_alignment", cosine)
++    # The REINFORCE gradient w.r.t. this layer's logits, in closed form:
++    # d/dlogits of -advantage * log pi(selected) is -advantage * score_shape. The
++    # matching task gradient arrives later, from the backward hook, so the cosine
++    # is assembled in pop_metrics() once the backward pass has run.
++    for rec, raw_advantage in zip(records, advantages):
++        if rec.score_shape is not None:
++            advantage = raw_advantage if scale is None else raw_advantage / scale
++            _STATE.align_policy[rec.layer_number] = (
++                -advantage.detach().unsqueeze(-1) * rec.score_shape
++            )
 +
 +    _STATE.microbatch += 1
 +    return bandit_loss.float()
 diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
-index 8fbe1ae88..a32272276 100644
+index 8fbe1ae88..5410331ea 100644
 --- a/megatron/core/transformer/moe/router.py
 +++ b/megatron/core/transformer/moe/router.py
 @@ -7,6 +7,7 @@ import torch
@@ -556,7 +611,7 @@ index 8fbe1ae88..a32272276 100644
      def _apply_aux_loss(
          self,
          probs: torch.Tensor,
-@@ -602,6 +656,68 @@ class TopKRouter(Router):
+@@ -602,6 +656,84 @@ class TopKRouter(Router):
                      routing_map = routing_map & (~padding_mask)
                  self.local_tokens_per_expert += routing_map.sum(dim=0)
  
@@ -599,7 +654,15 @@ index 8fbe1ae88..a32272276 100644
 +                raise ValueError(f"Unknown --bandit-explore: {cfg.explore}")
 +            _, top_indices = torch.topk(selection_scores, k=self.topk, dim=1)
 +
-+        mixing_logits = logits if cfg.keep_task_gradient else bandit.BlockTaskGradient.apply(logits)
++        probing = bandit.should_probe()
++        if cfg.keep_task_gradient:
++            # A separate graph node when probing, so the hook below sees only the
++            # task gradient and not the REINFORCE term's, which also reaches logits.
++            mixing_logits = logits.clone() if probing else logits
++        else:
++            mixing_logits = bandit.BlockTaskGradient.apply(logits)
++        if probing:
++            bandit.capture_task_gradient(self.layer_number, mixing_logits)
 +        top_logits = torch.gather(mixing_logits, dim=1, index=top_indices)
 +        top_probs = torch.softmax(top_logits, dim=-1, dtype=torch.float32).type_as(logits)
 +        probs = torch.zeros_like(logits).scatter(1, top_indices, top_probs)
@@ -613,19 +676,27 @@ index 8fbe1ae88..a32272276 100644
 +            value = (
 +                hidden @ self.bandit_value.float().t() + self.bandit_value_bias.float()
 +            ).squeeze(-1)
++        score_shape = None
++        if probing:
++            # d/dlogits of log pi(selected set) = onehot(selected) - topk * softmax,
++            # which bandit.build_loss() scales by the advantage to get the REINFORCE
++            # gradient without a second backward pass.
++            score_shape = torch.zeros_like(log_probs).scatter(
++                1, top_indices, 1.0
++            ) - self.topk * log_probs.exp()
 +        bandit.record(
 +            layer_number=self.layer_number,
 +            log_prob=log_probs.gather(1, top_indices).sum(dim=-1),
 +            entropy=-(log_probs.exp() * log_probs).sum(dim=-1),
 +            value=value,
-+            logits=logits if cfg.grad_align_interval > 0 else None,
++            score_shape=score_shape,
 +        )
 +        return probs, routing_map
 +
      def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
          """Top-k routing function
  
-@@ -629,6 +745,8 @@ class TopKRouter(Router):
+@@ -629,6 +761,8 @@ class TopKRouter(Router):
          # Calculate probs and routing_map for token dispatching
          if self.routing_type == "sinkhorn":
              probs, routing_map = self.sinkhorn_load_balancing(logits)
@@ -634,7 +705,7 @@ index 8fbe1ae88..a32272276 100644
          else:
              probs, routing_map = topk_routing_with_score_function(
                  logits,
-@@ -737,7 +855,11 @@ class TopKRouter(Router):
+@@ -737,7 +871,11 @@ class TopKRouter(Router):
              # Apply force load balancing with random logits for benchmark
              logits = apply_random_logits(logits)
  
@@ -647,7 +718,7 @@ index 8fbe1ae88..a32272276 100644
          return probs, routing_map
  
 diff --git a/megatron/training/arguments.py b/megatron/training/arguments.py
-index 44c776f6c..0d34ba7b7 100644
+index 44c776f6c..d96ea7aa7 100644
 --- a/megatron/training/arguments.py
 +++ b/megatron/training/arguments.py
 @@ -2698,6 +2698,62 @@ def _add_moe_args(parser):
@@ -701,15 +772,15 @@ index 44c776f6c..0d34ba7b7 100644
 +                            'throttles every other parameter\'s update.')
 +    group.add_argument('--bandit-keep-task-gradient', action='store_true',
 +                       help='Do not block the task gradient into the router, so it learns from '
-+                            'the task gradient and the bandit signal together (hybrid). Also '
-+                            'required by --bandit-grad-align-interval.')
++                            'the task gradient and the bandit signal together (hybrid).')
 +    group.add_argument('--bandit-grad-align-interval', type=int, default=0,
 +                       help='Every N iterations, log the cosine similarity between the task '
 +                            'gradient and the REINFORCE gradient w.r.t. the router logits as '
 +                            '"bandit/grad_alignment": how much of the true routing gradient the '
-+                            'bandit estimator recovers. Costs two extra backward passes on '
-+                            'those iterations and needs --bandit-keep-task-gradient. '
-+                            '0 disables.')
++                            'bandit estimator recovers, where near zero means it recovers none '
++                            'of it. Works with or without --bandit-keep-task-gradient and adds '
++                            'no backward passes; it costs one [tokens x experts] tensor per MoE '
++                            'layer on the iterations it fires. 0 disables.')
      group.add_argument('--router-lr', type=float, default=None,
                         help='Per-group learning rate for the MoE router params. '
                              'Defaults to --lr when unset. Splits the router into its own param group (with or without alternation).')

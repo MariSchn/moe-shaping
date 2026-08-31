@@ -32,7 +32,9 @@
 #                     BANDIT_EPSILON_FINAL
 #                     BANDIT_COEFF BANDIT_ADV_NORM BANDIT_ENTROPY
 #                     BANDIT_CRITIC_COEFF BANDIT_KEEP_TASK_GRAD
-#                     BANDIT_GRAD_ALIGN_INTERVAL
+#                     BANDIT_GRAD_ALIGN_INTERVAL=N logs bandit/grad_alignment,
+#                     the cosine between the REINFORCE and task gradients on the
+#                     router logits, every N steps (no extra backward passes)
 #   Frozen router: ROUTER_LR=0 (control arm: router never leaves its init).
 #                     ROUTER_LR/EXPERT_LR take effect with or without BILEVEL=1.
 #

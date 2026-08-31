@@ -47,8 +47,8 @@ run s1-base-aux    AUX_LOSS_COEFF=0.01
 run s1-base-frozen AUX_LOSS_COEFF=0 ROUTER_LR=0
 
 # --- which baseline reduces the advantage's variance best ---
-run s1-bd-bm      BANDIT=1 AUX_LOSS_COEFF=0 BANDIT_BASELINE=batch_mean
-run s1-bd-critic  BANDIT=1 AUX_LOSS_COEFF=0 BANDIT_BASELINE=critic
+run s1-bd-bm      BANDIT=1 AUX_LOSS_COEFF=0 BANDIT_BASELINE=batch_mean BANDIT_GRAD_ALIGN_INTERVAL=25
+run s1-bd-critic  BANDIT=1 AUX_LOSS_COEFF=0 BANDIT_BASELINE=critic BANDIT_GRAD_ALIGN_INTERVAL=25
 run s1-bd-nobase  BANDIT=1 AUX_LOSS_COEFF=0 BANDIT_BASELINE=none
 
 # --- how much exploration, and of which kind ---
