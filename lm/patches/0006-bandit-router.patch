@@ -58,6 +58,19 @@
 #   token difficulty rather than routing quality), optionally rescaled to unit
 #   standard deviation.
 #
+#   The critic regresses on the reward *standardized within the micro-batch*, not
+#   on the raw one. Two reasons, the second of which is the one that bites: the raw
+#   per-token loss is ~11 at initialization and ~2.4 late in training, so a critic
+#   chasing it aims at a target whose scale shifts by 5x; and its squared error is
+#   then large enough that, because --clip-grad is global across all parameters,
+#   that single term scales down every other parameter's update. Measured on a
+#   30-step smoke run, a raw-target critic produced global grad norms of
+#   1500-20000 against 1-19 for the same model with no bandit term.
+#
+#   The advantage's normalizing scale is computed once per micro-batch over all
+#   layers pooled, not once per layer. With one EMA update per layer per
+#   micro-batch (8 x 8 here) the "moving" average would span barely one step.
+#
 # Token ordering:
 #   The router flattens [seq, batch, hidden] -> [seq * batch]; the LM loss arrives
 #   as [batch, seq]. build_loss() transposes before flattening so token t means the
@@ -92,10 +105,10 @@
 #
 diff --git a/megatron/core/transformer/moe/bandit.py b/megatron/core/transformer/moe/bandit.py
 new file mode 100644
-index 000000000..76249145c
+index 000000000..d61fdabb4
 --- /dev/null
 +++ b/megatron/core/transformer/moe/bandit.py
-@@ -0,0 +1,333 @@
+@@ -0,0 +1,368 @@
 +"""Contextual-bandit (REINFORCE) training of the MoE router (moe-shaping).
 +
 +The router normally learns from the task gradient that flows back through the
@@ -161,9 +174,10 @@ index 000000000..76249145c
 +    records: List[_Record] = field(default_factory=list)
 +    progress: float = 0.0  # training progress in [0, 1], drives the anneals
 +    iteration: int = 0
++    microbatch: int = 0  # index within the current step, reset by reset_records()
 +    adv_ema_var: Optional[torch.Tensor] = None
 +    metric_sums: Dict[str, Any] = field(default_factory=dict)
-+    metric_count: int = 0
++    metric_counts: Dict[str, int] = field(default_factory=dict)
 +
 +
 +_STATE = _State()
@@ -245,8 +259,9 @@ index 000000000..76249145c
 +
 +
 +def reset_records() -> None:
-+    """Drop any records left over from an aborted micro-batch."""
++    """Start a training step: drop stale records and restart the micro-batch count."""
 +    _STATE.records.clear()
++    _STATE.microbatch = 0
 +
 +
 +def record(
@@ -269,9 +284,14 @@ index 000000000..76249145c
 +
 +
 +def _accumulate_metric(name: str, value: Any) -> None:
-+    """Accumulate a diagnostic. Tensors stay on the GPU until pop_metrics()."""
++    """Accumulate a diagnostic. Tensors stay on the GPU until pop_metrics().
++
++    Counts are tracked per metric, not globally, because not every diagnostic is
++    written on every micro-batch (the gradient-alignment probe fires on one).
++    """
 +    prev = _STATE.metric_sums.get(name)
 +    _STATE.metric_sums[name] = value if prev is None else prev + value
++    _STATE.metric_counts[name] = _STATE.metric_counts.get(name, 0) + 1
 +
 +
 +def pop_metrics() -> Dict[str, float]:
@@ -280,47 +300,56 @@ index 000000000..76249145c
 +    This is the only place tensor diagnostics are read back to the host, so the
 +    training step itself never blocks on a device synchronization for logging.
 +    """
-+    if _STATE.metric_count == 0:
++    if not _STATE.metric_sums:
 +        return {}
 +    metrics = {
-+        k: (v.item() if torch.is_tensor(v) else v) / _STATE.metric_count
-+        for k, v in _STATE.metric_sums.items()
++        name: (value.item() if torch.is_tensor(value) else value) / _STATE.metric_counts[name]
++        for name, value in _STATE.metric_sums.items()
 +    }
 +    _STATE.metric_sums.clear()
-+    _STATE.metric_count = 0
++    _STATE.metric_counts.clear()
 +    return metrics
 +
 +
-+def _normalize_advantage(advantage: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-+    """Scale the advantage to unit standard deviation over the valid tokens."""
++def _advantage_scale(advantages: List[torch.Tensor], weight: torch.Tensor) -> Optional[torch.Tensor]:
++    """The divisor that puts the advantage on a unit-standard-deviation scale.
++
++    Computed once per micro-batch over every layer's advantage pooled together,
++    not once per layer: with one EMA update per layer per micro-batch the moving
++    average would span barely more than a single step and stop being a moving
++    average at all.
++    """
 +    mode = _STATE.config.advantage_norm
 +    if mode == "none":
-+        return advantage
++        return None
 +
-+    total = weight.sum().clamp_min(1.0)
-+    mean = (advantage * weight).sum() / total
-+    var = ((advantage - mean) ** 2 * weight).sum() / total
++    total = weight.sum().clamp_min(1.0) * len(advantages)
++    stacked = torch.stack([a.detach() for a in advantages])
++    mean = (stacked * weight).sum() / total
++    var = ((stacked - mean) ** 2 * weight).sum() / total
 +
 +    if mode == "ema_std":
 +        if _STATE.adv_ema_var is None:
-+            _STATE.adv_ema_var = var.detach().clone()
++            _STATE.adv_ema_var = var.clone()
 +        else:
-+            _STATE.adv_ema_var.mul_(_ADV_EMA_DECAY).add_(var.detach(), alpha=1 - _ADV_EMA_DECAY)
++            _STATE.adv_ema_var.mul_(_ADV_EMA_DECAY).add_(var, alpha=1 - _ADV_EMA_DECAY)
 +        var = _STATE.adv_ema_var
 +    elif mode != "batch_std":
 +        raise ValueError(f"Unknown --bandit-advantage-norm: {mode}")
 +
-+    return advantage / var.sqrt().clamp_min(1e-6)
++    return var.sqrt().clamp_min(1e-6)
 +
 +
-+def _grad_alignment(task_loss: torch.Tensor, policy_loss: torch.Tensor) -> Optional[float]:
++def _grad_alignment(
++    records: List[_Record], task_loss: torch.Tensor, policy_loss: torch.Tensor
++) -> Optional[float]:
 +    """Cosine similarity of the task and REINFORCE gradients w.r.t. the router logits.
 +
 +    Answers whether the bandit estimator points the same way the true task
 +    gradient does. Requires --bandit-keep-task-gradient, since with the task
 +    gradient blocked there is no task path to the logits to compare against.
 +    """
-+    logits = [r.logits for r in _STATE.records if r.logits is not None]
++    logits = [r.logits for r in records if r.logits is not None]
 +    if not logits:
 +        return None
 +
@@ -372,8 +401,22 @@ index 000000000..76249145c
 +    # should be reinforced.
 +    reward = -reward_source
 +
++    reward_mean = (reward * weight).sum() / total_weight
++
++    # The critic regresses on the *standardized* reward, not the raw one. The raw
++    # per-token loss is around 11 at initialization and 2.4 late in training, so a
++    # critic chasing it is aiming at a target whose scale shifts by 5x -- and its
++    # squared error then contributes a gradient orders of magnitude larger than
++    # anything else in the model. Since --clip-grad is global, that single term
++    # would scale down every other parameter's update, which is a much bigger
++    # effect on the run than anything the routing does. In standardized units the
++    # target is O(1) from the first step and stays there.
++    reward_z = (reward - reward_mean) / (
++        ((reward - reward_mean) ** 2 * weight).sum() / total_weight
++    ).sqrt().clamp_min(1e-6)
++
 +    if cfg.baseline == "batch_mean":
-+        shared_baseline = (reward * weight).sum() / total_weight
++        shared_baseline = reward_mean
 +    elif cfg.baseline in ("none", "critic"):
 +        shared_baseline = None
 +    else:
@@ -384,17 +427,20 @@ index 000000000..76249145c
 +    entropy_sum = torch.zeros((), device=reward.device, dtype=torch.float32)
 +    advantage_sq = torch.zeros((), device=reward.device, dtype=torch.float32)
 +
++    advantages = []
 +    for rec in records:
 +        if cfg.baseline == "critic":
 +            assert rec.value is not None, "critic baseline needs a value head"
-+            baseline = rec.value.float().detach()
-+            critic_loss = critic_loss + (((rec.value.float() - reward) ** 2) * weight).sum()
-+        elif shared_baseline is not None:
-+            baseline = shared_baseline
++            value = rec.value.float()
++            critic_loss = critic_loss + (((value - reward_z) ** 2) * weight).sum()
++            advantages.append(reward_z - value.detach())
 +        else:
-+            baseline = 0.0
++            baseline = shared_baseline if shared_baseline is not None else 0.0
++            advantages.append(reward - baseline)
 +
-+        advantage = _normalize_advantage(reward - baseline, weight)
++    scale = _advantage_scale(advantages, weight)
++    for rec, raw_advantage in zip(records, advantages):
++        advantage = raw_advantage if scale is None else raw_advantage / scale
 +        policy_loss = policy_loss - (advantage * rec.log_prob.float() * weight).sum()
 +        entropy_sum = entropy_sum + (rec.entropy.float() * weight).sum()
 +        advantage_sq = advantage_sq + (advantage**2 * weight).sum() / total_weight
@@ -418,16 +464,18 @@ index 000000000..76249145c
 +            "bandit/critic_mse", (critic_loss / total_weight / num_layers).detach()
 +        )
 +
++    # Two extra full backward passes, so fire on the step's first micro-batch only.
 +    if (
 +        cfg.grad_align_interval > 0
-+        and _STATE.iteration % cfg.grad_align_interval == 0
 +        and cfg.keep_task_gradient
++        and _STATE.microbatch == 0
++        and _STATE.iteration % cfg.grad_align_interval == 0
 +    ):
-+        cosine = _grad_alignment(task_loss, policy_loss)
++        cosine = _grad_alignment(records, task_loss, policy_loss)
 +        if cosine is not None:
 +            _accumulate_metric("bandit/grad_alignment", cosine)
 +
-+    _STATE.metric_count += 1
++    _STATE.microbatch += 1
 +    return bandit_loss.float()
 diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
 index 8fbe1ae88..a32272276 100644

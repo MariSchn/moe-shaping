@@ -235,18 +235,22 @@ if [ ! -f "$MEGATRON_SNAPSHOT/.snapshot-complete" ]; then
     # paths resolve against it, and the check below refuses to publish a snapshot
     # unless every file the patches name actually changed.
     git init -q "$STAGING"
-    git -C "$STAGING" add -A
-    git -C "$STAGING" -c user.email=snapshot@local -c user.name=snapshot commit -qm base
     ( cd "$STAGING" && git apply "$WORKDIR"/patches/*.patch )
-    EXPECTED=$(grep -h '^+++ b/' "$WORKDIR"/patches/*.patch | sed 's|^+++ b/||' | sort -u)
-    ACTUAL=$( { git -C "$STAGING" diff --name-only
-                git -C "$STAGING" ls-files --others --exclude-standard; } | sort -u)
-    if [ "$EXPECTED" != "$ACTUAL" ]; then
-        echo "ERROR: patch set did not apply as expected in $STAGING" >&2
-        diff <(echo "$EXPECTED") <(echo "$ACTUAL") >&2 || true
-        exit 1
-    fi
     rm -rf "$STAGING/.git"
+    # Every file the patches name must now differ from the pristine one (or, for a
+    # file the patches create, exist at all). Comparing against the submodule
+    # directly rather than indexing the staging tree keeps this to a few seconds.
+    for f in $(grep -h '^+++ b/' "$WORKDIR"/patches/*.patch | sed 's|^+++ b/||' | sort -u); do
+        if git -C "$WORKDIR/Megatron-LM" cat-file -e "HEAD:$f" 2>/dev/null; then
+            if git -C "$WORKDIR/Megatron-LM" show "HEAD:$f" | cmp -s - "$STAGING/$f"; then
+                echo "ERROR: $f is unchanged after applying the patch set" >&2
+                exit 1
+            fi
+        elif [ ! -f "$STAGING/$f" ]; then
+            echo "ERROR: $f was not created by the patch set" >&2
+            exit 1
+        fi
+    done
     touch "$STAGING/.snapshot-complete"
     mv -T "$STAGING" "$MEGATRON_SNAPSHOT"
 fi

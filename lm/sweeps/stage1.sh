@@ -52,7 +52,11 @@ run s1-bd-tau3    BANDIT=1 AUX_LOSS_COEFF=0 BANDIT_BASELINE=critic BANDIT_TAU=3.
 
 # --- does anything rescue it: load balancing, the task gradient, entropy ---
 run s1-bd-aux     BANDIT=1 AUX_LOSS_COEFF=0.01 BANDIT_BASELINE=critic
-run s1-bd-entropy BANDIT=1 AUX_LOSS_COEFF=0 BANDIT_BASELINE=critic BANDIT_ENTROPY=0.01
+# Two entropy levels because a 30-step smoke run collapsed the routing
+# distribution from 1.98 nats to 0.005 (of a possible log 8 = 2.08), so how
+# strongly entropy has to be held up is the question that matters most here.
+run s1-bd-ent001  BANDIT=1 AUX_LOSS_COEFF=0 BANDIT_BASELINE=critic BANDIT_ENTROPY=0.01
+run s1-bd-ent01   BANDIT=1 AUX_LOSS_COEFF=0 BANDIT_BASELINE=critic BANDIT_ENTROPY=0.1
 run s1-bd-hybrid  BANDIT=1 AUX_LOSS_COEFF=0 BANDIT_BASELINE=critic \
                   BANDIT_KEEP_TASK_GRAD=1 BANDIT_GRAD_ALIGN_INTERVAL=25
 run s1-bd-hyb-c01 BANDIT=1 AUX_LOSS_COEFF=0 BANDIT_BASELINE=critic \
