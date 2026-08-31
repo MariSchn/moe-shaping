@@ -20,11 +20,20 @@
 #                                   router & experts train every step at their own LR.
 #                                   In alternating mode these are the optional per-phase
 #                                   LRs (default --lr for both).
-#   Schedule/eval: LR EVAL_INTERVAL EVAL_ITERS LR_WARMUP_ITERS TIME
+#   Schedule/eval: LR EVAL_INTERVAL EVAL_ITERS LR_WARMUP_ITERS TIME SEED
 #   Cluster: SBATCH_ACCOUNT PARTITION (empty = cluster default, e.g. PARTITION=debug)
+#            SUBMIT=0 generates logs/<JOB_NAME>.sbatch without queueing it
 #   W&B: RUN_NAME (run/TB name)  |  MoE LB: LB_TYPE (aux_loss|...|none) AUX_LOSS_COEFF
 #   Aux-loss-free LB: EXPERT_BIAS=1 (DeepSeek-V3 per-expert bias; forces sigmoid
 #                     router) [BIAS_UPDATE_RATE] | SCORE_FUNCTION (softmax|sigmoid)
+#   Bandit router: BANDIT=1 trains the router from bandit feedback instead of the
+#                     task gradient (see patches/0006). Knobs: BANDIT_BASELINE
+#                     BANDIT_EXPLORE BANDIT_TAU BANDIT_TAU_FINAL BANDIT_EPSILON
+#                     BANDIT_EPSILON_FINAL
+#                     BANDIT_COEFF BANDIT_ADV_NORM BANDIT_ENTROPY
+#                     BANDIT_CRITIC_COEFF BANDIT_KEEP_TASK_GRAD
+#                     BANDIT_GRAD_ALIGN_INTERVAL
+#   Frozen router: ROUTER_LR=0 (control arm: router never leaves its init)
 #
 # Baseline vs bilevel runs get distinct job/log/W&B names (RUN_TAG: joint vs
 # bl-r<R>e<E>), so their TensorBoard dirs and runs do not clobber each other.
@@ -35,6 +44,7 @@
 #   BILEVEL=1 BILEVEL_ROUTER_STEPS=0 BILEVEL_EXPERT_STEPS=0 \
 #       ROUTER_LR=1e-3 EXPERT_LR=3e-4 ./launch.sh 1000   # different-LR only, no alternation
 #   NUM_EXPERTS=16 HIDDEN=768 ./launch.sh 2000   # bigger model
+#   BANDIT=1 ./launch.sh 3000                    # bandit-trained router
 
 set -euo pipefail
 
@@ -82,6 +92,7 @@ EVAL_ITERS=${EVAL_ITERS:-10}
 LR_WARMUP_ITERS=${LR_WARMUP_ITERS:-$(( STEPS / 10 ))}
 [ "$LR_WARMUP_ITERS" -ge "$STEPS" ] && LR_WARMUP_ITERS=$(( STEPS / 2 ))
 TIME=${TIME:-01:00:00}
+SEED=${SEED:-42}
 
 # ---- Bilevel arg block + run tag (keeps baseline vs split-mode logs separate) ----
 if [ "$BILEVEL" = 1 ]; then
@@ -156,6 +167,73 @@ fi
 [ "$SCORE_FUNCTION" != softmax ] && MOE_LB_LINES="${MOE_LB_LINES}
     --moe-router-score-function ${SCORE_FUNCTION}"
 
+# ---- Bandit (REINFORCE) router training (patch 0006) ----
+# BANDIT=1 blocks the task gradient into the router and trains it from the
+# per-token LM loss as a bandit reward instead. BANDIT_COEFF is the knob that
+# matches the bandit gradient scale to the task one, so arms can be compared at an
+# identical --lr. BANDIT_KEEP_TASK_GRAD=1 keeps the task gradient too (hybrid),
+# which is also what BANDIT_GRAD_ALIGN_INTERVAL needs to measure against.
+BANDIT=${BANDIT:-0}
+BANDIT_BASELINE=${BANDIT_BASELINE:-critic}
+BANDIT_EXPLORE=${BANDIT_EXPLORE:-gumbel}
+BANDIT_TAU=${BANDIT_TAU:-1.0}
+BANDIT_TAU_FINAL=${BANDIT_TAU_FINAL:-0.1}
+BANDIT_EPSILON=${BANDIT_EPSILON:-0.1}
+BANDIT_EPSILON_FINAL=${BANDIT_EPSILON_FINAL:-}
+BANDIT_COEFF=${BANDIT_COEFF:-1.0}
+BANDIT_ADV_NORM=${BANDIT_ADV_NORM:-ema_std}
+BANDIT_ENTROPY=${BANDIT_ENTROPY:-0.0}
+BANDIT_CRITIC_COEFF=${BANDIT_CRITIC_COEFF:-0.01}
+BANDIT_KEEP_TASK_GRAD=${BANDIT_KEEP_TASK_GRAD:-0}
+BANDIT_GRAD_ALIGN_INTERVAL=${BANDIT_GRAD_ALIGN_INTERVAL:-0}
+if [ "$BANDIT" = 1 ]; then
+    BANDIT_LINES="    --bandit-router
+    --bandit-baseline ${BANDIT_BASELINE}
+    --bandit-explore ${BANDIT_EXPLORE}
+    --bandit-tau ${BANDIT_TAU}
+    --bandit-tau-final ${BANDIT_TAU_FINAL}
+    --bandit-epsilon ${BANDIT_EPSILON}
+    --bandit-coeff ${BANDIT_COEFF}
+    --bandit-advantage-norm ${BANDIT_ADV_NORM}
+    --bandit-entropy-weight ${BANDIT_ENTROPY}
+    --bandit-critic-coeff ${BANDIT_CRITIC_COEFF}"
+    [ -n "$BANDIT_EPSILON_FINAL" ] && BANDIT_LINES="${BANDIT_LINES}
+    --bandit-epsilon-final ${BANDIT_EPSILON_FINAL}"
+    [ "$BANDIT_KEEP_TASK_GRAD" = 1 ] && BANDIT_LINES="${BANDIT_LINES}
+    --bandit-keep-task-gradient"
+    [ "$BANDIT_GRAD_ALIGN_INTERVAL" != 0 ] && BANDIT_LINES="${BANDIT_LINES}
+    --bandit-grad-align-interval ${BANDIT_GRAD_ALIGN_INTERVAL}"
+    BANDIT_ARGS_BLOCK="BANDIT_ARGS=(
+${BANDIT_LINES}
+)"
+    RUN_TAG="bandit-${RUN_TAG}"
+else
+    BANDIT_ARGS_BLOCK="BANDIT_ARGS=()"
+fi
+
+# ---- Immutable, already-patched Megatron-LM snapshot ----
+# Patches are applied ONCE here on the login node and the job is pointed at the
+# result. Applying them inside the job is not safe with concurrent runs: the
+# `git checkout -- .` briefly unlinks files another job is importing, and because
+# `git apply` is atomic across all its inputs, a single left-over patch-created
+# file makes it drop *every* patch and silently train an unpatched model. A
+# submitted run now keeps exactly the source it was launched with. The key is the
+# submodule commit plus the patch contents, so editing a patch produces a new
+# snapshot and leaves in-flight jobs untouched.
+SNAPSHOT_ROOT="$WORKDIR/.megatron-snapshots"
+SNAPSHOT_KEY=$( { git -C "$WORKDIR/Megatron-LM" rev-parse HEAD; cat "$WORKDIR"/patches/*.patch; } | sha1sum | cut -c1-12 )
+MEGATRON_SNAPSHOT="$SNAPSHOT_ROOT/$SNAPSHOT_KEY"
+if [ ! -f "$MEGATRON_SNAPSHOT/.snapshot-complete" ]; then
+    echo "Building patched Megatron-LM snapshot $SNAPSHOT_KEY ..."
+    mkdir -p "$SNAPSHOT_ROOT"
+    STAGING=$(mktemp -d "$SNAPSHOT_ROOT/.staging-XXXXXX")
+    git -C "$WORKDIR/Megatron-LM" archive HEAD | tar -x -C "$STAGING"
+    ( cd "$STAGING" && git apply "$WORKDIR"/patches/*.patch )
+    touch "$STAGING/.snapshot-complete"
+    mv -T "$STAGING" "$MEGATRON_SNAPSHOT"
+fi
+echo "Megatron source: $MEGATRON_SNAPSHOT"
+
 ################ W&B block ################
 WANDB_BLOCK='
 # WANDB
@@ -206,9 +284,15 @@ BODY_HEAD
 
 cat >> "$SCRIPT" << BODY_WORKDIR
 WORKDIR=${WORKDIR}
-MEGATRON_LM_DIR=\$WORKDIR/Megatron-LM
+# Immutable, already-patched copy of Megatron-LM (see the snapshot block in
+# launch.sh). Jobs never modify it, so overlapping runs cannot clobber it.
+MEGATRON_LM_DIR=${MEGATRON_SNAPSHOT}
 DATA_PREFIX=/capstor/store/cscs/swissai/infra01/datasets/nvidia/Nemotron-ClimbMix/climbmix_small_megatron/climbmix_small
-DATASET_CACHE_DIR=/iopsstor/scratch/cscs/\$USER/moe-shaping/cache
+# Megatron keys its dataset index cache by (num_samples, seed), so concurrently
+# starting jobs that share a (STEPS, SEED) race on the half-written .npy and die
+# with "UnpicklingError: invalid load key". Rebuilding the index costs ~6 s, so
+# every job simply gets its own cache dir rather than coordinating a warm-up.
+DATASET_CACHE_DIR=/iopsstor/scratch/cscs/\$USER/moe-shaping/cache/${JOB_NAME}
 BODY_WORKDIR
 
 cat >> "$SCRIPT" << CONFIGS
@@ -233,7 +317,7 @@ cat >> "$SCRIPT" << 'SETUP'
 mkdir -p logs $LOG_DIR $TENSORBOARD_DIR $DATASET_CACHE_DIR
 
 cd $MEGATRON_LM_DIR
-flock $MEGATRON_LM_DIR/.git-lock bash -c "cd $MEGATRON_LM_DIR && git checkout -- . && git apply $WORKDIR/patches/*.patch"
+echo "[$(date)] Megatron source: $MEGATRON_LM_DIR"
 export PYTHONPATH=$MEGATRON_LM_DIR:$PYTHONPATH
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
@@ -277,6 +361,9 @@ ${MOE_LB_LINES}
 # Bilevel router/expert alternation (consumed by the patched training.py).
 # Empty when BILEVEL=0 (joint-training baseline).
 ${BILEVEL_ARGS_BLOCK}
+
+# Bandit (REINFORCE) router training (patch 0006). Empty when BANDIT=0.
+${BANDIT_ARGS_BLOCK}
 MODEL
 
 cat >> "$SCRIPT" << TRAINING
@@ -311,14 +398,15 @@ LEARNING_RATE_ARGS=(
     --lr-decay-style constant
     --lr-warmup-iters ${LR_WARMUP_ITERS}
 )
+
+INITIALIZATION_ARGS=(
+    --seed ${SEED}
+    --init-method-std 0.02
+)
 TRAINING
 
 cat >> "$SCRIPT" << 'REST'
 
-INITIALIZATION_ARGS=(
-    --seed 42
-    --init-method-std 0.02
-)
 
 MIXED_PRECISION_ARGS=(
     --bf16
@@ -367,6 +455,7 @@ TRAINING_CMD="torchrun ${TORCHRUN_ARGS[@]} $MEGATRON_LM_DIR/pretrain_gpt.py \
     ${NETWORK_SIZE_ARGS[@]} \
     ${MOE_ARGS[@]} \
     ${BILEVEL_ARGS[@]} \
+    ${BANDIT_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
     ${REGULARIZATION_ARGS[@]} \
     ${LEARNING_RATE_ARGS[@]} \
@@ -399,4 +488,8 @@ FOOTER
 chmod +x "$SCRIPT"
 
 echo "Generated: $SCRIPT"
-sbatch "$SCRIPT"
+# SUBMIT=0 generates the script without queueing it, for inspecting a sweep's
+# arg lists before spending node hours on them.
+if [ "${SUBMIT:-1}" = 1 ]; then
+    sbatch "$SCRIPT"
+fi

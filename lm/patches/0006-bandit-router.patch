@@ -1,0 +1,757 @@
+# Patch: Train the MoE router from bandit feedback (REINFORCE) instead of the task gradient
+#
+# Problem:
+#   The MoE router normally learns from the task gradient that flows back through
+#   the mixing weights it produces. moe-shaping asks what happens if the router
+#   instead only receives *bandit* feedback: it picks experts, the model runs, and
+#   the resulting loss is the only thing it is told. src/bandit.py does this for
+#   the toy MoE; this patch does it for a real LM in Megatron.
+#
+#   The awkward part at LM scale is credit assignment. The toy model has one
+#   router and per-expert losses are directly observable (semi-bandit feedback).
+#   An LM has one router per layer and a single loss at the output, so the reward
+#   for a routing decision is only observable through the final per-token loss,
+#   shared by every layer the token passed through.
+#
+# What this patch does:
+#   1. megatron/core/transformer/moe/bandit.py (new): the whole mechanism.
+#      - BanditConfig, populated once from the --bandit-* args.
+#      - record(): per-micro-batch store of each layer's routing action (the
+#        per-token log-probability of the selected top-k set, its entropy, and
+#        optionally the critic's prediction).
+#      - build_loss(): given the per-token LM loss, builds the REINFORCE
+#        surrogate  -sum_layers advantage_t * log pi(a_t | s_t)  plus the optional
+#        entropy bonus and critic regression, and returns it as a scalar to add to
+#        the *summed* task loss, so the pipeline schedule's division by token count
+#        and micro-batch count normalizes both terms identically.
+#      - BlockTaskGradient: identity with a zero backward. Used instead of
+#        .detach() on the mixing logits so the router logits stay connected in the
+#        autograd graph -- MoEAuxLossAutoScaler attaches the aux load-balancing
+#        loss to the *probs* tensor and is silently skipped if that tensor does not
+#        require grad -- while the task loss still contributes nothing to the
+#        router weight.
+#      - pop_metrics(): "bandit/*" diagnostics. All accumulation stays on the GPU
+#        and is read back once per logging call, so the training step never blocks
+#        on a synchronization for logging.
+#   2. megatron/core/transformer/moe/router.py: TopKRouter.bandit_routing(), the
+#      selection path (Gumbel-top-k or epsilon-greedy exploration, annealed over
+#      the run), which records the action and blocks the task gradient. __init__
+#      rejects the routing variants this path does not implement (sigmoid scoring,
+#      pre-softmax, expert bias, token dropping, group-limited routing) rather than
+#      ignoring them, and builds the per-layer critic head when that baseline is
+#      selected. forward() stashes the flattened router input for the critic.
+#      Also adds "router/entropy" to the MoE tracker for *every* arm (not just
+#      bandit ones), so router collapse is visible next to the load statistics.
+#   3. megatron/training/arguments.py (moe arg group): the --bandit-* flags.
+#   4. megatron/training/training.py: bandit.configure(args) in pretrain() before
+#      the model is built (the router inspects the config at construction time);
+#      the exploration anneal advanced in train_step(); "bandit/*" logged in
+#      training_log().
+#   5. pretrain_gpt.py, loss_func(): hands the per-token loss to build_loss() and
+#      adds the result to the loss.
+#
+# Reward and credit assignment:
+#   reward_t = -(LM loss for token t), credited in full to that token's routing
+#   decision in *every* MoE layer. The advantage is reward minus a baseline
+#   (micro-batch mean, or a per-layer linear critic reading the router's own input,
+#   which is the variance-reducing choice since most of the spread in token loss is
+#   token difficulty rather than routing quality), optionally rescaled to unit
+#   standard deviation.
+#
+# Token ordering:
+#   The router flattens [seq, batch, hidden] -> [seq * batch]; the LM loss arrives
+#   as [batch, seq]. build_loss() transposes before flattening so token t means the
+#   same token on both sides. Getting this wrong silently trains on a permuted
+#   reward, so keep the transpose if either shape convention changes.
+#
+# Diagnostics:
+#   --bandit-grad-align-interval N logs "bandit/grad_alignment", the cosine
+#   similarity between the task gradient and the REINFORCE gradient w.r.t. the
+#   router logits -- i.e. how much of the true routing gradient the bandit
+#   estimator actually recovers. It needs a task path to the logits, so it requires
+#   --bandit-keep-task-gradient, and it costs two extra backward passes on the
+#   iterations it fires.
+#
+# Scope / caveats:
+#   * "bandit/*" metrics are the logging rank's local view (no cross-rank reduce),
+#     matching the caveat on patches 0003/0004.
+#   * The critic head lives inside the router module, so '*.router.*' param-group
+#     overrides from patch 0002 (e.g. --router-lr) apply to it too.
+#   * Only the plain softmax top-k routing path is implemented; see the asserts.
+#
+# How to find the right location in a future Megatron version:
+#   router.py: TopKRouter.routing(), the `if self.routing_type == "sinkhorn"`
+#     dispatch; and TopKRouter.forward() just before the self.routing() call.
+#   training.py: `args = get_args()` at the top of pretrain(); the top of
+#     train_step(); the 'samples vs steps' line in training_log().
+#   pretrain_gpt.py: the `losses = output_tensor.view(-1).float()` block in
+#     loss_func().
+#   arguments.py: the 'moe' argument group, next to --router-lr from patch 0002.
+#
+# Applied to: Megatron-LM core_v0.16.1 (commit 55ac7082), on top of patches 0001-0005.
+#
+diff --git a/megatron/core/transformer/moe/bandit.py b/megatron/core/transformer/moe/bandit.py
+new file mode 100644
+index 000000000..76249145c
+--- /dev/null
++++ b/megatron/core/transformer/moe/bandit.py
+@@ -0,0 +1,333 @@
++"""Contextual-bandit (REINFORCE) training of the MoE router (moe-shaping).
++
++The router normally learns from the task gradient that flows back through the
++mixing weights it produces. This module replaces that signal with bandit
++feedback: the router picks top-k experts per token (optionally with exploration
++noise), the model runs, and the per-token language-model loss becomes the reward
++for every routing decision that token passed through.
++
++Flow across the codebase:
++
++  TopKRouter.routing()  -- picks experts, blocks the task gradient into the
++                           router weight, and calls record() with the per-token
++                           log-probability of the chosen action.
++  loss_func()           -- once the per-token LM loss exists, calls
++                           build_loss(), which turns the recorded actions and
++                           the reward into a scalar surrogate added to the loss.
++  training_log()        -- calls pop_metrics() for the "bandit/*" diagnostics.
++
++Records live for exactly one micro-batch: the schedule runs forward_step (which
++ends in loss_func) and backward_step per micro-batch, so build_loss() always
++consumes the records the forward pass just wrote.
++"""
++
++from dataclasses import dataclass, field
++from typing import Any, Dict, List, Optional
++
++import torch
++
++
++@dataclass
++class BanditConfig:
++    """Everything the --bandit-* CLI flags control. See _add_moe_args."""
++
++    enabled: bool = False
++    baseline: str = "batch_mean"  # batch_mean | critic | none
++    explore: str = "gumbel"  # none | gumbel | epsilon
++    tau: float = 1.0
++    tau_final: Optional[float] = None
++    epsilon: float = 0.1
++    epsilon_final: Optional[float] = None
++    coeff: float = 1.0
++    advantage_norm: str = "ema_std"  # none | batch_std | ema_std
++    entropy_weight: float = 0.0
++    critic_coeff: float = 0.01
++    keep_task_gradient: bool = False
++    grad_align_interval: int = 0
++
++
++@dataclass
++class _Record:
++    """One MoE layer's routing action for the current micro-batch."""
++
++    layer_number: int
++    log_prob: torch.Tensor  # [num_tokens], differentiable w.r.t. the router weight
++    entropy: torch.Tensor  # [num_tokens], differentiable
++    value: Optional[torch.Tensor] = None  # [num_tokens], critic prediction of the loss
++    logits: Optional[torch.Tensor] = None  # [num_tokens, num_experts], for grad alignment
++
++
++@dataclass
++class _State:
++    config: BanditConfig = field(default_factory=BanditConfig)
++    records: List[_Record] = field(default_factory=list)
++    progress: float = 0.0  # training progress in [0, 1], drives the anneals
++    iteration: int = 0
++    adv_ema_var: Optional[torch.Tensor] = None
++    metric_sums: Dict[str, Any] = field(default_factory=dict)
++    metric_count: int = 0
++
++
++_STATE = _State()
++
++_ADV_EMA_DECAY = 0.99
++
++
++def configure(args: Any) -> None:
++    """Install the CLI configuration. Called once, before training starts."""
++    _STATE.config = BanditConfig(
++        enabled=args.bandit_router,
++        baseline=args.bandit_baseline,
++        explore=args.bandit_explore,
++        tau=args.bandit_tau,
++        tau_final=args.bandit_tau_final,
++        epsilon=args.bandit_epsilon,
++        epsilon_final=args.bandit_epsilon_final,
++        coeff=args.bandit_coeff,
++        advantage_norm=args.bandit_advantage_norm,
++        entropy_weight=args.bandit_entropy_weight,
++        critic_coeff=args.bandit_critic_coeff,
++        keep_task_gradient=args.bandit_keep_task_gradient,
++        grad_align_interval=args.bandit_grad_align_interval,
++    )
++
++
++def get_config() -> BanditConfig:
++    """The active configuration (disabled by default)."""
++    return _STATE.config
++
++
++def is_enabled() -> bool:
++    """True when the router should be trained from bandit feedback."""
++    return _STATE.config.enabled
++
++
++def set_progress(iteration: int, train_iters: int) -> None:
++    """Report training progress so the temperature / epsilon anneals can advance."""
++    _STATE.iteration = iteration
++    _STATE.progress = min(max(iteration / max(train_iters, 1), 0.0), 1.0)
++
++
++def _anneal(start: float, final: Optional[float]) -> float:
++    """Linear interpolation from start to final over the run."""
++    if final is None:
++        return start
++    return start + (final - start) * _STATE.progress
++
++
++def current_tau() -> float:
++    """Gumbel temperature for this step. Higher = more exploration."""
++    return max(_anneal(_STATE.config.tau, _STATE.config.tau_final), 1e-4)
++
++
++def current_epsilon() -> float:
++    """Epsilon-greedy exploration rate for this step."""
++    return max(_anneal(_STATE.config.epsilon, _STATE.config.epsilon_final), 0.0)
++
++
++class BlockTaskGradient(torch.autograd.Function):
++    """Identity that returns a zero gradient.
++
++    Keeps the mixing weights connected to the router logits in the autograd graph
++    -- so anything else attached to them (the aux load-balancing loss, via
++    MoEAuxLossAutoScaler) still receives its gradient -- while ensuring the task
++    loss itself contributes nothing to the router weight. A plain .detach() would
++    disconnect the graph and silently drop the aux loss.
++    """
++
++    @staticmethod
++    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
++        """Pass the logits through unchanged."""
++        return x
++
++    @staticmethod
++    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
++        """Absorb the task gradient."""
++        return torch.zeros_like(grad_output)
++
++
++def reset_records() -> None:
++    """Drop any records left over from an aborted micro-batch."""
++    _STATE.records.clear()
++
++
++def record(
++    layer_number: int,
++    log_prob: torch.Tensor,
++    entropy: torch.Tensor,
++    value: Optional[torch.Tensor] = None,
++    logits: Optional[torch.Tensor] = None,
++) -> None:
++    """Store one layer's routing action for the current micro-batch."""
++    _STATE.records.append(
++        _Record(
++            layer_number=layer_number,
++            log_prob=log_prob,
++            entropy=entropy,
++            value=value,
++            logits=logits,
++        )
++    )
++
++
++def _accumulate_metric(name: str, value: Any) -> None:
++    """Accumulate a diagnostic. Tensors stay on the GPU until pop_metrics()."""
++    prev = _STATE.metric_sums.get(name)
++    _STATE.metric_sums[name] = value if prev is None else prev + value
++
++
++def pop_metrics() -> Dict[str, float]:
++    """Return the bandit diagnostics averaged over the micro-batches since the last call.
++
++    This is the only place tensor diagnostics are read back to the host, so the
++    training step itself never blocks on a device synchronization for logging.
++    """
++    if _STATE.metric_count == 0:
++        return {}
++    metrics = {
++        k: (v.item() if torch.is_tensor(v) else v) / _STATE.metric_count
++        for k, v in _STATE.metric_sums.items()
++    }
++    _STATE.metric_sums.clear()
++    _STATE.metric_count = 0
++    return metrics
++
++
++def _normalize_advantage(advantage: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
++    """Scale the advantage to unit standard deviation over the valid tokens."""
++    mode = _STATE.config.advantage_norm
++    if mode == "none":
++        return advantage
++
++    total = weight.sum().clamp_min(1.0)
++    mean = (advantage * weight).sum() / total
++    var = ((advantage - mean) ** 2 * weight).sum() / total
++
++    if mode == "ema_std":
++        if _STATE.adv_ema_var is None:
++            _STATE.adv_ema_var = var.detach().clone()
++        else:
++            _STATE.adv_ema_var.mul_(_ADV_EMA_DECAY).add_(var.detach(), alpha=1 - _ADV_EMA_DECAY)
++        var = _STATE.adv_ema_var
++    elif mode != "batch_std":
++        raise ValueError(f"Unknown --bandit-advantage-norm: {mode}")
++
++    return advantage / var.sqrt().clamp_min(1e-6)
++
++
++def _grad_alignment(task_loss: torch.Tensor, policy_loss: torch.Tensor) -> Optional[float]:
++    """Cosine similarity of the task and REINFORCE gradients w.r.t. the router logits.
++
++    Answers whether the bandit estimator points the same way the true task
++    gradient does. Requires --bandit-keep-task-gradient, since with the task
++    gradient blocked there is no task path to the logits to compare against.
++    """
++    logits = [r.logits for r in _STATE.records if r.logits is not None]
++    if not logits:
++        return None
++
++    task_grads = torch.autograd.grad(
++        task_loss, logits, retain_graph=True, allow_unused=True, materialize_grads=True
++    )
++    policy_grads = torch.autograd.grad(
++        policy_loss, logits, retain_graph=True, allow_unused=True, materialize_grads=True
++    )
++
++    flat_task = torch.cat([g.float().flatten() for g in task_grads])
++    flat_policy = torch.cat([g.float().flatten() for g in policy_grads])
++    denom = flat_task.norm() * flat_policy.norm()
++    if denom == 0:
++        return None
++    return (flat_task @ flat_policy / denom).item()
++
++
++def build_loss(
++    per_token_loss: torch.Tensor, loss_mask: torch.Tensor, task_loss: torch.Tensor
++) -> torch.Tensor:
++    """Build the bandit surrogate for the micro-batch and clear the records.
++
++    Args:
++        per_token_loss: [batch, seq] language-model loss, the negative reward.
++        loss_mask: [batch, seq] 1.0 for tokens that count.
++        task_loss: the scalar summed LM loss, used only by the grad-alignment probe.
++
++    Returns:
++        A scalar to add to the summed task loss. It is normalized the same way
++        the LM loss is (the schedule divides the returned loss by the token count
++        and the micro-batch count), so the terms stay commensurate.
++    """
++    records = _STATE.records
++    if not records:
++        return torch.zeros((), device=per_token_loss.device, dtype=torch.float32)
++    _STATE.records = []
++
++    cfg = _STATE.config
++
++    # The router flattens its input as [seq, batch, hidden] -> [seq * batch], while
++    # the LM loss arrives as [batch, seq]. Transpose so token t means the same
++    # token on both sides.
++    reward_source = per_token_loss.detach().float().transpose(0, 1).reshape(-1)
++    weight = loss_mask.detach().float().transpose(0, 1).reshape(-1)
++    total_weight = weight.sum().clamp_min(1.0)
++
++    # Reward is the negated loss: routing that made the token cheaper to predict
++    # should be reinforced.
++    reward = -reward_source
++
++    if cfg.baseline == "batch_mean":
++        shared_baseline = (reward * weight).sum() / total_weight
++    elif cfg.baseline in ("none", "critic"):
++        shared_baseline = None
++    else:
++        raise ValueError(f"Unknown --bandit-baseline: {cfg.baseline}")
++
++    policy_loss = torch.zeros((), device=reward.device, dtype=torch.float32)
++    critic_loss = torch.zeros((), device=reward.device, dtype=torch.float32)
++    entropy_sum = torch.zeros((), device=reward.device, dtype=torch.float32)
++    advantage_sq = torch.zeros((), device=reward.device, dtype=torch.float32)
++
++    for rec in records:
++        if cfg.baseline == "critic":
++            assert rec.value is not None, "critic baseline needs a value head"
++            baseline = rec.value.float().detach()
++            critic_loss = critic_loss + (((rec.value.float() - reward) ** 2) * weight).sum()
++        elif shared_baseline is not None:
++            baseline = shared_baseline
++        else:
++            baseline = 0.0
++
++        advantage = _normalize_advantage(reward - baseline, weight)
++        policy_loss = policy_loss - (advantage * rec.log_prob.float() * weight).sum()
++        entropy_sum = entropy_sum + (rec.entropy.float() * weight).sum()
++        advantage_sq = advantage_sq + (advantage**2 * weight).sum() / total_weight
++
++    num_layers = len(records)
++    bandit_loss = cfg.coeff * policy_loss
++    if cfg.entropy_weight != 0.0:
++        # Subtracting entropy from the loss maximizes it, keeping the policy from
++        # collapsing onto one expert.
++        bandit_loss = bandit_loss - cfg.entropy_weight * entropy_sum
++    if cfg.baseline == "critic":
++        bandit_loss = bandit_loss + cfg.critic_coeff * critic_loss
++
++    _accumulate_metric("bandit/policy_loss", (policy_loss / total_weight).detach())
++    _accumulate_metric("bandit/entropy", (entropy_sum / total_weight / num_layers).detach())
++    _accumulate_metric("bandit/advantage_rms", (advantage_sq / num_layers).sqrt().detach())
++    _accumulate_metric("bandit/reward_std", reward_source.std().detach())
++    _accumulate_metric("bandit/tau", current_tau())
++    if cfg.baseline == "critic":
++        _accumulate_metric(
++            "bandit/critic_mse", (critic_loss / total_weight / num_layers).detach()
++        )
++
++    if (
++        cfg.grad_align_interval > 0
++        and _STATE.iteration % cfg.grad_align_interval == 0
++        and cfg.keep_task_gradient
++    ):
++        cosine = _grad_alignment(task_loss, policy_loss)
++        if cosine is not None:
++            _accumulate_metric("bandit/grad_alignment", cosine)
++
++    _STATE.metric_count += 1
++    return bandit_loss.float()
+diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
+index 8fbe1ae88..a32272276 100644
+--- a/megatron/core/transformer/moe/router.py
++++ b/megatron/core/transformer/moe/router.py
+@@ -7,6 +7,7 @@ import torch
+ 
+ from megatron.core.jit import jit_fuser
+ from megatron.core.transformer.module import MegatronModule
++from megatron.core.transformer.moe import bandit
+ from megatron.core.transformer.moe.moe_utils import (
+     MoEAuxLossAutoScaler,
+     ProcessGroupCollection,
+@@ -206,6 +207,48 @@ class TopKRouter(Router):
+         if self.config.moe_enable_routing_replay:
+             self.router_replay = RouterReplay()
+ 
++        # Bandit router (moe-shaping). bandit_routing() implements only the plain
++        # softmax top-k path, so reject the routing variants it does not cover
++        # rather than silently ignoring them.
++        self._bandit_hidden = None
++        self.bandit_value = None
++        self.bandit_value_bias = None
++        bandit_cfg = bandit.get_config()
++        if bandit_cfg.enabled:
++            assert self.score_function == "softmax", (
++                "--bandit-router implements softmax scoring only, got "
++                f"--moe-router-score-function {self.score_function}"
++            )
++            assert not self.config.moe_router_pre_softmax, (
++                "--bandit-router is incompatible with --moe-router-pre-softmax"
++            )
++            assert not self.enable_expert_bias, (
++                "--bandit-router is incompatible with --moe-router-enable-expert-bias "
++                "(which requires sigmoid scoring)"
++            )
++            assert self.config.moe_expert_capacity_factor is None, (
++                "--bandit-router is incompatible with token dropping"
++            )
++            assert self.config.moe_router_group_topk is None, (
++                "--bandit-router is incompatible with group-limited routing"
++            )
++            # The critic baseline is a per-layer linear head predicting the token's
++            # LM loss from the router's own input, so the REINFORCE advantage is
++            # measured against how hard this token was expected to be rather than
++            # against the batch average. Built only when selected, to keep unused
++            # parameters out of the distributed optimizer.
++            if bandit_cfg.baseline == "critic":
++                self.bandit_value = torch.nn.Parameter(
++                    torch.empty((1, self.config.hidden_size), dtype=torch.float32)
++                )
++                self.config.init_method(self.bandit_value)
++                self.bandit_value.data = self.bandit_value.data.to(
++                    dtype=self.config.params_dtype
++                )
++                self.bandit_value_bias = torch.nn.Parameter(
++                    torch.zeros(1, dtype=self.config.params_dtype)
++                )
++
+     def _maintain_float32_expert_bias(self):
+         """
+         Maintain the expert bias in float32.
+@@ -332,6 +375,17 @@ class TopKRouter(Router):
+             "load", expert_load.detach(), self.layer_number, num_layers, reduce_op="collect"
+         )
+ 
++        # Mean entropy of the router's distribution over experts, in nats. log(E)
++        # is a uniform router; 0 is a router that always picks the same expert.
++        # Logged for every arm so router collapse is visible independently of the
++        # load statistics above.
++        entropy = -(scores_for_aux_loss * torch.log(scores_for_aux_loss.clamp_min(1e-9))).sum(
++            dim=-1
++        ).mean()
++        save_to_aux_losses_tracker(
++            "router/entropy", entropy.detach(), self.layer_number, num_layers
++        )
++
+     def _apply_aux_loss(
+         self,
+         probs: torch.Tensor,
+@@ -602,6 +656,68 @@ class TopKRouter(Router):
+                     routing_map = routing_map & (~padding_mask)
+                 self.local_tokens_per_expert += routing_map.sum(dim=0)
+ 
++    def bandit_active(self) -> bool:
++        """True when this forward pass should route from the bandit policy."""
++        return bandit.is_enabled() and self.training and torch.is_grad_enabled()
++
++    def bandit_routing(self, logits: torch.Tensor):
++        """Top-k routing whose expert choice is trained from bandit feedback.
++
++        Selection is optionally perturbed for exploration and the mixing weights
++        are the usual softmax over the selected logits, but the task gradient into
++        the router weight is blocked. The router's only learning signal is the
++        REINFORCE term that bandit.build_loss() builds once the per-token LM loss
++        -- the bandit reward -- is known.
++        """
++        cfg = bandit.get_config()
++        num_tokens, num_experts = logits.shape
++        scores = logits.float()
++
++        with torch.no_grad():
++            selection_scores = scores.detach()
++            if cfg.explore == "gumbel":
++                # Gumbel-top-k: sampling the k experts without replacement from
++                # softmax(logits / tau). tau -> 0 recovers greedy selection.
++                uniform = torch.rand_like(selection_scores).clamp_min(1e-20)
++                gumbel = -torch.log(-torch.log(uniform).clamp_min(1e-20))
++                selection_scores = selection_scores / bandit.current_tau() + gumbel
++            elif cfg.explore == "epsilon":
++                # With probability epsilon, force one uniformly chosen expert into
++                # the token's top-1 slot by out-scoring the whole logit range.
++                exploring = torch.rand(num_tokens, device=logits.device) < bandit.current_epsilon()
++                forced = torch.randint(0, num_experts, (num_tokens,), device=logits.device)
++                spread = selection_scores.max() - selection_scores.min() + 1.0
++                bonus = torch.zeros_like(selection_scores)
++                rows = torch.arange(num_tokens, device=logits.device)
++                bonus[rows, forced] = spread * exploring.to(selection_scores.dtype)
++                selection_scores = selection_scores + bonus
++            elif cfg.explore != "none":
++                raise ValueError(f"Unknown --bandit-explore: {cfg.explore}")
++            _, top_indices = torch.topk(selection_scores, k=self.topk, dim=1)
++
++        mixing_logits = logits if cfg.keep_task_gradient else bandit.BlockTaskGradient.apply(logits)
++        top_logits = torch.gather(mixing_logits, dim=1, index=top_indices)
++        top_probs = torch.softmax(top_logits, dim=-1, dtype=torch.float32).type_as(logits)
++        probs = torch.zeros_like(logits).scatter(1, top_indices, top_probs)
++        routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
++
++        log_probs = torch.log_softmax(scores, dim=-1)
++        value = None
++        if self.bandit_value is not None:
++            # Detached input: the critic reads the hidden state but must not shape it.
++            hidden = self._bandit_hidden.detach().float()
++            value = (
++                hidden @ self.bandit_value.float().t() + self.bandit_value_bias.float()
++            ).squeeze(-1)
++        bandit.record(
++            layer_number=self.layer_number,
++            log_prob=log_probs.gather(1, top_indices).sum(dim=-1),
++            entropy=-(log_probs.exp() * log_probs).sum(dim=-1),
++            value=value,
++            logits=logits if cfg.grad_align_interval > 0 else None,
++        )
++        return probs, routing_map
++
+     def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+         """Top-k routing function
+ 
+@@ -629,6 +745,8 @@ class TopKRouter(Router):
+         # Calculate probs and routing_map for token dispatching
+         if self.routing_type == "sinkhorn":
+             probs, routing_map = self.sinkhorn_load_balancing(logits)
++        elif self.bandit_active():
++            probs, routing_map = self.bandit_routing(logits)
+         else:
+             probs, routing_map = topk_routing_with_score_function(
+                 logits,
+@@ -737,7 +855,11 @@ class TopKRouter(Router):
+             # Apply force load balancing with random logits for benchmark
+             logits = apply_random_logits(logits)
+ 
++        # Flattened the same way routing() flattens the logits, so token t indexes
++        # the same token in both. Read by bandit_routing() for the critic baseline.
++        self._bandit_hidden = input.reshape(-1, input.shape[-1])
+         probs, routing_map = self.routing(logits, padding_mask=padding_mask)
++        self._bandit_hidden = None
+ 
+         return probs, routing_map
+ 
+diff --git a/megatron/training/arguments.py b/megatron/training/arguments.py
+index 44c776f6c..0d34ba7b7 100644
+--- a/megatron/training/arguments.py
++++ b/megatron/training/arguments.py
+@@ -2698,6 +2698,62 @@ def _add_moe_args(parser):
+     group.add_argument('--bilevel-expert-steps', type=int, default=1,
+                        help='Bilevel alternation: number of consecutive optimizer steps that '
+                             'update ONLY the MoE expert params (*.experts.*) per cycle.')
++    # --- Bandit (REINFORCE) router training (moe-shaping) ---
++    group.add_argument('--bandit-router', action='store_true',
++                       help='Train the MoE router from bandit feedback instead of the task '
++                            'gradient: the per-token LM loss is the reward for every routing '
++                            'decision that token passed through, and the task gradient into '
++                            'the router weight is blocked. See '
++                            'megatron/core/transformer/moe/bandit.py.')
++    group.add_argument('--bandit-baseline', type=str, default='batch_mean',
++                       choices=['batch_mean', 'critic', 'none'],
++                       help='Baseline subtracted from the reward to form the advantage. '
++                            '"batch_mean": the micro-batch mean reward. "critic": a per-layer '
++                            'linear head predicting the token reward from the router input. '
++                            '"none": no baseline (highest variance).')
++    group.add_argument('--bandit-explore', type=str, default='gumbel',
++                       choices=['none', 'gumbel', 'epsilon'],
++                       help='Exploration used when selecting experts. "gumbel": Gumbel-top-k '
++                            'sampling at temperature --bandit-tau. "epsilon": force a random '
++                            'expert into the top-1 slot with probability --bandit-epsilon. '
++                            '"none": greedy (argmax) selection.')
++    group.add_argument('--bandit-tau', type=float, default=1.0,
++                       help='Gumbel sampling temperature at the start of training. Larger is '
++                            'more exploratory; tau -> 0 is greedy.')
++    group.add_argument('--bandit-tau-final', type=float, default=None,
++                       help='If set, anneal --bandit-tau linearly to this value over the run.')
++    group.add_argument('--bandit-epsilon', type=float, default=0.1,
++                       help='Exploration rate for --bandit-explore epsilon.')
++    group.add_argument('--bandit-epsilon-final', type=float, default=None,
++                       help='If set, anneal --bandit-epsilon linearly to this value.')
++    group.add_argument('--bandit-coeff', type=float, default=1.0,
++                       help='Weight of the REINFORCE surrogate. Since the shared learning rate '
++                            'is held fixed across arms, this is the knob that matches the '
++                            'bandit gradient scale to the task gradient scale. 0 leaves the '
++                            'router untrained while still applying exploration.')
++    group.add_argument('--bandit-advantage-norm', type=str, default='ema_std',
++                       choices=['none', 'batch_std', 'ema_std'],
++                       help='Rescale the advantage to unit standard deviation, over the '
++                            'micro-batch ("batch_std") or an exponential moving average of it '
++                            '("ema_std", steadier), or not at all ("none").')
++    group.add_argument('--bandit-entropy-weight', type=float, default=0.0,
++                       help='Weight of an entropy bonus on the routing distribution, which '
++                            'resists collapse onto a single expert.')
++    group.add_argument('--bandit-critic-coeff', type=float, default=0.01,
++                       help='Weight of the critic regression loss (--bandit-baseline critic). '
++                            'Kept small because --clip-grad is global: a large auxiliary loss '
++                            'throttles every other parameter\'s update.')
++    group.add_argument('--bandit-keep-task-gradient', action='store_true',
++                       help='Do not block the task gradient into the router, so it learns from '
++                            'the task gradient and the bandit signal together (hybrid). Also '
++                            'required by --bandit-grad-align-interval.')
++    group.add_argument('--bandit-grad-align-interval', type=int, default=0,
++                       help='Every N iterations, log the cosine similarity between the task '
++                            'gradient and the REINFORCE gradient w.r.t. the router logits as '
++                            '"bandit/grad_alignment": how much of the true routing gradient the '
++                            'bandit estimator recovers. Costs two extra backward passes on '
++                            'those iterations and needs --bandit-keep-task-gradient. '
++                            '0 disables.')
+     group.add_argument('--router-lr', type=float, default=None,
+                        help='Per-group learning rate for the MoE router params. '
+                             'Defaults to --lr when unset. Splits the router into its own param group (with or without alternation).')
+diff --git a/megatron/training/training.py b/megatron/training/training.py
+index c0c5e563a..1aca7f38d 100644
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -141,6 +141,7 @@ from megatron.training.datasets.data_samplers import build_pretraining_data_load
+ from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
+ from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+ from megatron.core.transformer.moe import upcycling_utils
++from megatron.core.transformer.moe import bandit
+ from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
+ from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
+ from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+@@ -778,6 +779,11 @@ def pretrain(
+     args = get_args()
+     timers = get_timers()
+ 
++    # Bandit router (moe-shaping): install the --bandit-* configuration before the
++    # model is built, since TopKRouter reads it to validate the routing setup and
++    # to decide whether to create its critic head.
++    bandit.configure(args)
++
+     if args.fine_grained_activation_offloading:
+         from megatron.core.pipeline_parallel.utils import (
+             set_ideal_affinity_for_current_gpu
+@@ -1690,6 +1696,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
+     args = get_args()
+     timers = get_timers()
+ 
++    # Bandit router (moe-shaping): advance the exploration anneal for this step and
++    # drop any records a previous, aborted micro-batch may have left behind.
++    if bandit.is_enabled():
++        bandit.set_progress(getattr(args, 'curr_iteration', 0), args.train_iters)
++        bandit.reset_records()
++
+     rerun_state_machine = get_rerun_state_machine()
+     save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
+                                      (iteration + 1) % args.save_dgrads_interval == 0)
+@@ -1970,9 +1982,19 @@ def training_log(
+     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
+     learning_rate: float | None = reduce_max_stat_across_model_parallel_group(learning_rate)
+     # Tensorboard values.
++    # Bandit router (moe-shaping): "bandit/*" diagnostics, averaged over the
++    # micro-batches since the last call. Popped unconditionally so they cannot
++    # accumulate when this iteration is not a logging one. Rank-local, like the
++    # other MoE monitors.
++    bandit_metrics = bandit.pop_metrics()
++
+     if writer and (iteration % args.tensorboard_log_interval == 0):
+         if wandb_writer:
+             wandb_writer.log({'samples vs steps': args.consumed_train_samples}, iteration)
++        for name, value in bandit_metrics.items():
++            writer.add_scalar(name, value, iteration)
++            if wandb_writer:
++                wandb_writer.log({name: value}, iteration)
+         # Bilevel alternation phase indicator (1 = router-only step, 0 = expert-only step).
+         if bilevel_enabled(args):
+             bilevel_phase = getattr(args, 'bilevel_phase', 0)
+diff --git a/pretrain_gpt.py b/pretrain_gpt.py
+index 8eff08d24..0c342cf5f 100644
+--- a/pretrain_gpt.py
++++ b/pretrain_gpt.py
+@@ -41,6 +41,7 @@ from megatron.training import (
+ )
+ from megatron.training.datasets.sft_dataset import SFTDataset
+ from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, get_mtp_ranks
++from megatron.core.transformer.moe import bandit
+ from megatron.training.arguments import core_transformer_config_from_args
+ from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
+ from megatron.training.utils import (
+@@ -123,12 +124,20 @@ def loss_func(
+         loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
+     else:
+         losses = output_tensor.view(-1).float()
++        loss_mask_2d = loss_mask
+         loss_mask = loss_mask.view(-1).float()
+         loss = torch.sum(losses * loss_mask)
+ 
+         num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+         report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
+ 
++        # Bandit router (moe-shaping): the per-token LM loss is the reward for the
++        # routing decisions this micro-batch's forward pass recorded. Added to the
++        # summed loss so the schedule's division by the token and micro-batch
++        # counts normalizes both terms identically. A no-op when --bandit-router
++        # is off, or during evaluation, when nothing was recorded.
++        loss = loss + bandit.build_loss(output_tensor, loss_mask_2d, loss)
++
+     # Check individual rank losses are not NaN prior to DP all-reduce.
+     rerun_state_machine = get_rerun_state_machine()
+     if args.check_for_nan_in_loss_and_grad:

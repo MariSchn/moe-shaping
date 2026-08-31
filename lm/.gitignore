@@ -2,3 +2,4 @@ logs/
 data/climbmix_small/
 config.sh
 env.sh
+.megatron-snapshots/
