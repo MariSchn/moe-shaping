@@ -1,0 +1,184 @@
+# Patch: Router-router LOLA opponent shaping (--lola-router-alpha)
+#
+# Goal:
+#   Scale the toy src/utils.py apply_router_router_lola_shaping (lola_learner="all") to the
+#   Megatron LM: every selected router row of a token is a LOLA learner that anticipates the
+#   naive gradient step of the other selected rows, i.e. row i gets the extra gradient
+#       -alpha * grad_{w_i} [ stopgrad(grad_{w_j} l_t) . grad_{w_j} l_t ]   summed over j != i
+#   for each token t, averaged over the global batch (as the toy averages over samples).
+#
+# Why it is cheap here (no second backward pass):
+#   The router is linear and bias-free (z_t = W x_t) and the gate is the softmax over the
+#   selected logits. Treating the MoE layer output as the point at which the downstream loss is
+#   linearized (the toy likewise detaches the expert outputs), l_t = sum_{e in S_t} p_e c_e with
+#   c_e = dL/dp_e -- exactly the gradient autograd already delivers to the probs tensor. Then
+#   grad_{w_j} l_t = delta_j x_t with delta_j = p_j (c_j - cbar), and the correction to logit i
+#   is -alpha ||x_t||^2 sum_{j != i} delta_j H_ij with H_ij = d delta_j / d z_i
+#   = p_j (1[i=j] - p_i)(c_j - cbar) - p_i p_j (c_i - cbar), a k x k computation per token.
+#   The closed form was checked against a double-backward implementation of the toy formula
+#   (max abs error 1e-7 at fp32).
+#   Approximation vs the toy: curvature of the loss downstream of the MoE layer is dropped
+#   (first-order in the layer output); the toy's regression loss keeps it.
+#
+# What this patch does:
+#   megatron/core/transformer/moe/lola.py (new): an identity autograd Function on the top-k
+#   probs that, in backward, receives dL/dprobs, rescales it to per-token gradients (Megatron
+#   divides each micro-batch loss by its token count and the number of micro-batches; bf16 has no
+#   loss scale), computes the correction and returns it as an extra gradient into the router
+#   logits, so it reaches the router weight through the normal autograd / DDP path.
+#   Logs lola/correction_to_task_grad (norm of the correction over norm of the task gradient on
+#   the selected logits, mean over layers) to size alpha.
+#   router.py: applied after top-k selection, before capacity dropping; asserts softmax
+#   post-top-k scoring, no expert bias, no bandit, no top-k scaling factor.
+#   arguments.py: --lola-router-alpha (0 disables). training.py: lola.configure before model build.
+#
+# How to find the right location in a future Megatron version:
+#   router.py: TopKRouter.routing(), right after topk_routing_with_score_function.
+#
+# Applied to: Megatron-LM core_v0.16.1 (commit 55ac7082), on top of patches 0001-0007.
+#
+diff --git a/megatron/core/transformer/moe/lola.py b/megatron/core/transformer/moe/lola.py
+new file mode 100644
+index 000000000..f64aad8b3
+--- /dev/null
++++ b/megatron/core/transformer/moe/lola.py
+@@ -0,0 +1,67 @@
++from dataclasses import dataclass
++
++import torch
++
++from megatron.core.transformer.moe.moe_utils import save_to_aux_losses_tracker
++
++
++@dataclass
++class LolaConfig:
++    alpha: float = 0.0
++
++
++_config = LolaConfig()
++
++
++def configure(alpha):
++    _config.alpha = alpha
++
++
++def is_enabled():
++    return _config.alpha > 0
++
++
++def router_router_correction(probs, per_token_grad, hidden_sq_norm, alpha):
++    p = probs.float()
++    g = per_token_grad.float()
++    deviation = g - (p * g).sum(dim=-1, keepdim=True)
++    delta = p * deviation
++    a = (delta * p * deviation).sum(dim=-1, keepdim=True)
++    b = (delta * p).sum(dim=-1, keepdim=True)
++    shaped = delta * p * deviation - p * a - p * deviation * b
++    own = delta * p * deviation * (1.0 - 2.0 * p)
++    return -alpha * hidden_sq_norm.unsqueeze(-1) * (shaped - own), delta
++
++
++class _RouterRouterShaping(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, probs, logits, hidden_sq_norm, tokens_scale, router):
++        ctx.save_for_backward(probs, hidden_sq_norm)
++        ctx.tokens_scale = tokens_scale
++        ctx.router = router
++        return probs.view_as(probs)
++
++    @staticmethod
++    def backward(ctx, grad_probs):
++        probs, hidden_sq_norm = ctx.saved_tensors
++        scale = ctx.tokens_scale
++        correction, task_logit_grad = router_router_correction(
++            probs, grad_probs * scale, hidden_sq_norm, _config.alpha
++        )
++        extra = correction / scale
++        _track(ctx.router, extra, task_logit_grad / scale)
++        return grad_probs, extra.to(grad_probs.dtype), None, None, None
++
++
++def _track(router, extra, task_logit_grad):
++    num_layers = router.config.num_layers
++    if router.config.mtp_num_layers is not None:
++        num_layers += router.config.mtp_num_layers
++    ratio = extra.norm() / task_logit_grad.norm().clamp_min(1e-30)
++    save_to_aux_losses_tracker("lola/correction_to_task_grad", ratio, router.layer_number, num_layers)
++
++
++def apply(router, probs, logits, hidden, num_microbatches):
++    hidden_sq_norm = hidden.detach().float().pow(2).sum(dim=-1)
++    tokens_scale = float(logits.shape[0] * num_microbatches)
++    return _RouterRouterShaping.apply(probs, logits, hidden_sq_norm, tokens_scale, router)
+diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
+index db56566ca..bff06fc88 100644
+--- a/megatron/core/transformer/moe/router.py
++++ b/megatron/core/transformer/moe/router.py
+@@ -8,7 +8,8 @@ import torch
+ from megatron.core.jit import jit_fuser
+ from megatron.core.transformer.module import MegatronModule
+ from megatron.core.transformer.moe import bandit
+-from megatron.core.transformer.moe import routing_stats
++from megatron.core.transformer.moe import lola, routing_stats
++from megatron.core.num_microbatches_calculator import get_num_microbatches
+ from megatron.core.transformer.moe.moe_utils import (
+     MoEAuxLossAutoScaler,
+     ProcessGroupCollection,
+@@ -214,6 +215,12 @@ class TopKRouter(Router):
+         self._bandit_hidden = None
+         self.bandit_value = None
+         self.bandit_value_bias = None
++        if lola.is_enabled():
++            assert self.score_function == "softmax" and not self.config.moe_router_pre_softmax, (
++                "--lola-router-alpha shapes the post-softmax top-k gate and needs softmax scoring"
++            )
++            assert not self.enable_expert_bias and not bandit.get_config().enabled
++            assert self.config.moe_router_topk_scaling_factor is None
+         bandit_cfg = bandit.get_config()
+         if bandit_cfg.enabled:
+             assert self.score_function == "softmax", (
+@@ -783,6 +790,8 @@ class TopKRouter(Router):
+                 fused=self.config.moe_router_fusion,
+                 router_replay=self.router_replay,
+             )
++            if lola.is_enabled() and self.training and torch.is_grad_enabled():
++                probs = lola.apply(self, probs, logits, self._bandit_hidden, get_num_microbatches())
+ 
+         assigned_routing_map = routing_map
+         # Apply token dropping to probs and routing_map.
+diff --git a/megatron/training/arguments.py b/megatron/training/arguments.py
+index 2a36cd78b..df76dc4b5 100644
+--- a/megatron/training/arguments.py
++++ b/megatron/training/arguments.py
+@@ -2698,6 +2698,10 @@ def _add_moe_args(parser):
+     group.add_argument('--bilevel-expert-steps', type=int, default=1,
+                        help='Bilevel alternation: number of consecutive optimizer steps that '
+                             'update ONLY the MoE expert params (*.experts.*) per cycle.')
++    group.add_argument('--lola-router-alpha', type=float, default=0.0,
++                       help='Router-router LOLA shaping strength (0 disables). Every selected '
++                            'router row anticipates the naive update of the other selected rows '
++                            'of the same token, with the loss linearized in the MoE layer output.')
+     group.add_argument('--routing-analysis-data', type=str, default=None,
+                        help='Directory with the domain-labelled held-out set (manifest.json and '
+                             '<domain>.npy windows) for the expert-specialization analysis. '
+diff --git a/megatron/training/training.py b/megatron/training/training.py
+index f6b15011b..249da2ff7 100644
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -141,7 +141,7 @@ from megatron.training.datasets.data_samplers import build_pretraining_data_load
+ from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
+ from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+ from megatron.core.transformer.moe import upcycling_utils
+-from megatron.core.transformer.moe import bandit
++from megatron.core.transformer.moe import bandit, lola
+ from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
+ from megatron.training import routing_analysis
+ from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
+@@ -784,6 +784,7 @@ def pretrain(
+     # model is built, since TopKRouter reads it to validate the routing setup and
+     # to decide whether to create its critic head.
+     bandit.configure(args)
++    lola.configure(args.lola_router_alpha)
+ 
+     if args.fine_grained_activation_offloading:
+         from megatron.core.pipeline_parallel.utils import (

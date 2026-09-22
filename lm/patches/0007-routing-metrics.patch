@@ -1,0 +1,712 @@
+# Patch: MaxVio load-balance tracking and the OLMoE expert-specialization analysis
+#
+# Goal:
+#   Compare MoE training methods on (a) how balanced their routing is and (b) how specialized
+#   their experts end up, not just on loss.
+#
+# What this patch does:
+#   1. megatron/core/transformer/moe/routing_stats.py (new): TopKRouter.routing() hands every
+#      routing decision to routing_stats.observe(). It is monitor-only (never touches probs,
+#      routing_map or gradients) and uses the PRE-capacity-drop assignment the router actually
+#      chose, including expert bias (aux-free LB) and bandit exploration. (The expert_imbalance
+#      and load/* metrics of patches 0003/0004 recompute top-k from the raw logits and therefore
+#      miss both; do not use them to compare aux-free or bandit arms.)
+#        - training step: per-layer assignment fractions -> tracker entry "maxvio" (reduce_op
+#          "maxvio") and, with a capacity factor, "moe/token_drop_fraction";
+#        - recording mode: each token's top-k expert indices per layer (analysis forwards);
+#        - other no-grad forwards (validation): per-layer assignment counts.
+#   2. moe_utils.py: reduce_op "maxvio" stores the per-layer assignment vector, all-reduces it
+#      over the data-parallel group at logging time (= the whole global batch) and logs
+#      MaxVio_batch = (max_i load_i - mean load) / mean load (arXiv 2408.15664) as
+#      maxvio/batch (mean over layers, as in the paper), maxvio/batch_worst_layer and
+#      maxvio/batch_layer_XX.
+#   3. megatron/training/routing_analysis.py (new), called from training.py:
+#        - after every validation: MaxVio_global over the validation set -> maxvio/global_valid*;
+#        - after every in-loop evaluation: routes a fixed probe set (--routing-probe-seqs per
+#          domain) and keeps the top-k indices (router-saturation snapshot);
+#        - after training: routes the whole domain-labelled set (--routing-analysis-data, built
+#          by lm/data/build_domain_eval.py) and computes the OLMoE (arXiv 2409.02060) metrics:
+#            domain specialization  N^(k)_{Ei,D} / N_D (uniform = k/E), plus the normalized
+#                                   mutual information I(domain; expert) / H(domain);
+#            vocabulary spec.       per expert, the mean over its routed tokens of the share of
+#                                   that token type's assignments going to it (uniform = k/E),
+#                                   for input tokens and predicted tokens, with top tokens;
+#            co-activation          N_{Ei,Ej} / N_{Ei}; summary = mean_i max_{j!=i};
+#            router saturation      mean |E_t ∩ E_T| / k per snapshot vs the final model;
+#          plus collapse indicators (dead experts < 10% of uniform load, effective number of
+#          experts exp(H(load)), MaxVio on the domain set) and per-domain perplexity. Written to
+#          <--routing-analysis-out>/specialization.json, logged to W&B under spec/* (scalars,
+#          tables, heatmaps) and the JSON uploaded to the run.
+#        - --save-final-weights: plain torch.save of the final state dict (Megatron
+#          checkpointing is disabled on GH200 due to a SIGSEGV), for offline re-analysis.
+#
+# Scope / caveats:
+#   Assumes TP=CP=PP=EP=1 (data-parallel only), which is what launch.sh runs.
+#
+# How to find the right location in a future Megatron version:
+#   router.py: TopKRouter.routing(), around apply_router_token_dropping.
+#   moe_utils.py: save_to_aux_losses_tracker / track_moe_metrics.
+#   training.py: after train() returns in pretrain(); the in-loop evaluate_and_print_results
+#   call in train(); after evaluate() in evaluate_and_print_results().
+#
+# Applied to: Megatron-LM core_v0.16.1 (commit 55ac7082), on top of patches 0001-0006.
+#
+diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
+index c477da764..97383309e 100644
+--- a/megatron/core/transformer/moe/moe_utils.py
++++ b/megatron/core/transformer/moe/moe_utils.py
+@@ -867,7 +867,9 @@ def apply_router_token_dropping(
+ # identity element of the op so that a layer which never writes does not affect the result
+ # ("sum" -> 0, "max" -> -inf, "min" -> +inf, the latter two being ignored by max()/min();
+ # "collect" -> 0, dense layers stay all-zero and are dropped before pooling quantiles).
+-_AUX_LOSS_TRACKER_INIT = {"sum": 0.0, "max": float("-inf"), "min": float("inf"), "collect": 0.0}
++_AUX_LOSS_TRACKER_INIT = {
++    "sum": 0.0, "max": float("-inf"), "min": float("inf"), "collect": 0.0, "maxvio": 0.0
++}
+ 
+ # Quantiles (in [0, 1]) of the per-expert load distribution, pooled over all experts of all MoE
+ # layers and logged as "load/p10".."load/p90" alongside "load/min" (the p0 extreme) and
+@@ -875,6 +877,28 @@ _AUX_LOSS_TRACKER_INIT = {"sum": 0.0, "max": float("-inf"), "min": float("inf"),
+ _LOAD_QUANTILES = (0.10, 0.25, 0.50, 0.75, 0.90)
+ 
+ 
++def max_violation(load: torch.Tensor) -> torch.Tensor:
++    mean = load.mean(dim=-1)
++    return (load.max(dim=-1).values - mean) / mean
++
++
++def _track_maxvio(entry, iteration, writer, wandb_writer, total_loss_dict):
++    load = entry["values"].float()
++    if torch.distributed.is_initialized():
++        torch.distributed.all_reduce(load, group=parallel_state.get_data_parallel_group())
++    per_layer = max_violation(load[load.sum(dim=1) > 0])
++    scalars = {"maxvio/batch": per_layer.mean(), "maxvio/batch_worst_layer": per_layer.max()}
++    if total_loss_dict is not None:
++        for key, value in scalars.items():
++            total_loss_dict[key] = total_loss_dict.get(key, 0.0) + value
++    scalars.update({f"maxvio/batch_layer_{i:02d}": v for i, v in enumerate(per_layer.tolist())})
++    if writer is not None:
++        for key, value in scalars.items():
++            writer.add_scalar(key, value, iteration)
++    if wandb_writer:
++        wandb_writer.log({key: float(value) for key, value in scalars.items()}, iteration)
++
++
+ def save_to_aux_losses_tracker(
+     name: str,
+     loss: torch.Tensor,
+@@ -913,7 +937,7 @@ def save_to_aux_losses_tracker(
+     tracker = get_moe_layer_wise_logging_tracker()
+     if name not in tracker:
+         tracker[name] = {}
+-        if reduce_op == "collect":
++        if reduce_op in ("collect", "maxvio"):
+             # Keep the full per-expert vector for each layer so true quantiles can be computed
+             # over the pooled experts of all MoE layers at logging time. Dense layers never
+             # write, so their all-zero row (row-sum 0) is dropped before pooling.
+@@ -1058,6 +1082,9 @@ def track_moe_metrics(
+ 
+     for name, entry in tracker.items():
+         reduce_op = entry.get("reduce_op", "sum")
++        if reduce_op == "maxvio":
++            _track_maxvio(entry, iteration, writer, wandb_writer, total_loss_dict)
++            continue
+         if reduce_op == "collect":
+             # Pooled quantiles of the per-expert load over all experts of all MoE layers.
+             # entry["values"] is (num_layers, num_experts) accumulated across micro-batches;
+diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
+index 2e47e4657..db56566ca 100644
+--- a/megatron/core/transformer/moe/router.py
++++ b/megatron/core/transformer/moe/router.py
+@@ -8,6 +8,7 @@ import torch
+ from megatron.core.jit import jit_fuser
+ from megatron.core.transformer.module import MegatronModule
+ from megatron.core.transformer.moe import bandit
++from megatron.core.transformer.moe import routing_stats
+ from megatron.core.transformer.moe.moe_utils import (
+     MoEAuxLossAutoScaler,
+     ProcessGroupCollection,
+@@ -783,6 +784,7 @@ class TopKRouter(Router):
+                 router_replay=self.router_replay,
+             )
+ 
++        assigned_routing_map = routing_map
+         # Apply token dropping to probs and routing_map.
+         if self.config.moe_expert_capacity_factor is not None:
+             probs, routing_map = apply_router_token_dropping(
+@@ -793,6 +795,7 @@ class TopKRouter(Router):
+                 drop_policy=self.config.moe_token_drop_policy,
+                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
+             )
++        routing_stats.observe(self, assigned_routing_map, routing_map, padding_mask)
+ 
+         # Always monitor expert imbalance for aux-loss-based routing, even when the aux
+         # loss coefficient is 0. It is logged as "expert_imbalance" (kept separate from
+diff --git a/megatron/core/transformer/moe/routing_stats.py b/megatron/core/transformer/moe/routing_stats.py
+new file mode 100644
+index 000000000..56a377960
+--- /dev/null
++++ b/megatron/core/transformer/moe/routing_stats.py
+@@ -0,0 +1,62 @@
++import torch
++
++from megatron.core.transformer.moe.moe_utils import save_to_aux_losses_tracker
++
++_recording = None
++_eval_counts = {}
++
++
++def observe(router, routing_map, dropped_routing_map, padding_mask=None):
++    if router.layer_number is None:
++        return
++    if padding_mask is not None:
++        routing_map = routing_map[padding_mask]
++        dropped_routing_map = dropped_routing_map[padding_mask]
++    if router.training and torch.is_grad_enabled():
++        _track_training(router, routing_map, dropped_routing_map)
++    elif _recording is not None:
++        _recording.setdefault(router.layer_number, []).append(
++            routing_map.to(torch.float16).topk(router.topk, dim=-1).indices.to(torch.uint8)
++        )
++    elif not router.training:
++        counts = routing_map.sum(dim=0, dtype=torch.float64)
++        if router.layer_number in _eval_counts:
++            _eval_counts[router.layer_number] += counts
++        else:
++            _eval_counts[router.layer_number] = counts
++
++
++def _track_training(router, routing_map, dropped_routing_map):
++    num_layers = router.config.num_layers
++    if router.config.mtp_num_layers is not None:
++        num_layers += router.config.mtp_num_layers
++    assigned = routing_map.sum(dim=0, dtype=torch.float32)
++    save_to_aux_losses_tracker(
++        "maxvio", assigned / routing_map.shape[0], router.layer_number, num_layers,
++        reduce_op="maxvio",
++    )
++    if dropped_routing_map is not routing_map:
++        kept = dropped_routing_map.sum(dtype=torch.float32)
++        save_to_aux_losses_tracker(
++            "moe/token_drop_fraction", 1.0 - kept / assigned.sum(), router.layer_number,
++            num_layers,
++        )
++
++
++def start_recording():
++    global _recording
++    _recording = {}
++
++
++def stop_recording():
++    global _recording
++    recorded = {layer: torch.cat(chunks) for layer, chunks in _recording.items()}
++    _recording = None
++    return recorded
++
++
++def pop_eval_counts():
++    global _eval_counts
++    counts = _eval_counts
++    _eval_counts = {}
++    return counts
+diff --git a/megatron/training/arguments.py b/megatron/training/arguments.py
+index d96ea7aa7..2a36cd78b 100644
+--- a/megatron/training/arguments.py
++++ b/megatron/training/arguments.py
+@@ -2698,6 +2698,18 @@ def _add_moe_args(parser):
+     group.add_argument('--bilevel-expert-steps', type=int, default=1,
+                        help='Bilevel alternation: number of consecutive optimizer steps that '
+                             'update ONLY the MoE expert params (*.experts.*) per cycle.')
++    group.add_argument('--routing-analysis-data', type=str, default=None,
++                       help='Directory with the domain-labelled held-out set (manifest.json and '
++                            '<domain>.npy windows) for the expert-specialization analysis. '
++                            'Enables router-saturation snapshots at every evaluation and the '
++                            'end-of-training analysis.')
++    group.add_argument('--routing-analysis-out', type=str, default=None,
++                       help='Directory the specialization.json analysis is written to.')
++    group.add_argument('--routing-probe-seqs', type=int, default=16,
++                       help='Sequences per domain routed at every evaluation to measure router '
++                            'saturation against the final model.')
++    group.add_argument('--save-final-weights', type=str, default=None,
++                       help='Path to torch.save the final model state dict to (rank 0).')
+     # --- Bandit (REINFORCE) router training (moe-shaping) ---
+     group.add_argument('--bandit-router', action='store_true',
+                        help='Train the MoE router from bandit feedback instead of the task '
+diff --git a/megatron/training/routing_analysis.py b/megatron/training/routing_analysis.py
+new file mode 100644
+index 000000000..863635027
+--- /dev/null
++++ b/megatron/training/routing_analysis.py
+@@ -0,0 +1,434 @@
++import json
++import math
++import os
++
++import numpy as np
++import torch
++
++from megatron.core import parallel_state
++from megatron.core.transformer.moe import routing_stats
++from megatron.core.transformer.moe.moe_utils import max_violation
++from megatron.core.utils import unwrap_model
++from megatron.training.global_vars import get_args, get_tensorboard_writer, get_wandb_writer
++from megatron.training.utils import print_rank_0
++
++_ANALYSIS_BATCH = 4
++_TOP_TOKENS_PER_EXPERT = 20
++_MIN_TOKEN_COUNT = 20
++_DEAD_EXPERT_FRACTION = 0.1
++
++_domains = None
++_saturation_snapshots = []
++
++
++def enabled():
++    return get_args().routing_analysis_data is not None
++
++
++def _dp_group():
++    return parallel_state.get_data_parallel_group()
++
++
++def _dp_rank_and_size():
++    return (
++        parallel_state.get_data_parallel_rank(),
++        parallel_state.get_data_parallel_world_size(),
++    )
++
++
++def _all_reduce(tensor):
++    torch.distributed.all_reduce(tensor, group=_dp_group())
++    return tensor
++
++
++def _log_scalars(scalars, iteration):
++    writer = get_tensorboard_writer()
++    wandb_writer = get_wandb_writer()
++    if writer is not None:
++        for key, value in scalars.items():
++            writer.add_scalar(key, value, iteration)
++    if wandb_writer:
++        wandb_writer.log(scalars, iteration)
++
++
++def log_eval_maxvio(iteration, prefix="valid"):
++    counts = routing_stats.pop_eval_counts()
++    if not counts:
++        return
++    layers = sorted(counts)
++    load = _all_reduce(torch.stack([counts[layer] for layer in layers]))
++    per_layer = max_violation(load)
++    scalars = {
++        f"maxvio/global_{prefix}": per_layer.mean().item(),
++        f"maxvio/global_{prefix}_worst_layer": per_layer.max().item(),
++    }
++    scalars.update(
++        {f"maxvio/global_{prefix}_layer_{i:02d}": v for i, v in enumerate(per_layer.tolist())}
++    )
++    _log_scalars(scalars, iteration)
++    print_rank_0(
++        f" routing | MaxVio_global ({prefix}) mean over layers {scalars[f'maxvio/global_{prefix}']:.4f}"
++        f" | worst layer {scalars[f'maxvio/global_{prefix}_worst_layer']:.4f}"
++    )
++
++
++def _load_domains():
++    global _domains
++    if _domains is None:
++        args = get_args()
++        manifest = json.load(open(os.path.join(args.routing_analysis_data, "manifest.json")))
++        _domains = {
++            name: np.load(os.path.join(args.routing_analysis_data, f"{name}.npy"))
++            for name in manifest["domains"]
++        }
++    return _domains
++
++
++def _local_sequences(windows, limit=None):
++    rank, size = _dp_rank_and_size()
++    if limit is not None:
++        windows = windows[:limit]
++    return windows[rank::size]
++
++
++def _forward_recorded(model, windows):
++    tokens = torch.from_numpy(windows[:, :-1].astype(np.int64)).cuda()
++    labels = torch.from_numpy(windows[:, 1:].astype(np.int64)).cuda()
++    seq_len = tokens.shape[1]
++    position_ids = torch.arange(seq_len, device=tokens.device).unsqueeze(0).expand_as(tokens)
++    routing_stats.start_recording()
++    losses = model(tokens, position_ids, None, labels=labels)
++    recorded = routing_stats.stop_recording()
++    token_major = lambda t: t.t().reshape(-1)
++    return recorded, losses.float(), token_major(tokens), token_major(labels)
++
++
++def _run(model, windows_by_domain, visit):
++    was_training = [m.training for m in model]
++    for m in model:
++        m.eval()
++    with torch.no_grad():
++        for domain_index, windows in enumerate(windows_by_domain):
++            for start in range(0, len(windows), _ANALYSIS_BATCH):
++                batch = windows[start : start + _ANALYSIS_BATCH]
++                visit(domain_index, *_forward_recorded(model[0], batch))
++    for m, training in zip(model, was_training):
++        m.train(training)
++
++
++def record_saturation_snapshot(model, iteration):
++    if not enabled():
++        return
++    args = get_args()
++    windows = [
++        _local_sequences(w, args.routing_probe_seqs) for w in _load_domains().values()
++    ]
++    chunks = {}
++
++    def visit(domain_index, recorded, losses, tokens, labels):
++        for layer, indices in recorded.items():
++            chunks.setdefault(layer, []).append(indices.cpu())
++
++    _run(model, windows, visit)
++    _saturation_snapshots.append(
++        (iteration, {layer: torch.cat(parts) for layer, parts in chunks.items()})
++    )
++
++
++def _saturation(final_snapshot):
++    rows = []
++    for iteration, snapshot in _saturation_snapshots:
++        per_layer = []
++        for layer in sorted(final_snapshot):
++            earlier = snapshot[layer].long()
++            final = final_snapshot[layer].long()
++            k = final.shape[1]
++            overlap = (earlier.unsqueeze(2) == final.unsqueeze(1)).any(dim=2).sum(dim=1)
++            per_layer.append(overlap.double().sum() / k)
++        num_tokens = float(next(iter(final_snapshot.values())).shape[0])
++        totals = _all_reduce(torch.stack(per_layer).cuda())
++        num_tokens = _all_reduce(torch.tensor([num_tokens], device="cuda", dtype=torch.float64))
++        rows.append((iteration, (totals / num_tokens).tolist()))
++    return rows
++
++
++def _entropy(p, dim=-1):
++    return -(p * torch.log(p.clamp_min(1e-30))).sum(dim=dim)
++
++
++def _vocab_specialization(counts, topk):
++    per_token = counts.sum(dim=1, keepdim=True)
++    frequent = per_token.squeeze(1) >= _MIN_TOKEN_COUNT * topk
++    counts = counts[frequent]
++    share = counts / counts.sum(dim=1, keepdim=True)
++    routed = counts.sum(dim=0)
++    per_expert = (counts * share).sum(dim=0) / routed.clamp_min(1)
++    token_ids = frequent.nonzero().squeeze(1)
++    top = {}
++    for expert in range(counts.shape[1]):
++        order = torch.argsort(counts[:, expert] * share[:, expert], descending=True)
++        order = order[:_TOP_TOKENS_PER_EXPERT]
++        top[expert] = [
++            [int(token_ids[i]), float(share[i, expert]), int(counts[i, expert])] for i in order
++        ]
++    return per_expert, top
++
++
++def _summarize(dom_counts, vocab_in, vocab_out, coact, domain_tokens, domain_loss, topk, names):
++    num_layers, num_domains, num_experts = dom_counts.shape
++    uniform = topk / num_experts
++    spec = dom_counts / domain_tokens.view(1, -1, 1)
++    joint = dom_counts / dom_counts.sum(dim=(1, 2), keepdim=True)
++    p_domain = joint.sum(dim=2)
++    p_expert = joint.sum(dim=1)
++    mutual_info = _entropy(p_domain) + _entropy(p_expert) - _entropy(joint.flatten(1))
++    domain_nmi = mutual_info / _entropy(p_domain)
++
++    load = dom_counts.sum(dim=1)
++    load_share = load / load.sum(dim=1, keepdim=True)
++    effective_experts = torch.exp(_entropy(load_share))
++    dead_experts = (load_share < _DEAD_EXPERT_FRACTION / num_experts).sum(dim=1)
++
++    activations = coact.diagonal(dim1=1, dim2=2)
++    coact_ratio = coact / activations.clamp_min(1).unsqueeze(2)
++    off_diag = coact_ratio.clone()
++    off_diag.diagonal(dim1=1, dim2=2).fill_(0)
++    coact_max = off_diag.max(dim=2).values
++    coact_max_mean = (coact_max * (activations > 0)).sum(dim=1) / (activations > 0).sum(dim=1)
++
++    layers = []
++    for layer in range(num_layers):
++        vin, vin_top = _vocab_specialization(vocab_in[layer], topk)
++        vout, vout_top = _vocab_specialization(vocab_out[layer], topk)
++        layers.append(
++            {
++                "domain_specialization": spec[layer].tolist(),
++                "domain_specialization_max_over_domains": spec[layer].max(dim=0).values.tolist(),
++                "domain_nmi": domain_nmi[layer].item(),
++                "vocab_specialization_input": vin.tolist(),
++                "vocab_specialization_output": vout.tolist(),
++                "vocab_top_input_tokens": vin_top,
++                "vocab_top_output_tokens": vout_top,
++                "coactivation": coact_ratio[layer].tolist(),
++                "coactivation_max_mean": coact_max_mean[layer].item(),
++                "load_share": load_share[layer].tolist(),
++                "maxvio_global": max_violation(load[layer]).item(),
++                "effective_experts": effective_experts[layer].item(),
++                "dead_experts": int(dead_experts[layer].item()),
++            }
++        )
++
++    mean = lambda key: float(np.mean([np.mean(layer[key]) for layer in layers]))
++    summary = {
++        "uniform_domain_specialization": uniform,
++        "uniform_vocab_specialization": uniform,
++        "uniform_coactivation": (topk - 1) / (num_experts - 1),
++        "domain_nmi": mean("domain_nmi"),
++        "domain_specialization_max_over_domains": mean("domain_specialization_max_over_domains"),
++        "vocab_specialization_input": mean("vocab_specialization_input"),
++        "vocab_specialization_output": mean("vocab_specialization_output"),
++        "coactivation_max_mean": mean("coactivation_max_mean"),
++        "maxvio_global_domains": mean("maxvio_global"),
++        "effective_experts": mean("effective_experts"),
++        "dead_experts_total": int(sum(layer["dead_experts"] for layer in layers)),
++        "domain_loss": {
++            name: (domain_loss[d] / domain_tokens[d]).item() for d, name in enumerate(names)
++        },
++        "domain_ppl": {
++            name: math.exp((domain_loss[d] / domain_tokens[d]).item())
++            for d, name in enumerate(names)
++        },
++    }
++    return summary, layers
++
++
++def final_analysis(model, iteration):
++    if not enabled():
++        return
++    args = get_args()
++    domains = _load_domains()
++    names = list(domains)
++    config = unwrap_model(model[0]).config
++    num_experts = config.num_moe_experts
++    topk = config.moe_router_topk
++    vocab = args.padded_vocab_size
++    num_layers = args.num_layers
++    device = torch.cuda.current_device()
++    dom_counts = torch.zeros(num_layers, len(names), num_experts, dtype=torch.float64, device=device)
++    vocab_in = torch.zeros(num_layers, vocab * num_experts, dtype=torch.float64, device=device)
++    vocab_out = torch.zeros_like(vocab_in)
++    coact = torch.zeros(num_layers, num_experts, num_experts, dtype=torch.float64, device=device)
++    domain_tokens = torch.zeros(len(names), dtype=torch.float64, device=device)
++    domain_loss = torch.zeros(len(names), dtype=torch.float64, device=device)
++    probe_limit = args.routing_probe_seqs
++    probe_chunks = {}
++
++    def visit(domain_index, recorded, losses, tokens, labels):
++        domain_tokens[domain_index] += tokens.numel()
++        domain_loss[domain_index] += losses.double().sum()
++        for layer, indices in recorded.items():
++            row = layer - 1
++            flat = indices.long()
++            dom_counts[row, domain_index] += torch.bincount(
++                flat.flatten(), minlength=num_experts
++            ).double()
++            vocab_in[row] += torch.bincount(
++                (tokens.unsqueeze(1) * num_experts + flat).flatten(),
++                minlength=vocab * num_experts,
++            ).double()
++            vocab_out[row] += torch.bincount(
++                (labels.unsqueeze(1) * num_experts + flat).flatten(),
++                minlength=vocab * num_experts,
++            ).double()
++            onehot = torch.zeros(flat.shape[0], num_experts, device=device)
++            onehot.scatter_(1, flat, 1.0)
++            coact[row] += (onehot.t() @ onehot).double()
++
++    windows = [_local_sequences(w) for w in domains.values()]
++    _run(model, windows, visit)
++
++    probe_windows = [_local_sequences(w, probe_limit) for w in domains.values()]
++
++    def probe_visit(domain_index, recorded, losses, tokens, labels):
++        for layer, indices in recorded.items():
++            probe_chunks.setdefault(layer, []).append(indices.cpu())
++
++    _run(model, probe_windows, probe_visit)
++    final_snapshot = {layer: torch.cat(parts) for layer, parts in probe_chunks.items()}
++    saturation = _saturation(final_snapshot)
++
++    for tensor in (dom_counts, vocab_in, vocab_out, coact, domain_tokens, domain_loss):
++        _all_reduce(tensor)
++
++    if torch.distributed.get_rank() == 0:
++        summary, layers = _summarize(
++            dom_counts,
++            vocab_in.view(num_layers, vocab, num_experts),
++            vocab_out.view(num_layers, vocab, num_experts),
++            coact,
++            domain_tokens,
++            domain_loss,
++            topk,
++            names,
++        )
++        summary["router_saturation"] = [
++            {"iteration": it, "fraction": it / iteration, "per_layer": values,
++             "mean": float(np.mean(values))}
++            for it, values in saturation
++        ]
++        result = {
++            "iteration": iteration,
++            "num_experts": num_experts,
++            "topk": topk,
++            "domains": names,
++            "summary": summary,
++            "layers": layers,
++        }
++        os.makedirs(args.routing_analysis_out, exist_ok=True)
++        path = os.path.join(args.routing_analysis_out, "specialization.json")
++        with open(path, "w") as f:
++            json.dump(result, f)
++        print_rank_0(f" routing | specialization analysis written to {path}")
++        _log_final_to_wandb(result, path, iteration)
++    torch.distributed.barrier()
++
++
++def _log_final_to_wandb(result, path, iteration):
++    wandb_writer = get_wandb_writer()
++    summary = result["summary"]
++    scalars = {
++        f"spec/{key}": value
++        for key, value in summary.items()
++        if isinstance(value, (int, float))
++    }
++    scalars.update({f"spec/domain_ppl_{k}": v for k, v in summary["domain_ppl"].items()})
++    for i, layer in enumerate(result["layers"]):
++        scalars[f"spec/domain_nmi_layer_{i:02d}"] = layer["domain_nmi"]
++        scalars[f"spec/vocab_specialization_input_layer_{i:02d}"] = float(
++            np.mean(layer["vocab_specialization_input"])
++        )
++        scalars[f"spec/coactivation_max_mean_layer_{i:02d}"] = layer["coactivation_max_mean"]
++    _log_scalars(scalars, iteration)
++    if not wandb_writer:
++        return
++    import wandb
++
++    for key, value in scalars.items():
++        wandb_writer.summary[key] = value
++    wandb_writer.log(
++        {
++            "spec/router_saturation": wandb.Table(
++                columns=["iteration", "fraction_of_training", "saturation_mean"],
++                data=[[r["iteration"], r["fraction"], r["mean"]] for r in summary["router_saturation"]],
++            ),
++            "spec/domain_specialization_table": wandb.Table(
++                columns=["layer", "domain", "expert", "specialization"],
++                data=[
++                    [i, domain, e, value]
++                    for i, layer in enumerate(result["layers"])
++                    for d, domain in enumerate(result["domains"])
++                    for e, value in enumerate(layer["domain_specialization"][d])
++                ],
++            ),
++        },
++        iteration,
++    )
++    _log_heatmaps(result, wandb_writer, iteration)
++    wandb_writer.save(path, base_path=os.path.dirname(path), policy="now")
++
++
++def _log_heatmaps(result, wandb_writer, iteration):
++    try:
++        import matplotlib
++
++        matplotlib.use("Agg")
++        import matplotlib.pyplot as plt
++    except ImportError:
++        return
++    import wandb
++
++    layers = result["layers"]
++    shown = sorted({0, len(layers) // 2, len(layers) - 1})
++    fig, axes = plt.subplots(len(shown), 1, figsize=(14, 2.2 * len(shown)), squeeze=False)
++    for ax, layer in zip(axes[:, 0], shown):
++        spec = np.array(layers[layer]["domain_specialization"])
++        im = ax.imshow(spec, aspect="auto", cmap="viridis", vmin=0)
++        ax.set_yticks(range(len(result["domains"])), result["domains"])
++        ax.set_title(f"layer {layer}: fraction of domain tokens routed to each expert")
++        fig.colorbar(im, ax=ax)
++    axes[-1, 0].set_xlabel("expert")
++    fig.tight_layout()
++    images = {"spec/domain_specialization_heatmap": wandb.Image(fig)}
++    plt.close(fig)
++
++    fig, axes = plt.subplots(1, len(shown), figsize=(5 * len(shown), 4.5), squeeze=False)
++    for ax, layer in zip(axes[0], shown):
++        im = ax.imshow(np.array(layers[layer]["coactivation"]), cmap="magma", vmin=0, vmax=1)
++        ax.set_title(f"layer {layer} co-activation")
++        fig.colorbar(im, ax=ax)
++    fig.tight_layout()
++    images["spec/coactivation_heatmap"] = wandb.Image(fig)
++    plt.close(fig)
++    wandb_writer.log(images, iteration)
++
++
++def save_final_weights(model, iteration):
++    args = get_args()
++    if args.save_final_weights is None:
++        return
++    if torch.distributed.get_rank() == 0:
++        os.makedirs(os.path.dirname(args.save_final_weights), exist_ok=True)
++        state = {
++            name: tensor.detach().cpu()
++            for name, tensor in unwrap_model(model[0]).state_dict().items()
++            if isinstance(tensor, torch.Tensor)
++        }
++        plain_args = {
++            key: value
++            for key, value in vars(args).items()
++            if isinstance(value, (bool, int, float, str, list, tuple, type(None)))
++        }
++        torch.save({"iteration": iteration, "args": plain_args, "state_dict": state},
++                   args.save_final_weights)
++        print_rank_0(f" routing | final weights saved to {args.save_final_weights}")
++    torch.distributed.barrier()
+diff --git a/megatron/training/training.py b/megatron/training/training.py
+index 1aca7f38d..f6b15011b 100644
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -143,6 +143,7 @@ from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+ from megatron.core.transformer.moe import upcycling_utils
+ from megatron.core.transformer.moe import bandit
+ from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
++from megatron.training import routing_analysis
+ from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
+ from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+ from megatron.core.parallel_state import (
+@@ -1049,6 +1050,8 @@ def pretrain(
+             )
+ 
+         print_datetime('after training is done')
++        routing_analysis.final_analysis(model, iteration)
++        routing_analysis.save_final_weights(model, iteration)
+ 
+         if args.save and iteration != 0 and iteration % args.save_interval != 0:
+             save_checkpoint(
+@@ -3075,6 +3078,7 @@ def train(
+                                        iteration, process_non_loss_data_func,
+                                        config, verbose=False, write_to_tensorboard=True,
+                                        non_loss_data_func=non_loss_data_func)
++                routing_analysis.record_saturation_snapshot(model, iteration)
+ 
+             eval_duration += timers('eval-time').elapsed()
+             eval_iterations += sum(args.eval_iters) if isinstance(args.eval_iters, list) else args.eval_iters
+@@ -3378,6 +3382,7 @@ def evaluate_and_print_results(
+         # Timelimit hit during evaluation
+         if timelimit:
+             return
++        routing_analysis.log_eval_maxvio(iteration, f"valid{suffix.replace('-', '_')}")
+         string = f' validation{suffix} loss at {prefix} | '
+         for key in total_loss_dict:
+             string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())

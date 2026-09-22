@@ -97,6 +97,8 @@ EVAL_ITERS=${EVAL_ITERS:-10}
 LR_WARMUP_ITERS=${LR_WARMUP_ITERS:-$(( STEPS / 10 ))}
 [ "$LR_WARMUP_ITERS" -ge "$STEPS" ] && LR_WARMUP_ITERS=$(( STEPS / 2 ))
 TIME=${TIME:-01:00:00}
+DOMAIN_EVAL_DIR=${DOMAIN_EVAL_DIR:-/iopsstor/scratch/cscs/$USER/moe-shaping/domain_eval}
+SAVE_FINAL_WEIGHTS=${SAVE_FINAL_WEIGHTS:-1}
 SEED=${SEED:-42}
 
 # ---- Bilevel arg block + run tag (keeps baseline vs split-mode logs separate) ----
@@ -251,6 +253,13 @@ else
     BANDIT_ARGS_BLOCK="BANDIT_ARGS=()"
 fi
 
+LOLA_ALPHA=${LOLA_ALPHA:-0}
+if [ "$LOLA_ALPHA" != 0 ]; then
+    MOE_LB_LINES="${MOE_LB_LINES}
+    --lola-router-alpha ${LOLA_ALPHA}"
+    RUN_TAG="lola${LOLA_ALPHA}-${RUN_TAG}"
+fi
+
 # ---- Immutable, already-patched Megatron-LM snapshot ----
 # Patches are applied ONCE here on the login node and the job is pointed at the
 # result. Applying them inside the job is not safe with concurrent runs: the
@@ -361,6 +370,7 @@ DATA_PREFIX=/capstor/store/cscs/swissai/infra01/datasets/nvidia/Nemotron-ClimbMi
 # with "UnpicklingError: invalid load key". Rebuilding the index costs ~6 s, so
 # every job simply gets its own cache dir rather than coordinating a warm-up.
 DATASET_CACHE_DIR=/iopsstor/scratch/cscs/\$USER/moe-shaping/cache/${JOB_NAME}
+DOMAIN_EVAL_DIR=${DOMAIN_EVAL_DIR}
 BODY_WORKDIR
 
 cat >> "$SCRIPT" << CONFIGS
@@ -370,6 +380,7 @@ MBS=${MBS}
 GBS=${GBS}
 SEQ_LEN=${SEQ_LEN}
 TRAINING_STEPS=${STEPS}
+SAVE_FINAL_WEIGHTS=${SAVE_FINAL_WEIGHTS}
 
 # Logging
 PROJECT_NAME=${WANDB_PROJECT}
@@ -423,6 +434,8 @@ NETWORK_SIZE_ARGS=(
 # Top-2 routing (Megatron default moe_router_topk=2); per-expert FFN = --ffn-hidden-size.
 MOE_ARGS=(
     --num-experts ${NUM_EXPERTS}
+    --moe-grouped-gemm
+    --moe-token-dispatcher-type alltoall
 ${MOE_LB_LINES}
 )
 
@@ -509,6 +522,13 @@ DATA_ARGS=(
     --num-workers 1
 )
 
+ROUTING_ANALYSIS_ARGS=(
+    --routing-analysis-data $DOMAIN_EVAL_DIR
+    --routing-analysis-out $LOG_DIR/analysis
+    --routing-probe-seqs 16
+)
+[ "$SAVE_FINAL_WEIGHTS" = 1 ] && ROUTING_ANALYSIS_ARGS+=(--save-final-weights $LOG_DIR/final_weights.pt)
+
 TORCHRUN_ARGS=(
     --nproc-per-node $SLURM_GPUS_PER_NODE
     --nnodes $SLURM_NNODES
@@ -524,6 +544,7 @@ TRAINING_CMD="torchrun ${TORCHRUN_ARGS[@]} $MEGATRON_LM_DIR/pretrain_gpt.py \
     ${MOE_ARGS[@]} \
     ${BILEVEL_ARGS[@]} \
     ${BANDIT_ARGS[@]} \
+    ${ROUTING_ANALYSIS_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
     ${REGULARIZATION_ARGS[@]} \
     ${LEARNING_RATE_ARGS[@]} \
