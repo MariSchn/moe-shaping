@@ -90,6 +90,8 @@ EXPERT_LR=${EXPERT_LR:-}
 
 # ---- Schedule / eval ----
 LR=${LR:-1e-3}
+LR_DECAY_STYLE=${LR_DECAY_STYLE:-constant}
+MIN_LR=${MIN_LR:-0.0}
 EVAL_INTERVAL=${EVAL_INTERVAL:-200}
 EVAL_ITERS=${EVAL_ITERS:-10}
 # Warmup scales with run length; the scheduler requires warmup < train_iters,
@@ -252,6 +254,10 @@ ${BANDIT_LINES}
 else
     BANDIT_ARGS_BLOCK="BANDIT_ARGS=()"
 fi
+
+PERMUTE_FUSION=${PERMUTE_FUSION:-1}
+MOE_PERF_LINES=""
+[ "$PERMUTE_FUSION" = 1 ] && MOE_PERF_LINES="    --moe-permute-fusion"
 
 LOLA_ALPHA=${LOLA_ALPHA:-0}
 if [ "$LOLA_ALPHA" != 0 ]; then
@@ -436,6 +442,7 @@ MOE_ARGS=(
     --num-experts ${NUM_EXPERTS}
     --moe-grouped-gemm
     --moe-token-dispatcher-type alltoall
+${MOE_PERF_LINES}
 ${MOE_LB_LINES}
 )
 
@@ -476,7 +483,8 @@ REGULARIZATION_ARGS=(
 
 LEARNING_RATE_ARGS=(
     --lr ${LR}
-    --lr-decay-style constant
+    --min-lr ${MIN_LR}
+    --lr-decay-style ${LR_DECAY_STYLE}
     --lr-warmup-iters ${LR_WARMUP_ITERS}
 )
 

@@ -235,7 +235,7 @@ index d96ea7aa7..2a36cd78b 100644
                         help='Train the MoE router from bandit feedback instead of the task '
 diff --git a/megatron/training/routing_analysis.py b/megatron/training/routing_analysis.py
 new file mode 100644
-index 000000000..863635027
+index 000000000..a37f587dc
 --- /dev/null
 +++ b/megatron/training/routing_analysis.py
 @@ -0,0 +1,434 @@
@@ -401,7 +401,7 @@ index 000000000..863635027
 +    per_token = counts.sum(dim=1, keepdim=True)
 +    frequent = per_token.squeeze(1) >= _MIN_TOKEN_COUNT * topk
 +    counts = counts[frequent]
-+    share = counts / counts.sum(dim=1, keepdim=True)
++    share = counts * topk / counts.sum(dim=1, keepdim=True)
 +    routed = counts.sum(dim=0)
 +    per_expert = (counts * share).sum(dim=0) / routed.clamp_min(1)
 +    token_ids = frequent.nonzero().squeeze(1)
