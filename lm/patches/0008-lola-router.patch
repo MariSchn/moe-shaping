@@ -31,6 +31,10 @@
 #   router.py: applied after top-k selection, before capacity dropping; asserts softmax
 #   post-top-k scoring, no expert bias, no bandit, no top-k scaling factor.
 #   arguments.py: --lola-router-alpha (0 disables). training.py: lola.configure before model build.
+#   --lola-max-ratio R (default 0 = off, the plain method): caps each token's correction at R times
+#   the norm of that token's task gradient on the selected logits and zeroes non-finite values.
+#   Added because plain LOLA diverged at LM scale (alpha 3e-4 by a runaway, 1e-4 by a sudden NaN
+#   at step 591 in one of two seeds); the cap only touches outlier tokens at small alpha.
 #
 # How to find the right location in a future Megatron version:
 #   router.py: TopKRouter.routing(), right after topk_routing_with_score_function.
@@ -39,10 +43,10 @@
 #
 diff --git a/megatron/core/transformer/moe/lola.py b/megatron/core/transformer/moe/lola.py
 new file mode 100644
-index 000000000..f64aad8b3
+index 000000000..a95ad8b66
 --- /dev/null
 +++ b/megatron/core/transformer/moe/lola.py
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,78 @@
 +from dataclasses import dataclass
 +
 +import torch
@@ -53,13 +57,22 @@ index 000000000..f64aad8b3
 +@dataclass
 +class LolaConfig:
 +    alpha: float = 0.0
++    max_ratio: float = 0.0
 +
 +
 +_config = LolaConfig()
 +
 +
-+def configure(alpha):
++def configure(alpha, max_ratio=0.0):
 +    _config.alpha = alpha
++    _config.max_ratio = max_ratio
++
++
++def _bounded(correction, task_logit_grad, max_ratio):
++    correction = torch.nan_to_num(correction, nan=0.0, posinf=0.0, neginf=0.0)
++    limit = max_ratio * task_logit_grad.norm(dim=-1, keepdim=True)
++    scale = (limit / correction.norm(dim=-1, keepdim=True).clamp_min(1e-30)).clamp(max=1.0)
++    return correction * scale
 +
 +
 +def is_enabled():
@@ -93,6 +106,8 @@ index 000000000..f64aad8b3
 +        correction, task_logit_grad = router_router_correction(
 +            probs, grad_probs * scale, hidden_sq_norm, _config.alpha
 +        )
++        if _config.max_ratio > 0:
++            correction = _bounded(correction, task_logit_grad, _config.max_ratio)
 +        extra = correction / scale
 +        _track(ctx.router, extra, task_logit_grad / scale)
 +        return grad_probs, extra.to(grad_probs.dtype), None, None, None
@@ -147,10 +162,10 @@ index db56566ca..bff06fc88 100644
          assigned_routing_map = routing_map
          # Apply token dropping to probs and routing_map.
 diff --git a/megatron/training/arguments.py b/megatron/training/arguments.py
-index 2a36cd78b..df76dc4b5 100644
+index 2a36cd78b..8178c2953 100644
 --- a/megatron/training/arguments.py
 +++ b/megatron/training/arguments.py
-@@ -2698,6 +2698,10 @@ def _add_moe_args(parser):
+@@ -2698,6 +2698,14 @@ def _add_moe_args(parser):
      group.add_argument('--bilevel-expert-steps', type=int, default=1,
                         help='Bilevel alternation: number of consecutive optimizer steps that '
                              'update ONLY the MoE expert params (*.experts.*) per cycle.')
@@ -158,11 +173,15 @@ index 2a36cd78b..df76dc4b5 100644
 +                       help='Router-router LOLA shaping strength (0 disables). Every selected '
 +                            'router row anticipates the naive update of the other selected rows '
 +                            'of the same token, with the loss linearized in the MoE layer output.')
++    group.add_argument('--lola-max-ratio', type=float, default=0.0,
++                       help='If > 0, cap each token\'s LOLA logit correction at this multiple of '
++                            'the norm of its own task gradient on the selected logits, and zero '
++                            'non-finite corrections (0 = unbounded, the plain method).')
      group.add_argument('--routing-analysis-data', type=str, default=None,
                         help='Directory with the domain-labelled held-out set (manifest.json and '
                              '<domain>.npy windows) for the expert-specialization analysis. '
 diff --git a/megatron/training/training.py b/megatron/training/training.py
-index f6b15011b..249da2ff7 100644
+index f6b15011b..6f467ce56 100644
 --- a/megatron/training/training.py
 +++ b/megatron/training/training.py
 @@ -141,7 +141,7 @@ from megatron.training.datasets.data_samplers import build_pretraining_data_load
@@ -178,7 +197,7 @@ index f6b15011b..249da2ff7 100644
      # model is built, since TopKRouter reads it to validate the routing setup and
      # to decide whether to create its critic head.
      bandit.configure(args)
-+    lola.configure(args.lola_router_alpha)
++    lola.configure(args.lola_router_alpha, args.lola_max_ratio)
  
      if args.fine_grained_activation_offloading:
          from megatron.core.pipeline_parallel.utils import (

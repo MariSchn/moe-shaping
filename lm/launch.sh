@@ -271,9 +271,11 @@ MOE_PERF_LINES=""
 [ "$PERMUTE_FUSION" = 1 ] && MOE_PERF_LINES="    --moe-permute-fusion"
 
 LOLA_ALPHA=${LOLA_ALPHA:-0}
+LOLA_MAX_RATIO=${LOLA_MAX_RATIO:-0}
 if [ "$LOLA_ALPHA" != 0 ]; then
     MOE_LB_LINES="${MOE_LB_LINES}
-    --lola-router-alpha ${LOLA_ALPHA}"
+    --lola-router-alpha ${LOLA_ALPHA}
+    --lola-max-ratio ${LOLA_MAX_RATIO}"
     RUN_TAG="lola${LOLA_ALPHA}-${RUN_TAG}"
 fi
 
