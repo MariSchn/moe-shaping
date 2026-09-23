@@ -138,6 +138,19 @@ dl.setup dd { margin: 0; }
     <p class="lede">Nine ways to train (or not train) the router of the same mixture-of-experts language model, compared on validation perplexity, load balance (MaxVio) and expert specialization. Unbounded LOLA opponent shaping diverged at this scale; a capped variant is included.</p>
   </header>
 
+  <section class="panel stack" aria-labelledby="audit-h" style="border-color: var(--bad);">
+    <div class="eyebrow" style="color: var(--bad);">Code audit, 23 Sep · read before the results</div>
+    <h2 id="audit-h">Three method arms are affected by implementation bugs</h2>
+    <p>An independent audit of the exact code that ran found bugs that invalidate some conclusions below. The load-balancing comparison is <b>unaffected</b>: baseline, aux-loss, aux-free, sigmoid control, their sweeps and all balance/specialization metrics were verified correct. Affected:</p>
+    <ul class="findings">
+      <li class="f-router"><p><b>Bandit and bandit + gradient:</b> the REINFORCE gradient also flows through the router input into the whole backbone (at the final checkpoint 0.8–1.3× the task gradient in the lowest layers). The measured deficit reflects that leak, not bandit routing as a method. The routing code itself is correct: bitwise identical to standard routing with REINFORCE and exploration off.</p></li>
+      <li class="f-router"><p><b>LOLA:</b> the same leak. The correction reaches the backbone at 1.1–1.5× the task gradient, partly opposing it. The divergences and the 11.9 perplexity cannot be attributed to opponent shaping. The closed form itself is verified correct.</p></li>
+      <li><p><b>Frozen random router:</b> not actually frozen. It trained at a small, rising learning rate from the schedule's minimum LR, and seed 42 additionally resumed with a corrupted optimizer group mapping. Treat 8.57 as approximate.</p></li>
+      <li class="f-router"><p><b>Bilevel (design, not a bug):</b> the experts, ~93% of parameters, are frozen during router phases, so its cost measures withheld expert updates rather than routing.</p></li>
+    </ul>
+    <p class="note">Fixes and re-runs for these arms are pending. Full audit: <span class="mono">/iopsstor/scratch/cscs/smarian/moe-shaping/audit/REPORT.md</span>.</p>
+  </section>
+
   <section class="stack" aria-labelledby="findings-h">
     <h2 id="findings-h">What the sweep shows</h2>
     <ul class="findings" id="findings"></ul>
