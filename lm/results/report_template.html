@@ -112,6 +112,17 @@ dl.setup dt { color: var(--muted); }
 dl.setup dd { margin: 0; }
 #tip { position: fixed; pointer-events: none; background: var(--surface); color: var(--ink); border: 1px solid var(--rule); border-radius: 4px; padding: 8px 10px; font-size: 12px; line-height: 1.45; box-shadow: 0 4px 14px rgba(0,0,0,0.12); z-index: 10; max-width: 260px; }
 .hit { fill: transparent; cursor: default; }
+.why-card { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 16px 18px; display: grid; gap: 8px; }
+.why-card header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.why-card dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 0; font-size: 14px; }
+.why-card dt { color: var(--muted); }
+.why-card dd { margin: 0; max-width: 72ch; }
+.verdict { font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; padding: 2px 9px; border-radius: 10px; border: 1px solid currentColor; }
+.verdict.supported { color: var(--balance); }
+.verdict.partly { color: var(--ink-2); }
+.verdict.refuted { color: var(--bad); }
+.verdict.open { color: var(--muted); }
+@media (max-width: 560px) { .why-card dl { grid-template-columns: 1fr; } }
 @media (max-width: 560px) {
   h1 { font-size: 27px; }
   dl.setup { grid-template-columns: 1fr; }
@@ -171,6 +182,14 @@ dl.setup dd { margin: 0; }
       <p class="note">Saturation: the share of each token's top-8 experts at a given point in training that are still among its top-8 at the end (OLMoE's definition, averaged over layers on a fixed probe set). Higher early saturation means routing settled sooner.</p>
       <table id="sat-table"></table>
     </div>
+  </section>
+
+  <section class="stack" aria-labelledby="why-h">
+    <div class="eyebrow">Mechanisms</div>
+    <h2 id="why-h">Why the results look like this</h2>
+    <p class="note">Each explanation below was turned into a prediction that could fail, then checked, either on the existing runs or with a follow-up run (one seed each; about 44 node-hours on top of the ~72 for the main sweep). Verdicts: <b>supported</b> means the prediction held; <b>partly</b> means it held with an exception; <b>not supported</b> means it failed; <b>open</b> means no test separated the explanations.</p>
+    <div class="stack" id="why"></div>
+    <div class="two-col" id="sweeps"></div>
   </section>
 
   <section class="stack" aria-labelledby="lola-h">
@@ -392,6 +411,45 @@ document.getElementById("fam-legend").innerHTML = Object.values(FAMILY)
     const tr = el("tr", {}, body);
     tr.style.setProperty("--c", FAMILY[a.family].color);
     tr.innerHTML = `<td><span class="fam"></span>${a.label}</td>${pick.map(f => `<td class="num">${fmt(sat(f), 2)}</td>`).join("")}${domains.map(d => `<td class="num">${fmt(dp(d), 2)}</td>`).join("")}`;
+  });
+})();
+
+document.getElementById("why").innerHTML = TEXT.why.map(h => `<article class="why-card">
+  <header><h3>${h.claim}</h3><span class="verdict ${h.verdict}">${{supported: "supported", partly: "partly", refuted: "not supported", open: "open"}[h.verdict]}</span></header>
+  <dl><dt>Test</dt><dd>${h.test}</dd><dt>Prediction</dt><dd>${h.prediction}</dd><dt>Result</dt><dd>${h.result}</dd></dl></article>`).join("");
+
+(function sweepCharts() {
+  const host = document.getElementById("sweeps");
+  (DATA.sweeps || []).forEach(sw => {
+    const box = el("div", { class: "panel" }, host);
+    el("h3", { text: sw.title }, box);
+    el("p", { class: "note", text: sw.note }, box);
+    const W = 340, H = 170, l = 44, r = 12, t = 12, b = 34;
+    sw.panels.forEach(pn => {
+      el("div", { class: "sm-title", html: `<span>${pn.metric}</span>` }, box);
+      const wrap = el("div", { class: "chart" }, box);
+      const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `${sw.title}: ${pn.metric}` }, wrap);
+      svg.style.minWidth = "0";
+      const ys = pn.points.map(p => p[1]);
+      let lo = Math.min(...ys), hi = Math.max(...ys);
+      const pad = (hi - lo) * 0.15 || Math.abs(hi) * 0.1 || 0.01; const floor0 = lo >= 0; lo -= pad; hi += pad;
+      if (floor0) lo = Math.max(0, lo);
+      if (pn.range) { lo = pn.range[0]; hi = pn.range[1]; }
+      const n = pn.points.length;
+      const x = i => l + (n === 1 ? 0.5 : i / (n - 1)) * (W - l - r), y = v => t + (1 - (v - lo) / (hi - lo)) * (H - t - b);
+      for (let k = 0; k <= 3; k++) {
+        const v = lo + (hi - lo) * k / 3;
+        el("line", { x1: l, x2: W - r, y1: y(v), y2: y(v), stroke: "var(--grid)" }, svg);
+        el("text", { x: l - 6, y: y(v) + 4, "text-anchor": "end", class: "tick", text: v.toFixed(pn.digits) }, svg);
+      }
+      el("polyline", { points: pn.points.map((p, i) => `${x(i)},${y(p[1])}`).join(" "), fill: "none", stroke: "var(--balance)", "stroke-width": 2 }, svg);
+      pn.points.forEach((p, i) => {
+        el("text", { x: x(i), y: H - 12, "text-anchor": i === 0 ? "start" : i === n - 1 ? "end" : "middle", class: "tick", text: p[0] }, svg);
+        const c = el("circle", { cx: x(i), cy: y(p[1]), r: 5, fill: p[2] ? "var(--surface)" : "var(--balance)", stroke: "var(--balance)", "stroke-width": 2 }, svg);
+        hover(c, `<b>${sw.xlabel} ${p[0]}</b><br>${pn.metric}: ${p[1].toFixed(pn.digits + 1)}${p[2] ? "<br>(from the main sweep, 2-seed mean)" : ""}`);
+      });
+      el("text", { x: W - r, y: H - 1, "text-anchor": "end", class: "tick", text: sw.xlabel + " →" }, svg);
+    });
   });
 })();
 
