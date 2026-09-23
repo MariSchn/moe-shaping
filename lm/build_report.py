@@ -22,9 +22,10 @@ FINDINGS = [
     ("none", "<b>Routing quality only matters a little with top-8 of 64 experts.</b> A frozen random router reaches "
              "8.57, only 0.018 nats behind the trained baseline, and ahead of bilevel and both bandit variants. "
              "Differences between routing methods are therefore small at this scale."),
-    ("router", "<b>LOLA opponent shaping did not train stably.</b> All three unbounded runs diverged to NaN "
-               "(α = 3e-4 by step ~357, α = 1e-4 at steps 591 and ~495). A variant that caps each token's correction "
-               "is described <a href=\"#lola-h\">below</a>."),
+    ("router", "<b>LOLA opponent shaping is feasible to compute but harmful.</b> All three unbounded runs diverged "
+               "to NaN (α = 3e-4 by step ~357, α = 1e-4 at steps 591 and ~495). With each token's correction capped, "
+               "training is stable but ends at ppl 11.9 (+0.34 nats), still collapsed (MaxVio 4.1) and with the "
+               "<i>lowest</i> domain specialization of any arm (NMI 0.052). <a href=\"#lola-h\">Details below.</a>"),
 ]
 
 LOLA = """
@@ -46,6 +47,16 @@ SETUP = [
 ]
 
 
+CAPPED = ("<b>A stabilized variant trains but does not help.</b> <span class=\"mono\">--lola-max-ratio 0.5</span> caps "
+          "each token's correction at half the norm of that token's own task gradient and zeroes non-finite values. "
+          "With α = 1e-4 both seeds completed, but the global gradient norm stayed at ~2, about 10× the other arms, "
+          "and the models finished at val ppl 11.95 / 11.77, +0.34 nats against the baseline. Routing still collapsed "
+          "(MaxVio<sub>global</sub> 4.1, 85 dead experts, fully collapsed layers at MaxVio 7.0) and was the least "
+          "specialized of all arms (domain NMI 0.052, vocabulary specialization 0.352). Router-router LOLA pushes "
+          "each selected row to anticipate its co-selected rows' updates. At this scale that disrupts the routing "
+          "rather than coordinating it.")
+
+
 def main(template, data_path, out, capped_text):
     html = open(template).read()
     data = json.load(open(data_path))
@@ -60,4 +71,4 @@ def main(template, data_path, out, capped_text):
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:4], sys.argv[4] if len(sys.argv) > 4 else "The capped runs are still training.")
+    main(*sys.argv[1:4], CAPPED)

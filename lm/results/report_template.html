@@ -124,7 +124,7 @@ dl.setup dd { margin: 0; }
   <header class="stack">
     <div class="eyebrow">moe-shaping · 1.3B-parameter MoE · 64 experts, top-8 · 1.57B tokens</div>
     <h1>MoE Router Method Study</h1>
-    <p class="lede">Eight ways to train (or not train) the router of the same mixture-of-experts language model, compared on validation perplexity, load balance (MaxVio) and expert specialization. LOLA opponent shaping was attempted as well and did not train stably at this scale.</p>
+    <p class="lede">Nine ways to train (or not train) the router of the same mixture-of-experts language model, compared on validation perplexity, load balance (MaxVio) and expert specialization. Unbounded LOLA opponent shaping diverged at this scale; a capped variant is included.</p>
   </header>
 
   <section class="stack" aria-labelledby="findings-h">
@@ -245,7 +245,7 @@ document.getElementById("fam-legend").innerHTML = Object.values(FAMILY)
   const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Validation loss difference from baseline per method" });
   const baseSeeds = base.seeds.map(s => s.loss - baseLoss);
   el("rect", { x: x(Math.min(...baseSeeds)), y: top - 6, width: Math.max(2, x(Math.max(...baseSeeds)) - x(Math.min(...baseSeeds))), height: rowH * arms.length + 6, fill: "var(--band)" }, svg);
-  for (let t = -0.02; t <= 0.0701; t += 0.01) {
+  for (let t = -0.02; t <= 0.0601; t += 0.01) {
     const tx = x(t);
     el("line", { x1: tx, x2: tx, y1: top - 6, y2: H - 10, stroke: Math.abs(t) < 1e-9 ? "var(--muted)" : "var(--grid)", "stroke-width": 1 }, svg);
     el("text", { x: tx, y: 16, "text-anchor": "middle", class: "tick", text: (t > 1e-9 ? "+" : "") + t.toFixed(2) }, svg);
@@ -326,12 +326,12 @@ document.getElementById("fam-legend").innerHTML = Object.values(FAMILY)
     const box = el("div", { class: "panel" }, host);
     el("h3", { text: mt.title }, box);
     el("p", { class: "note", text: mt.note }, box);
-    const W = 420, rowH = 24, left = 170, right = 16, top = 22, H = top + rowH * arms.length + 6;
+    const W = 320, rowH = 24, left = 150, right = 14, top = 22, H = top + rowH * arms.length + 6;
     const x = v => left + (v - mt.lo) / (mt.hi - mt.lo) * (W - left - right);
     const wrap = el("div", { class: "chart" }, box);
     const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": mt.title }, wrap);
     svg.style.minWidth = "0";
-    const ticks = 4;
+    const ticks = 3;
     for (let i = 0; i <= ticks; i++) {
       const v = mt.lo + (mt.hi - mt.lo) * i / ticks, tx = x(v);
       el("line", { x1: tx, x2: tx, y1: top - 6, y2: H - 4, stroke: "var(--grid)" }, svg);
