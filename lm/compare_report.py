@@ -55,16 +55,32 @@ def parse_log(path):
     }
 
 
-def latest_logs(prefix):
-    runs = {}
+def run_logs(prefix, excluded_jobs, min_job):
+    runs = defaultdict(list)
     for path in glob.glob(f"logs/{prefix}-*-s*-*.log"):
         m = RUN.match(os.path.basename(path))
-        if not m or m["prefix"] != prefix:
+        if not m or m["prefix"] != prefix or int(m["job"]) in excluded_jobs or int(m["job"]) < min_job:
             continue
-        key = (m["arm"], int(m["seed"]))
-        if key not in runs or int(m["job"]) > runs[key][0]:
-            runs[key] = (int(m["job"]), path)
-    return runs
+        runs[(m["arm"], int(m["seed"]))].append((int(m["job"]), path))
+    return {key: sorted(paths) for key, paths in runs.items()}
+
+
+def parse_run(paths):
+    merged = None
+    for _, path in paths:
+        parsed = parse_log(path)
+        if merged is None:
+            merged = parsed
+            continue
+        for key in ("valid", "maxvio_global_valid"):
+            merged[key].update(parsed[key])
+        for name, points in parsed["series"].items():
+            merged["series"].setdefault(name, {}).update(points)
+        merged["total_steps"] = parsed["total_steps"] or merged["total_steps"]
+        merged["last_step"] = max(merged["last_step"], parsed["last_step"])
+        if parsed["final_valid_loss"] is not None:
+            merged["final_valid_loss"] = parsed["final_valid_loss"]
+    return merged
 
 
 def main():
@@ -72,11 +88,15 @@ def main():
     parser.add_argument("--prefix", default="cmp")
     parser.add_argument("--project", default="moe-method-comparison")
     parser.add_argument("--out", default="results/compare.json")
+    parser.add_argument("--exclude-jobs", default="")
+    parser.add_argument("--min-job", type=int, default=0)
     args = parser.parse_args()
+    excluded = {int(j) for j in args.exclude_jobs.split(",") if j}
 
     runs = []
-    for (arm, seed), (job, path) in sorted(latest_logs(args.prefix).items()):
-        parsed = parse_log(path)
+    for (arm, seed), paths in sorted(run_logs(args.prefix, excluded, args.min_job).items()):
+        parsed = parse_run(paths)
+        job = paths[-1][0]
         name = f"{args.prefix}-{arm}-s{seed}"
         spec_path = os.path.join(SCRATCH, args.project, name, "analysis", "specialization.json")
         spec = json.load(open(spec_path)) if os.path.exists(spec_path) else None
