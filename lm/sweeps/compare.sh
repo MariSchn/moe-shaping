@@ -44,6 +44,7 @@ arm_assignments() {
         bandit)        echo "AUX_LOSS_COEFF=0 $BANDIT_KNOBS" ;;
         bandit-hybrid) echo "AUX_LOSS_COEFF=0 $BANDIT_KNOBS BANDIT_KEEP_TASK_GRAD=1" ;;
         lola)          echo "AUX_LOSS_COEFF=0 LOLA_ALPHA=${ARM_LOLA_ALPHA:?set LOLA_ALPHA for the lola arm}" ;;
+        lola-*)        echo "AUX_LOSS_COEFF=0 LOLA_ALPHA=${1#lola-}" ;;
         frozen)        echo "AUX_LOSS_COEFF=0 ROUTER_LR=0" ;;
         *)             echo "unknown arm $1" >&2; exit 1 ;;
     esac
