@@ -101,6 +101,14 @@ LR_WARMUP_ITERS=${LR_WARMUP_ITERS:-$(( STEPS / 10 ))}
 TIME=${TIME:-01:00:00}
 DOMAIN_EVAL_DIR=${DOMAIN_EVAL_DIR:-/iopsstor/scratch/cscs/$USER/moe-shaping/domain_eval}
 SAVE_FINAL_WEIGHTS=${SAVE_FINAL_WEIGHTS:-1}
+CKPT_INTERVAL=${CKPT_INTERVAL:-0}
+PRECISION_AWARE_OPTIMIZER=${PRECISION_AWARE_OPTIMIZER:-1}
+if [ "$CKPT_INTERVAL" -gt 0 ]; then
+    REQUEUE_DIRECTIVES="#SBATCH --requeue
+#SBATCH --open-mode=append"
+else
+    REQUEUE_DIRECTIVES="#SBATCH --no-requeue"
+fi
 SEED=${SEED:-42}
 
 # ---- Bilevel arg block + run tag (keeps baseline vs split-mode logs separate) ----
@@ -355,7 +363,7 @@ ${PARTITION_DIRECTIVE}
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=288
 #SBATCH --mem=460000
-#SBATCH --no-requeue
+${REQUEUE_DIRECTIVES}
 SBATCH_DIRECTIVES
 
 cat >> "$SCRIPT" << 'BODY_HEAD'
@@ -387,6 +395,8 @@ GBS=${GBS}
 SEQ_LEN=${SEQ_LEN}
 TRAINING_STEPS=${STEPS}
 SAVE_FINAL_WEIGHTS=${SAVE_FINAL_WEIGHTS}
+CKPT_INTERVAL=${CKPT_INTERVAL}
+PRECISION_AWARE_OPTIMIZER=${PRECISION_AWARE_OPTIMIZER}
 
 # Logging
 PROJECT_NAME=${WANDB_PROJECT}
@@ -415,6 +425,8 @@ MASTER_PORT=25678
 
 TRANSFORMER_ENGINE_ARGS=(
     --transformer-impl transformer_engine
+)
+[ "$PRECISION_AWARE_OPTIMIZER" = 1 ] && TRANSFORMER_ENGINE_ARGS+=(
     --use-precision-aware-optimizer
     --main-grads-dtype bf16
 )
@@ -530,6 +542,14 @@ DATA_ARGS=(
     --num-workers 1
 )
 
+CHECKPOINT_ARGS=()
+[ "$CKPT_INTERVAL" -gt 0 ] && mkdir -p $LOG_DIR/ckpt && CHECKPOINT_ARGS=(
+    --save $LOG_DIR/ckpt
+    --load $LOG_DIR/ckpt
+    --save-interval $CKPT_INTERVAL
+    --ckpt-format torch_dist
+)
+
 ROUTING_ANALYSIS_ARGS=(
     --routing-analysis-data $DOMAIN_EVAL_DIR
     --routing-analysis-out $LOG_DIR/analysis
@@ -553,6 +573,7 @@ TRAINING_CMD="torchrun ${TORCHRUN_ARGS[@]} $MEGATRON_LM_DIR/pretrain_gpt.py \
     ${BILEVEL_ARGS[@]} \
     ${BANDIT_ARGS[@]} \
     ${ROUTING_ANALYSIS_ARGS[@]} \
+    ${CHECKPOINT_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
     ${REGULARIZATION_ARGS[@]} \
     ${LEARNING_RATE_ARGS[@]} \
@@ -576,6 +597,19 @@ WANDB_INSERT
 
 cat >> "$SCRIPT" << 'FOOTER'
 
+export WANDB_RUN_ID=$(echo "$EXP_NAME-$SLURM_JOB_ID" | tr -c 'A-Za-z0-9_-' '_')
+export WANDB_RESUME=allow
+echo "[$(date)] restart count: ${SLURM_RESTART_COUNT:-0}"
+if [ "$CKPT_INTERVAL" -gt 0 ]; then
+    (
+        while sleep 120; do
+            latest=$(cat $LOG_DIR/ckpt/latest_checkpointed_iteration.txt 2>/dev/null) || continue
+            for dir in $LOG_DIR/ckpt/iter_*; do
+                [ -d "$dir" ] && [ $((10#${dir##*iter_})) -lt "$latest" ] && rm -rf "$dir"
+            done
+        done
+    ) &
+fi
 echo "CMD: $TRAINING_CMD"
 srun -lu --mpi=pmix --network=disable_rdzv_get --environment=alps3 --cpus-per-task $SLURM_CPUS_PER_TASK --wait 60 bash -c "numactl --membind=0-3 $TRAINING_CMD"
 

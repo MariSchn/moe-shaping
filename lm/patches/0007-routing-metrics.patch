@@ -235,10 +235,10 @@ index d96ea7aa7..2a36cd78b 100644
                         help='Train the MoE router from bandit feedback instead of the task '
 diff --git a/megatron/training/routing_analysis.py b/megatron/training/routing_analysis.py
 new file mode 100644
-index 000000000..a37f587dc
+index 000000000..7a3e8d7a9
 --- /dev/null
 +++ b/megatron/training/routing_analysis.py
-@@ -0,0 +1,434 @@
+@@ -0,0 +1,452 @@
 +import json
 +import math
 +import os
@@ -259,7 +259,6 @@ index 000000000..a37f587dc
 +_DEAD_EXPERT_FRACTION = 0.1
 +
 +_domains = None
-+_saturation_snapshots = []
 +
 +
 +def enabled():
@@ -371,14 +370,33 @@ index 000000000..a37f587dc
 +            chunks.setdefault(layer, []).append(indices.cpu())
 +
 +    _run(model, windows, visit)
-+    _saturation_snapshots.append(
-+        (iteration, {layer: torch.cat(parts) for layer, parts in chunks.items()})
-+    )
++    snapshot = {layer: torch.cat(parts) for layer, parts in chunks.items()}
++    directory = _saturation_dir()
++    os.makedirs(directory, exist_ok=True)
++    torch.save(snapshot, os.path.join(directory, f"rank{_dp_rank_and_size()[0]:03d}_iter{iteration:07d}.pt"))
 +
 +
-+def _saturation(final_snapshot):
++def _saturation_dir():
++    return os.path.join(get_args().routing_analysis_out, "saturation")
++
++
++def _saturation_snapshots(final_iteration):
++    rank = _dp_rank_and_size()[0]
++    prefix = f"rank{rank:03d}_iter"
++    snapshots = []
++    directory = _saturation_dir()
++    names = sorted(os.listdir(directory)) if os.path.isdir(directory) else []
++    for name in names:
++        if name.startswith(prefix):
++            iteration = int(name[len(prefix):-len(".pt")])
++            if iteration <= final_iteration:
++                snapshots.append((iteration, torch.load(os.path.join(directory, name))))
++    return snapshots
++
++
++def _saturation(final_snapshot, final_iteration):
 +    rows = []
-+    for iteration, snapshot in _saturation_snapshots:
++    for iteration, snapshot in _saturation_snapshots(final_iteration):
 +        per_layer = []
 +        for layer in sorted(final_snapshot):
 +            earlier = snapshot[layer].long()
@@ -536,7 +554,7 @@ index 000000000..a37f587dc
 +
 +    _run(model, probe_windows, probe_visit)
 +    final_snapshot = {layer: torch.cat(parts) for layer, parts in probe_chunks.items()}
-+    saturation = _saturation(final_snapshot)
++    saturation = _saturation(final_snapshot, iteration)
 +
 +    for tensor in (dom_counts, vocab_in, vocab_out, coact, domain_tokens, domain_loss):
 +        _all_reduce(tensor)

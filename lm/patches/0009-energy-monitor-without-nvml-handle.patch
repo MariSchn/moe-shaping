@@ -1,0 +1,30 @@
+# Patch: Do not query NVML energy when the energy monitor was never set up
+#
+# Problem:
+#   save_checkpoint_and_time() always calls energy_monitor.pause()/resume(), but the monitor only
+#   calls nvmlInit()/nvmlDeviceGetHandleByIndex() in setup(), which runs under --log-energy.
+#   Without it, _get_energy() passes a NULL handle to nvmlDeviceGetTotalEnergyConsumption, which
+#   segfaults on GH200 (libnvidia-ml, signal 11) at the first checkpoint save. This is the
+#   "checkpointing SIGSEGV" that had checkpointing disabled in this repo.
+#
+# Fix (megatron/core/energy_monitor.py): _get_energy() returns the last reading when no NVML
+#   handle exists, so pause()/resume()/lap() are no-ops unless --log-energy set the monitor up.
+#
+# How to find the right location in a future Megatron version:
+#   EnergyMonitor._get_energy in megatron/core/energy_monitor.py.
+#
+# Applied to: Megatron-LM core_v0.16.1 (commit 55ac7082), on top of patches 0001-0008.
+#
+diff --git a/megatron/core/energy_monitor.py b/megatron/core/energy_monitor.py
+index 4334cfe38..2ef18e40e 100644
+--- a/megatron/core/energy_monitor.py
++++ b/megatron/core/energy_monitor.py
+@@ -58,6 +58,8 @@ class EnergyMonitor:
+ 
+     def _get_energy(self) -> int:
+         """Get current energy consumption from NVML."""
++        if self._handle is None:
++            return self._last_energy
+         try:
+             return nvmlDeviceGetTotalEnergyConsumption(self._handle)
+         except NVMLError:
