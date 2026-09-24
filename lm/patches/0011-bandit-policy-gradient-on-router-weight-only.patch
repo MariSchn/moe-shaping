@@ -1,0 +1,46 @@
+# Patch: Keep the bandit's REINFORCE gradient on the router weight, and its critic off the init RNG
+#
+# Two bugs found by the 2026-09-23 audit (audit/REPORT.md, F3 and F8):
+#
+#   1. bandit_routing() built the policy log-probs from the router logits, which carry a graph to
+#      the router *input*. The REINFORCE term therefore also trained the hidden state and every
+#      earlier layer: at the trained bandit-hybrid checkpoint the extra gradient on layer-0
+#      attention, layer-0 experts and embeddings was 0.8-1.3x the task gradient. The intended
+#      method (and the toy, whose router input is raw data) trains only the router from it.
+#      Fix: compute the policy log-probs from self.gating(hidden.detach()), a second router pass
+#      whose only differentiable input is the router weight. Mixing weights and the task path are
+#      unchanged. Verified on CPU: the extra gradient on the router input is exactly 0 while the
+#      extra gradient on the router weight is unchanged.
+#   2. The critic value head was initialized from the CPU RNG inside TopKRouter.__init__, shifting
+#      the (CPU) initialization of every later router relative to non-bandit arms at the same seed.
+#      Fix: initialize it inside torch.random.fork_rng(devices=[]).
+#
+# How to find the right location in a future Megatron version:
+#   router.py: TopKRouter.bandit_routing (log_probs) and the critic block in TopKRouter.__init__.
+#
+# Applied to: Megatron-LM core_v0.16.1 (commit 55ac7082), on top of patches 0001-0010.
+#
+diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
+index bff06fc88..b37ea222e 100644
+--- a/megatron/core/transformer/moe/router.py
++++ b/megatron/core/transformer/moe/router.py
+@@ -248,7 +248,8 @@ class TopKRouter(Router):
+                 self.bandit_value = torch.nn.Parameter(
+                     torch.empty((1, self.config.hidden_size), dtype=torch.float32)
+                 )
+-                self.config.init_method(self.bandit_value)
++                with torch.random.fork_rng(devices=[]):
++                    self.config.init_method(self.bandit_value)
+                 self.bandit_value.data = self.bandit_value.data.to(
+                     dtype=self.config.params_dtype
+                 )
+@@ -723,7 +724,8 @@ class TopKRouter(Router):
+         probs = torch.zeros_like(logits).scatter(1, top_indices, top_probs)
+         routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+ 
+-        log_probs = torch.log_softmax(scores, dim=-1)
++        policy_logits = self.gating(self._bandit_hidden.detach()).float()
++        log_probs = torch.log_softmax(policy_logits, dim=-1)
+         value = None
+         if self.bandit_value is not None:
+             # Detached input: the critic reads the hidden state but must not shape it.

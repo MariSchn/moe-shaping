@@ -1,0 +1,99 @@
+# Patch: Make --router-lr/--expert-lr 0 really freeze, and keep split param groups apart on resume
+#
+# Two bugs found by the 2026-09-23 audit (audit/REPORT.md, F1 and F2), both in how patch 0002's
+# router/expert param groups interact with stock Megatron:
+#
+#   1. The override set only 'max_lr'. Every group also carries 'min_lr' (default: the global
+#      --min-lr), and cosine decay is min_lr + coeff*(max_lr - min_lr), so a "frozen" router with
+#      max_lr=0 still trained, at an lr rising from 0 to --min-lr over the run.
+#      Fix (training.py): scale the group's min_lr by the same factor as its max_lr, so
+#      --router-lr 0 gives lr 0 on every step, and a non-zero override keeps the global
+#      min_lr/lr ratio.
+#   2. On checkpoint load, optimizer groups are matched by
+#      (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr). At EP=1 the default, router and
+#      expert groups share that key, so every group was remapped onto the last one built (the
+#      router group): after a resume the backbone and experts trained with the router's lr.
+#      Fix (optimizer.py, distrib_optimizer.py): add 'bilevel_role' as an optional identifier key
+#      (None when absent, so checkpoints of runs without the split load exactly as before).
+#
+# Not fixed here: the bilevel phase counter is not checkpointed, so a resumed bilevel run restarts
+# its cycle at the router phase.
+#
+# How to find the right location in a future Megatron version:
+#   training.py: get_megatron_optimizer_config(), the router_override/expert_override block.
+#   optimizer.py: param_group_identifier_keys and _filter_and_reorder_param_groups.
+#   distrib_optimizer.py: make_needed_groups in load_parameter_state_from_dp_reshardable's caller.
+#
+# Applied to: Megatron-LM core_v0.16.1 (commit 55ac7082), on top of patches 0001-0009.
+#
+diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimizer/distrib_optimizer.py
+index 4192b0bb7..7a0df3fdf 100644
+--- a/megatron/core/optimizer/distrib_optimizer.py
++++ b/megatron/core/optimizer/distrib_optimizer.py
+@@ -53,7 +53,12 @@ from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_s
+ from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
+ from ..transformer.module import MegatronModule
+ from .grad_scaler import MegatronGradScaler
+-from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
++from .optimizer import (
++    MixedPrecisionOptimizer,
++    _zero_grad_group_helper,
++    optional_param_group_identifier_keys,
++    param_group_identifier_keys,
++)
+ from .optimizer_config import OptimizerConfig
+ 
+ logger = getLogger(__name__)
+@@ -748,6 +753,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+                         f"Key {key} (or pre_{key}) not found in param_group {param_group}."
+                     )
+                 needed_groups.append(param_group[key])
++            needed_groups.extend(param_group.get(key) for key in optional_param_group_identifier_keys)
+             needed_groups = tuple(needed_groups)
+             return needed_groups
+ 
+diff --git a/megatron/core/optimizer/optimizer.py b/megatron/core/optimizer/optimizer.py
+index 2c33d7e70..9f09fb716 100644
+--- a/megatron/core/optimizer/optimizer.py
++++ b/megatron/core/optimizer/optimizer.py
+@@ -94,6 +94,7 @@ def _multi_tensor_copy_this_to_that(
+ 
+ 
+ param_group_identifier_keys = ('wd_mult', 'lr_mult', 'is_expert_parallel', 'is_decoupled_lr')
++optional_param_group_identifier_keys = ('bilevel_role',)
+ 
+ 
+ class MegatronOptimizer(ABC):
+@@ -401,6 +402,7 @@ class MegatronOptimizer(ABC):
+         needed_groups = [
+             # NeMo may have different key for required fields, e.g., "wd_mult" to "pre_wd_mult"
+             tuple(g[key] if key in g else g[f"pre_{key}"] for key in param_group_identifier_keys)
++            + tuple(g.get(key) for key in optional_param_group_identifier_keys)
+             for g in current_groups
+         ]
+ 
+@@ -412,7 +414,8 @@ class MegatronOptimizer(ABC):
+                 # NeMo may have different key for required fields, e.g., "wd_mult" to "pre_wd_mult"
+                 group[key] if key in group else group[f"pre_{key}"]
+                 for key in param_group_identifier_keys
+-            ): group
++            )
++            + tuple(group.get(key) for key in optional_param_group_identifier_keys): group
+             for group in state_dict_groups
+         }
+ 
+diff --git a/megatron/training/training.py b/megatron/training/training.py
+index 6f467ce56..74a196d77 100644
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -1467,8 +1467,10 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
+         expert_override = {'bilevel_role': 'expert'}
+         if getattr(args, 'router_lr', None) is not None:
+             router_override['max_lr'] = args.router_lr
++            router_override['min_lr'] = args.min_lr * args.router_lr / args.lr
+         if getattr(args, 'expert_lr', None) is not None:
+             expert_override['max_lr'] = args.expert_lr
++            expert_override['min_lr'] = args.min_lr * args.expert_lr / args.lr
+         config_overrides[ParamKey(name='*.router.*')] = router_override
+         config_overrides[ParamKey(name='*.experts.*')] = expert_override
+ 

@@ -1,0 +1,35 @@
+# Patch: Apply the LOLA correction to the router weight only
+#
+# Bug found by the 2026-09-23 audit (audit/REPORT.md, F4): _RouterRouterShaping returned the
+# correction as a gradient on the router logits, which carry a graph to the router input, so the
+# correction also trained the hidden state and all earlier layers (1.1-1.5x the task gradient in
+# layer 0 at the capped-LOLA checkpoint, partly opposing it). The derivation (patch 0008 header)
+# and the toy apply it to the router rows only.
+#
+# Fix (lola.py apply): hand the Function the logits of a second router pass on the detached input,
+# router.gating(hidden.detach()), whose only differentiable input is the router weight. The
+# forward output is unchanged (the Function returns probs). Verified on CPU: the extra gradient on
+# the router input is exactly 0 while the extra gradient on the router weight is unchanged.
+#
+# How to find the right location in a future Megatron version:
+#   megatron/core/transformer/moe/lola.py, apply().
+#
+# Applied to: Megatron-LM core_v0.16.1 (commit 55ac7082), on top of patches 0001-0011.
+#
+diff --git a/megatron/core/transformer/moe/lola.py b/megatron/core/transformer/moe/lola.py
+index a95ad8b66..f3cb3b3c1 100644
+--- a/megatron/core/transformer/moe/lola.py
++++ b/megatron/core/transformer/moe/lola.py
+@@ -73,6 +73,10 @@ def _track(router, extra, task_logit_grad):
+ 
+ 
+ def apply(router, probs, logits, hidden, num_microbatches):
+-    hidden_sq_norm = hidden.detach().float().pow(2).sum(dim=-1)
++    detached_hidden = hidden.detach()
++    weight_only_logits = router.gating(detached_hidden)
++    hidden_sq_norm = detached_hidden.float().pow(2).sum(dim=-1)
+     tokens_scale = float(logits.shape[0] * num_microbatches)
+-    return _RouterRouterShaping.apply(probs, logits, hidden_sq_norm, tokens_scale, router)
++    return _RouterRouterShaping.apply(
++        probs, weight_only_logits, hidden_sq_norm, tokens_scale, router
++    )
