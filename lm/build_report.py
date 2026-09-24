@@ -93,7 +93,7 @@ WHY = [
      "verdict": "refuted",
      "test": "Per-domain routing concentration (effective number of experts serving each domain) on the existing runs.",
      "prediction": "The baseline routes arXiv more concentrated than other domains, relative to the balanced arms.",
-     "result": "The baseline routes every domain about twice as concentrated (≈32 vs ≈57 effective experts), with no arXiv-specific difference, and aux-free concentrates arXiv almost as much as the baseline yet also loses on it. The arXiv cost itself is robust: all seven balanced runs across both mechanisms and every strength are 0.01–0.06 nats worse on arXiv than both baseline seeds, while roughly even on web, Wikipedia and books. Its mechanism is open."},
+     "result": "The baseline routes every domain about twice as concentrated (≈32 vs ≈57 effective experts), with no arXiv-specific difference, and aux-free concentrates arXiv almost as much as the baseline yet also loses on it. The arXiv cost itself is robust across runs: all seven balanced runs across both mechanisms and every strength are 0.01–0.06 nats worse on arXiv than both baseline seeds, while roughly even on web, Wikipedia and books. Its mechanism is open, and it may be specific to this arXiv source, which is lowercased and re-spaced; it should be re-checked on raw arXiv text."},
 ]
 
 CAPPED = ("<b>A stabilized variant trains but does not help.</b> <span class=\"mono\">--lola-max-ratio 0.5</span> caps "

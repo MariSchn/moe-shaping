@@ -183,11 +183,11 @@ dl.setup dd { margin: 0; }
   <section class="stack" aria-labelledby="spec-h">
     <div class="eyebrow">Specialization (OLMoE metrics)</div>
     <h2 id="spec-h">How specialized the experts are</h2>
-    <p class="note">From OLMoE (Muennighoff et al., 2024), on a held-out set of five domains: Wikipedia, GitHub, arXiv, books and C4 web text, 128 × 4,096 tokens each. <b>Domain NMI</b> is the mutual information between a token's domain and its experts, normalized by the domain entropy (0 = routing ignores domain). <b>Vocabulary specialization</b>: per expert, the average share of a routed token type's occurrences that go to that expert (uniform = k/E = 0.125). <b>Co-activation</b>: for each expert, the highest fraction of its tokens that also go to one particular other expert (uniform ≈ 0.11). Lower co-activation means less redundancy.</p>
+    <p class="note">From OLMoE (Muennighoff et al., 2024). The model trains only on ClimbMix, whose Megatron copy has no domain labels, so these metrics use a separate held-out set built for the analysis from five public Hugging Face datasets, the first documents in stream order, each capped at 16k tokens and cut into 128 × 4,096 tokens per domain: Wikipedia (<span class="mono">wikimedia/wikipedia</span>, 78 documents), GitHub (<span class="mono">codeparrot/codeparrot-clean-valid</span>, Python only, 166), arXiv (<span class="mono">ccdv/arxiv-summarization</span> article bodies, 68), books (<span class="mono">emozilla/pg19-test</span>, 34) and web (<span class="mono">allenai/c4</span> validation, 1,057). Caveats: that arXiv source is pre-processed (lowercased, spaces around punctuation), unlike real arXiv or anything in ClimbMix; books and arXiv rest on few documents; and ClimbMix is web-derived, so the C4 and Wikipedia samples may overlap its training data. <b>Domain NMI</b> is the mutual information between a token's domain and its experts, normalized by the domain entropy (0 = routing ignores domain). <b>Vocabulary specialization</b>: per expert, the average share of a routed token type's occurrences that go to that expert (uniform = k/E = 0.125). <b>Co-activation</b>: for each expert, the highest fraction of its tokens that also go to one particular other expert (uniform ≈ 0.11). Lower co-activation means less redundancy.</p>
     <div class="two-col" id="spec-dots"></div>
     <div class="panel stack">
       <h3>Domain specialization in the last layer</h3>
-      <p class="note">The fraction of each domain's tokens routed to each expert, as a multiple of the uniform share. Experts are sorted by the domain they favour most. Seed 42.</p>
+      <p class="note">The fraction of each domain's tokens routed to each expert, as a multiple of the uniform share. Experts are sorted by the domain they favour most; a block that is dark for one domain only is a group of experts serving mainly that domain. A column dark in every domain is an overloaded expert, which is load imbalance rather than specialization (this metric mixes the two), and an empty column is a dead expert. All methods, seed 42, ordered by perplexity. Note that the bandit, LOLA and frozen rows come from the runs the audit found to be affected by bugs.</p>
       <div class="heatmaps" id="heatmaps"></div>
     </div>
     <div class="panel table-wrap">
@@ -384,7 +384,7 @@ document.getElementById("fam-legend").innerHTML = Object.values(FAMILY)
 
 (function heatmaps() {
   const host = document.getElementById("heatmaps");
-  const shown = ["noLB", "aux", "auxfree"].map(k => DATA.arms.find(a => a.arm === k));
+  const shown = arms.filter(a => a.domain_spec);
   const layer = String(DATA.num_layers - 1), uniform = DATA.topk / DATA.num_experts;
   shown.forEach(a => {
     const m = a.domain_spec[layer].map(row => row.map(v => v / uniform));
