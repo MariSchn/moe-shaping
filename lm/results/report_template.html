@@ -135,20 +135,19 @@ dl.setup dd { margin: 0; }
   <header class="stack">
     <div class="eyebrow">moe-shaping · 1.3B-parameter MoE · 64 experts, top-8 · 1.57B tokens</div>
     <h1>MoE Router Method Study</h1>
-    <p class="lede">Nine ways to train (or not train) the router of the same mixture-of-experts language model, compared on validation perplexity, load balance (MaxVio) and expert specialization. Unbounded LOLA opponent shaping diverged at this scale; a capped variant is included.</p>
+    <p class="lede">Ten ways to train (or not train) the router of the same mixture-of-experts language model, compared on validation perplexity, load balance (MaxVio) and expert specialization, followed by tests of why the results come out this way.</p>
   </header>
 
-  <section class="panel stack" aria-labelledby="audit-h" style="border-color: var(--bad);">
-    <div class="eyebrow" style="color: var(--bad);">Code audit, 23 Sep · read before the results</div>
-    <h2 id="audit-h">Three method arms are affected by implementation bugs</h2>
-    <p>An independent audit of the exact code that ran found bugs that invalidate some conclusions below. The load-balancing comparison is <b>unaffected</b>: baseline, aux-loss, aux-free, sigmoid control, their sweeps and all balance/specialization metrics were verified correct. Affected:</p>
+  <section class="panel stack" aria-labelledby="audit-h">
+    <div class="eyebrow">Code audit, 23–25 Sep</div>
+    <h2 id="audit-h">Bugs found, fixed and re-run</h2>
+    <p>An independent audit of the exact code that ran found bugs in three arms. They are fixed (Megatron patches 0010–0012), verified with CPU and GPU tests, and those arms were re-run from scratch with 2 seeds each. <b>All numbers on this page for bandit, bandit + task gradient, frozen router and LOLA come from the fixed runs</b>; the earlier, invalid runs are excluded.</p>
     <ul class="findings">
-      <li class="f-router"><p><b>Bandit and bandit + gradient:</b> the REINFORCE gradient also flows through the router input into the whole backbone (at the final checkpoint 0.8–1.3× the task gradient in the lowest layers). The measured deficit reflects that leak, not bandit routing as a method. The routing code itself is correct: bitwise identical to standard routing with REINFORCE and exploration off.</p></li>
-      <li class="f-router"><p><b>LOLA:</b> the same leak. The correction reaches the backbone at 1.1–1.5× the task gradient, partly opposing it. The divergences and the 11.9 perplexity cannot be attributed to opponent shaping. The closed form itself is verified correct.</p></li>
-      <li><p><b>Frozen random router:</b> not actually frozen. It trained at a small, rising learning rate from the schedule's minimum LR, and seed 42 additionally resumed with a corrupted optimizer group mapping. Treat 8.57 as approximate.</p></li>
-      <li class="f-router"><p><b>Bilevel (design, not a bug):</b> the experts, ~93% of parameters, are frozen during router phases, so its cost measures withheld expert updates rather than routing.</p></li>
+      <li class="f-router"><p><b>Bandit arms:</b> the REINFORCE gradient leaked through the router input into the whole backbone. Fixed, bandit + task gradient improves from ppl 8.81 to 8.50 (now tied with the baseline) and pure bandit from 17.5 to 10.65.</p></li>
+      <li class="f-router"><p><b>LOLA:</b> the correction leaked the same way. Fixed, LOLA trains stably at every α tried (before the fix α = 1e-2 went NaN by step 22) but is still worse than the baseline.</p></li>
+      <li><p><b>Frozen router:</b> it was not actually frozen (a minimum-LR override bug), and one seed resumed with a corrupted optimizer. Fixed, the truly frozen random router gives the same result (ppl 8.57–8.59).</p></li>
     </ul>
-    <p class="note">Fixes and re-runs for these arms are pending. Full audit: <span class="mono">/iopsstor/scratch/cscs/smarian/moe-shaping/audit/REPORT.md</span>.</p>
+    <p class="note">Load balancing, the baselines, bilevel and every metric were verified correct and were not affected. Bilevel has a design caveat, not a bug: its experts (~93% of parameters) are frozen during router phases. Full audit: <span class="mono">/iopsstor/scratch/cscs/smarian/moe-shaping/audit/REPORT.md</span>.</p>
   </section>
 
   <section class="stack" aria-labelledby="findings-h">
@@ -207,7 +206,7 @@ dl.setup dd { margin: 0; }
 
   <section class="stack" aria-labelledby="lola-h">
     <div class="eyebrow">Opponent shaping</div>
-    <h2 id="lola-h">LOLA did not train stably at this scale</h2>
+    <h2 id="lola-h">LOLA trains stably but flattens routing</h2>
     <div id="lola"></div>
   </section>
 
@@ -220,7 +219,7 @@ dl.setup dd { margin: 0; }
   <section class="stack" aria-labelledby="runs-h">
     <div class="eyebrow">Runs</div>
     <h2 id="runs-h">W&amp;B runs</h2>
-    <p class="note">Project <span class="mono">mari-schn/moe-method-comparison</span>. Each run's full per-layer analysis is in <span class="mono">…/moe-method-comparison/&lt;run&gt;/analysis/specialization.json</span> on iopsstor scratch, next to <span class="mono">final_weights.pt</span>. Runs in the project that are not listed here are partial runs from preempted or cancelled launches; ignore them.</p>
+    <p class="note">Project <span class="mono">mari-schn/moe-method-comparison</span>. Each run's full per-layer analysis is in <span class="mono">…/moe-method-comparison/&lt;run&gt;/analysis/specialization.json</span> on iopsstor scratch, next to <span class="mono">final_weights.pt</span>. Runs in the project that are not listed here are either partial runs from preempted or cancelled launches, or the first bandit, frozen and LOLA runs that the audit invalidated (names starting <span class="mono">cmp-bandit</span>, <span class="mono">cmp-frozen</span> or <span class="mono">cmp-lola</span>). The fixed re-runs start with <span class="mono">fix-</span>.</p>
     <div class="panel table-wrap"><table id="runs-table"></table></div>
   </section>
 </main>
@@ -272,12 +271,12 @@ document.getElementById("fam-legend").innerHTML = Object.values(FAMILY)
 
 (function pplChart() {
   const W = 900, rowH = 34, top = 30, left = 230, right = 150, H = top + rowH * arms.length + 16;
-  const lo = -0.02, hi = 0.07;
+  const lo = -0.02, hi = 0.16;
   const x = v => left + (Math.max(lo, Math.min(hi, v)) - lo) / (hi - lo) * (W - left - right);
   const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Validation loss difference from baseline per method" });
   const baseSeeds = base.seeds.map(s => s.loss - baseLoss);
   el("rect", { x: x(Math.min(...baseSeeds)), y: top - 6, width: Math.max(2, x(Math.max(...baseSeeds)) - x(Math.min(...baseSeeds))), height: rowH * arms.length + 6, fill: "var(--band)" }, svg);
-  for (let t = -0.02; t <= 0.0601; t += 0.01) {
+  for (let t = -0.02; t <= 0.1401; t += 0.02) {
     const tx = x(t);
     el("line", { x1: tx, x2: tx, y1: top - 6, y2: H - 10, stroke: Math.abs(t) < 1e-9 ? "var(--muted)" : "var(--grid)", "stroke-width": 1 }, svg);
     el("text", { x: tx, y: 16, "text-anchor": "middle", class: "tick", text: (t > 1e-9 ? "+" : "") + t.toFixed(2) }, svg);

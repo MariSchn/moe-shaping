@@ -18,27 +18,32 @@ FINDINGS = [
                 "the least domain-specific. Follow-up runs show this comes from the aux loss's mechanism, not from how hard it "
                 "balances: at matched balance (MaxVio ≈ 0.6) aux-free keeps NMI 0.100 against aux-loss's 0.058, and a very "
                 "weak aux loss (0.001) specializes more than none at all."),
-    ("router", "<b>Bilevel alternation and bandit + gradient cost about 0.04–0.05 nats</b> (ppl 8.76 and 8.81), "
-               "clearly outside seed noise. My first explanation for bilevel, that the router gets too few updates, is refuted: "
-               "giving the router more steps makes it much worse (ppl 9.87 at 25/25, 11.56 at 40/10). The cost tracks the updates "
-               "the experts lose while frozen. Why bandit + gradient loses is still open: turning exploration off makes it worse "
-               "(8.97), not better."),
-    ("router", "<b>Pure bandit routing is far worse</b> (ppl 16.7 / 18.3). The REINFORCE gradient's cosine with the "
-               "task gradient is only 0.02–0.03 throughout training, too little signal to learn a router from."),
+    ("router", "<b>Bilevel costs about 0.04 nats; bandit + task gradient ties the baseline.</b> Bilevel (ppl 8.76) "
+               "loses because the experts are frozen during router phases: giving the router more steps makes it much "
+               "worse (9.87 at 25/25, 11.56 at 40/10). Bandit + task gradient ends at 8.45 / 8.56 (+0.004 / +0.017 nats), "
+               "within seed noise of the baseline; its earlier 0.045-nat deficit was a bug."),
+    ("router", "<b>Pure bandit routing is clearly worse</b> (ppl 10.64 / 10.65, +0.235 nats in both seeds). The REINFORCE "
+               "gradient's cosine with the task gradient is only 0.02–0.03 throughout training, too little signal to learn a "
+               "router from. It does leave far fewer dead experts than the baseline (49–57 vs ~124)."),
     ("none", "<b>Routing quality only matters a little with top-8 of 64 experts.</b> A frozen random router reaches "
-             "8.57, only 0.018 nats behind the trained baseline, and ahead of bilevel and both bandit variants. "
+             "8.57 / 8.59, only 0.018–0.021 nats behind the trained baseline, and ahead of bilevel, pure bandit and LOLA. "
              "Differences between routing methods are therefore small at this scale."),
-    ("router", "<b>LOLA opponent shaping is feasible to compute but harmful.</b> All three unbounded runs diverged "
-               "to NaN (α = 3e-4 by step ~357, α = 1e-4 at steps 591 and ~495). With each token's correction capped, "
-               "training is stable but ends at ppl 11.9 (+0.34 nats), still collapsed (MaxVio 4.1) and with the "
-               "<i>lowest</i> domain specialization of any arm (NMI 0.052). <a href=\"#lola-h\">Details below.</a>"),
+    ("router", "<b>LOLA opponent shaping trains stably but flattens routing.</b> At α = 1e-3 / 1e-2 it ends at ppl "
+               "9.11 / 9.57 (+0.07–0.14 nats), with no dead experts but the lowest specialization of any method (domain NMI "
+               "0.037 / 0.019). Its per-token router entropy is 4.08–4.11, against 4.16 for a uniform distribution, 3.14 for the "
+               "baseline and even 3.68 for a frozen random router. <a href=\"#lola-h\">Details below.</a>"),
 ]
 
 LOLA = """
 <div class="stack">
-<p>LOLA is scaled from the toy <span class="mono">apply_router_router_lola_shaping</span> (<span class="mono">lola_learner="all"</span>): every selected router row is corrected to anticipate the naive gradient step of the token's other selected rows. At this scale the correction has a closed form, with no second backward pass. It treats the loss as linear in each MoE layer's output, just as the toy detaches expert outputs, and was checked against a double-backward implementation of the toy formula (maximum error 1e-7). It costs no measurable step time.</p>
-<p><b>The problem is scale, not compute.</b> The correction grows as α·‖x‖²·g². The router input satisfies ‖x‖² ≈ hidden size (1,024), compared with about 1 in the toy, so toy-sized α values are roughly 1,000× too strong. In 300-step calibration runs α = 1e-2 diverged by step 22 and 1e-3 by step ~260. α = 3e-4 was stable over 300 steps with the correction at ~10% of the task gradient, but it was already 0.8 nats worse than the baseline at step 200. In full runs α = 1e-4 still diverged in both seeds. Just before the NaN the correction was only ~2–3% of the task gradient, while the global gradient norm had sat 3–5× above the other arms for hundreds of steps and then spiked to ~5·10⁶. The shaped dynamics are unstable as a whole; the failure is not a single oversized correction.</p>
-<p id="lola-capped">CAPPED_TEXT</p>
+<p>LOLA is scaled from the toy <span class="mono">apply_router_router_lola_shaping</span> (<span class="mono">lola_learner="all"</span>): every selected router row is corrected to anticipate the naive gradient step of the token's other selected rows. At this scale the correction has a closed form and needs no second backward pass. It treats the loss as linear in each MoE layer's output, as the toy detaches expert outputs, and matches a double-backward of that formula to 1e-8. It costs no measurable step time. One approximation remains relative to the toy: on the toy's own MSE loss, dropping the curvature above the layer gives a correction with cosine 0.56 to the full one.</p>
+<p><b>First runs (invalid):</b> the correction was returned as a gradient on the router logits, so it also flowed through the router input into the whole backbone, at 1.1–1.5× the task gradient in layer 0. Those runs diverged to NaN (α = 1e-2 by step 22, α = 1e-3 by ~260, α = 1e-4 at 591 / ~495), and a capped variant ended at ppl 11.9. None of that reflects opponent shaping.</p>
+<p><b>Fixed runs:</b> the correction now acts on the router weight only (patch 0012). A 300-step calibration was stable at α = 1e-4, 1e-3 and 1e-2 (correction ≈ 1.5%, 12% and 100–130% of the task gradient). α = 1e-4 barely changed anything (val loss 3.988 vs 3.987 for the baseline at step 300), so the full runs use α = 1e-3 and 1e-2. Both train stably to the end. The router's correction stays near 0.26× and 3× the task gradient, and with α = 1e-2 the global gradient norm exceeds the clipping threshold, which also slows every other parameter.</p>
+<table class="num" style="width:auto"><thead><tr><th>α</th><th>Val ppl</th><th>Δ loss vs baseline</th><th>MaxVio<sub>global</sub></th><th>Dead experts</th><th>Domain NMI</th><th>Router entropy</th></tr></thead>
+<tbody><tr><td>baseline</td><td>8.41 / 8.42</td><td>–</td><td>4.47</td><td>124</td><td>0.086</td><td>3.14</td></tr>
+<tr><td>1e-3</td><td>9.19 / 9.03</td><td>+0.088 / +0.070</td><td>3.10</td><td>0</td><td>0.037</td><td>4.08</td></tr>
+<tr><td>1e-2</td><td>9.43 / 9.71</td><td>+0.114 / +0.142</td><td>2.35</td><td>0</td><td>0.019</td><td>4.11</td></tr></tbody></table>
+<p><b>Reading:</b> router-router LOLA pushes each token's routing distribution toward uniform (entropy 4.08–4.11 of a maximum 4.16). That prevents dead experts but erases specialization, and the model is worse than with a frozen random router. At this scale it acts as a strong entropy regularizer rather than a coordination mechanism. Smaller α than 1e-3 did not change the model measurably, so no α tested gives a benefit.</p>
 </div>
 """
 
@@ -49,7 +54,7 @@ SETUP = [
     ("Arms", "Baseline: no load balancing (aux coefficient 0). Aux-loss: Switch-style loss, coefficient 0.01. Aux-free: DeepSeek-V3 expert bias, update rate 1e-3 (Megatron requires a sigmoid router for this, hence the sigmoid-no-LB control). Bilevel: repeating 50-step cycle of 10 router-only then 40 expert-only steps (non-MoE weights train every step). Bandit: REINFORCE with ε-greedy exploration (0.1→0.01) and a learned critic baseline, with the task gradient to the router blocked (pure) or kept (hybrid); settings reused from the earlier bandit study. Frozen: router LR 0."),
     ("Metrics", "MaxVio<sub>batch</sub> every step and MaxVio<sub>global</sub> on validation (Wang et al., 2024), both from the routing the router actually chose, including expert bias and bandit exploration. OLMoE specialization metrics after training on a 5-domain × 0.5M-token held-out set, with saturation snapshots every 250 steps. Validation perplexity on 10.5M held-out tokens."),
     ("Deviations", "<b>Dropless instead of capacity 1.0:</b> in smoke tests with capacity 1.0, every arm without load balancing dropped 80–86% of expert assignments, so the comparison would have measured token dropping rather than routing. <b>LR 1e-3</b> instead of the earlier studies' 2e-3, which was tuned on a 512-wide model. <b>~3h per run</b> instead of ~2h: 1,500 steps ran at 6–9 s each. <b>fp32 optimizer state</b> instead of the precision-aware optimizer, because resuming the latter from a checkpoint fails in Transformer Engine; an A/B run showed no speed difference."),
-    ("Caveats", "Two seeds per arm (one for the frozen control), so differences under ~0.01 nats are not resolved. One training budget and one model size. Most arm hyper-parameters are defaults, not tuned (aux coefficient, bias rate, bilevel ratio, bandit settings), with LOLA's α calibrated only for stability. Several runs were preempted and resumed from checkpoints (resume reproduces the loss bit-for-bit); <span class=\"mono\">cmp-noLB-s43</span> was moved to another node at step 250 because the first node had slowed."),
+    ("Caveats", "Two seeds per arm, so differences under ~0.01 nats are not resolved. One training budget and one model size. Most arm hyper-parameters are defaults, not tuned (aux coefficient, bias rate, bilevel ratio, bandit settings); LOLA's α was calibrated for stability only. The bandit, frozen and LOLA arms were re-run on the fixed code (Megatron snapshot <span class=\"mono\">9b0baedd29a6</span>, patches 0010–0012); all other arms ran on the original code, whose paths the fixes do not touch, and were verified by the audit. Several runs were preempted and resumed from checkpoints; resume reproduces the uninterrupted run exactly."),
 ]
 
 
@@ -78,12 +83,17 @@ WHY = [
      "verdict": "supported",
      "test": "Re-ran bandit + task gradient logging the cosine between the REINFORCE gradient and the task gradient on the router logits every 25 steps.",
      "prediction": "The cosine stays near zero.",
-     "result": "0.02–0.03 for the whole run: above the ~0.001 expected for unrelated directions of this size, so there is some signal, but almost all of each REINFORCE update is orthogonal to the task gradient. A router trained on that alone (the pure bandit arm) learns little."},
+     "result": "0.02–0.03 for the whole run: above the ~0.001 expected for unrelated directions of this size, so there is some signal, but almost all of each REINFORCE update is orthogonal to the task gradient. A router trained on that alone learns little: after the leak fix, pure bandit still ends at ppl 10.64 / 10.65, +0.235 nats in both seeds, while a frozen random router loses only 0.02."},
     {"claim": "Bandit + task gradient loses because ε-exploration perturbs the forward pass, not because of the REINFORCE term",
      "verdict": "refuted",
      "test": "Bandit + task gradient with exploration switched off (otherwise identical).",
      "prediction": "Matches the no-LB baseline (ppl ≈ 8.42) instead of 8.79–8.83.",
-     "result": "The opposite: without exploration the arm ends at ppl 8.97, worse than both the arm with exploration (8.77–8.83) and the baseline (8.42). Exploration seems to <i>help</i> this arm by sending some tokens to experts that would otherwise die. The critic is ruled out too, since its input is detached from the hidden state. COEFF0_TEXT"},
+     "result": "The opposite: without exploration the arm ended at ppl 8.97, worse than with exploration (8.77–8.83). With the REINFORCE coefficient at 0 (exploration and critic unchanged) it ended at 8.44, against 8.41 for the baseline, so the cost came from the REINFORCE term. The audit then found why: that term leaked through the router input into the whole backbone. With the leak fixed, bandit + task gradient ends at 8.45 / 8.56, within seed noise of the baseline. (These three diagnostic runs used the leaking code; the fixed arm itself is in the main results.)"},
+    {"claim": "LOLA hurts because it flattens each token's routing distribution",
+     "verdict": "supported",
+     "test": "Router entropy (mean per-token entropy of the router's softmax, logged every step) in the fixed LOLA runs against the other arms.",
+     "prediction": "LOLA's entropy is close to uniform over 64 experts (4.16) and above the other arms'.",
+     "result": "Last-50-step router entropy: LOLA 4.08 (α = 1e-3) and 4.11 (α = 1e-2), against 3.14 for the baseline, 3.44–3.46 for aux-free and aux-loss, and 3.68 even for a frozen random router. This matches the rest of the LOLA profile: no dead experts, the lowest domain NMI (0.037 / 0.019) and vocabulary specialization (0.31 / 0.26) of any method, and worse perplexity as α grows (+0.07–0.09 and +0.11–0.14 nats). Each selected row being pushed to anticipate the others' updates acts like a strong entropy regularizer on the router."},
     {"claim": "Balancing buys no perplexity only because the ~36 live experts per layer suffice at 1.57B tokens",
      "verdict": "refuted",
      "test": "Baseline and aux-loss (0.01) retrained for 3,000 steps (3.1B tokens), one seed each.",
