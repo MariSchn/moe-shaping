@@ -21,6 +21,7 @@
 #                                   In alternating mode these are the optional per-phase
 #                                   LRs (default --lr for both).
 #   Schedule/eval: LR EVAL_INTERVAL EVAL_ITERS LR_WARMUP_ITERS TIME SEED
+#   Data: DATA_PATH (Megatron --data-path, a prefix or a weighted blend; default ClimbMix)
 #   Cluster: SBATCH_ACCOUNT PARTITION (empty = cluster default, e.g. PARTITION=debug)
 #            SUBMIT=0 generates logs/<JOB_NAME>.sbatch without queueing it
 #   W&B: RUN_NAME (run/TB name)  |  MoE LB: LB_TYPE (aux_loss|...|none) AUX_LOSS_COEFF
@@ -99,6 +100,7 @@ EVAL_ITERS=${EVAL_ITERS:-10}
 LR_WARMUP_ITERS=${LR_WARMUP_ITERS:-$(( STEPS / 10 ))}
 [ "$LR_WARMUP_ITERS" -ge "$STEPS" ] && LR_WARMUP_ITERS=$(( STEPS / 2 ))
 TIME=${TIME:-01:00:00}
+DATA_PATH=${DATA_PATH:-/capstor/store/cscs/swissai/infra01/datasets/nvidia/Nemotron-ClimbMix/climbmix_small_megatron/climbmix_small}
 DOMAIN_EVAL_DIR=${DOMAIN_EVAL_DIR:-/iopsstor/scratch/cscs/$USER/moe-shaping/domain_eval}
 SAVE_FINAL_WEIGHTS=${SAVE_FINAL_WEIGHTS:-1}
 CKPT_INTERVAL=${CKPT_INTERVAL:-0}
@@ -383,7 +385,7 @@ WORKDIR=${WORKDIR}
 # Immutable, already-patched copy of Megatron-LM (see the snapshot block in
 # launch.sh). Jobs never modify it, so overlapping runs cannot clobber it.
 MEGATRON_LM_DIR=${MEGATRON_SNAPSHOT}
-DATA_PREFIX=/capstor/store/cscs/swissai/infra01/datasets/nvidia/Nemotron-ClimbMix/climbmix_small_megatron/climbmix_small
+DATA_PREFIX="${DATA_PATH}"
 # Megatron keys its dataset index cache by (num_samples, seed), so concurrently
 # starting jobs that share a (STEPS, SEED) race on the half-written .npy and die
 # with "UnpicklingError: invalid load key". Rebuilding the index costs ~6 s, so
