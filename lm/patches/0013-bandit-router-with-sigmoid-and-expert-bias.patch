@@ -1,0 +1,71 @@
+# Patch: Let the bandit router run with sigmoid scoring and the aux-loss-free expert bias
+#
+# bandit_routing() implemented only softmax scoring and refused --moe-router-enable-expert-bias,
+# so the bandit could not be combined with DeepSeek-V3 aux-loss-free load balancing. With
+# sigmoid scoring the selection now mirrors topk_routing_with_score_function: top-k over
+# sigmoid(logits) + expert_bias (epsilon exploration perturbs these selection scores), and the
+# gate is sigmoid(selected logits) normalized over the top-k. The expert bias update is
+# unchanged, since routing() calls _apply_expert_bias() on the bandit's routing map as on any
+# other. The REINFORCE policy is still log_softmax(router logits) with the selected set's
+# log-probability, so the bandit learning signal is identical to the softmax bandit arms.
+# Gumbel exploration samples from softmax(logits / tau) and stays softmax-only.
+#
+# Verified on CPU (audit/tests/test_bandit_sigmoid_bias.py): at coeff 0 and no exploration the
+# bandit path gives the same routing map, probs and router gradients as Megatron's sigmoid +
+# expert_bias routing.
+#
+# How to find the right location in a future Megatron version:
+#   router.py: the bandit asserts in TopKRouter.__init__ and TopKRouter.bandit_routing.
+#
+# Applied to: Megatron-LM core_v0.16.1 (commit 55ac7082), on top of patches 0001-0012.
+#
+diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
+index b37ea222e..e510576a1 100644
+--- a/megatron/core/transformer/moe/router.py
++++ b/megatron/core/transformer/moe/router.py
+@@ -223,14 +223,15 @@ class TopKRouter(Router):
+             assert self.config.moe_router_topk_scaling_factor is None
+         bandit_cfg = bandit.get_config()
+         if bandit_cfg.enabled:
+-            assert self.score_function == "softmax", (
+-                "--bandit-router implements softmax scoring only, got "
++            assert self.score_function in ("softmax", "sigmoid"), (
++                "--bandit-router implements softmax and sigmoid scoring only, got "
+                 f"--moe-router-score-function {self.score_function}"
+             )
+-            assert not self.enable_expert_bias, (
+-                "--bandit-router is incompatible with --moe-router-enable-expert-bias "
+-                "(which requires sigmoid scoring)"
++            assert self.score_function == "softmax" or bandit_cfg.explore != "gumbel", (
++                "--bandit-explore gumbel samples from softmax(logits / tau) and needs softmax scoring"
+             )
++            assert self.score_function == "softmax" or not self.config.moe_router_pre_softmax
++            assert self.config.moe_router_topk_scaling_factor is None
+             # Token dropping is allowed. routing() applies it after this branch has
+             # already recorded the action, so for a dropped token the recorded
+             # log-probability is of the expert it was routed to rather than of the
+@@ -683,6 +684,10 @@ class TopKRouter(Router):
+ 
+         with torch.no_grad():
+             selection_scores = scores.detach()
++            if self.score_function == "sigmoid":
++                selection_scores = torch.sigmoid(selection_scores)
++            if self.expert_bias is not None:
++                selection_scores = selection_scores + self.expert_bias
+             if cfg.explore == "gumbel":
+                 # Gumbel-top-k: sampling the k experts without replacement from
+                 # softmax(logits / tau). tau -> 0 recovers greedy selection.
+@@ -712,7 +717,12 @@ class TopKRouter(Router):
+             mixing_logits = bandit.BlockTaskGradient.apply(logits)
+         if probing:
+             bandit.capture_task_gradient(self.layer_number, mixing_logits)
+-        if self.config.moe_router_pre_softmax:
++        if self.score_function == "sigmoid":
++            top_scores = torch.sigmoid(torch.gather(mixing_logits, dim=1, index=top_indices).float())
++            if self.topk > 1:
++                top_scores = top_scores / (top_scores.sum(dim=-1, keepdim=True) + 1e-20)
++            top_probs = top_scores.type_as(logits)
++        elif self.config.moe_router_pre_softmax:
+             # Softmax over all experts first, then select: the gate is the selected
+             # expert's actual probability. Megatron requires this at topk 1, where a
+             # softmax over the single selected logit would be identically 1.0.

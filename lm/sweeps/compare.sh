@@ -48,6 +48,7 @@ arm_assignments() {
         auxfree-*)     echo "AUX_LOSS_COEFF=0 EXPERT_BIAS=1 BIAS_UPDATE_RATE=${1#auxfree-}" ;;
         bilevel-*x*)   spec=${1#bilevel-}
                        echo "AUX_LOSS_COEFF=0 BILEVEL=1 BILEVEL_ROUTER_STEPS=${spec%x*} BILEVEL_EXPERT_STEPS=${spec#*x}" ;;
+        bandit-hybrid-auxfree-*) echo "AUX_LOSS_COEFF=0 EXPERT_BIAS=1 $BANDIT_KNOBS BANDIT_KEEP_TASK_GRAD=1 BANDIT_COEFF=${1#bandit-hybrid-auxfree-}" ;;
         bandit-hybrid-noexplore) echo "AUX_LOSS_COEFF=0 $BANDIT_KNOBS BANDIT_KEEP_TASK_GRAD=1 BANDIT_EXPLORE=none" ;;
         bandit-hybrid-coeff0) echo "AUX_LOSS_COEFF=0 $BANDIT_KNOBS BANDIT_KEEP_TASK_GRAD=1 BANDIT_COEFF=0" ;;
         bandit-hybrid-align) echo "AUX_LOSS_COEFF=0 $BANDIT_KNOBS BANDIT_KEEP_TASK_GRAD=1 BANDIT_GRAD_ALIGN_INTERVAL=25" ;;
