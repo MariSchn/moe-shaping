@@ -17,6 +17,7 @@ from utils import (
     apply_router_router_lola_shaping,
     calculate_last_layer_regret,
     calculate_load_balancing_loss,
+    calculate_max_vio,
     calculate_per_expert_loss,
     expert_load_metrics,
     gating_gradient_norm,
@@ -402,6 +403,9 @@ def main() -> None:
                     "bandit/last_layer_regret_gating": cumulative_regret_gating,
                     "bandit/last_layer_regret_optimal": cumulative_regret_optimal,
                     "expert_imbalance": load_balancing_loss.item(),
+                    "max_vio": calculate_max_vio(
+                        output["selected_experts"], model.num_experts
+                    ),
                     **expert_load_metrics(
                         output["selected_experts"], model.num_experts
                     ),

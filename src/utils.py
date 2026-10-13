@@ -105,6 +105,15 @@ def calculate_expert_load(
     return expert_counts / B
 
 
+def calculate_max_vio(
+    selected_experts: torch.Tensor,
+    num_experts: int,
+) -> float:
+    """MaxVio (Wang et al., 2024): (max_i load_i - mean load) / mean load."""
+    load = calculate_expert_load(selected_experts, num_experts)
+    return ((load.max() - load.mean()) / load.mean()).item()
+
+
 def expert_load_metrics(
     selected_experts: torch.Tensor,
     num_experts: int,
