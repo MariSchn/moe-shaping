@@ -10,6 +10,8 @@ target:
     output_dim: 1
     router_top_k: 2
     router_activation: softmax
+    expert_hidden_dim: null
+    expert_num_layers: 1
     initial_expert_weights:
       - [[0.0]]
       - [[0.3]]
@@ -37,6 +39,8 @@ model:
   output_dim: 1
   router_top_k: 2
   router_activation: softmax
+  expert_hidden_dim: null
+  expert_num_layers: 1
   freeze_router: false
   freeze_experts: false
 
@@ -45,7 +49,7 @@ training:
   batch_size: 128
   learning_rate: 1e-2
   # One of: SGD, Adam, AdamW
-  optimizer: Adam  
+  optimizer: Adam
   # Controls the weight of the Switch Transformer-style load balancing loss (1e-2 default from paper).
   load_balancing_loss_weight: 0.0
   # DeepSeek V3 auxiliary loss-free load balancing gamma, controlling how much is added/subtracted to under/over-utilized experts (1e-3 default from paper)
@@ -61,6 +65,11 @@ training:
   # Which selected expert(s) act as LOLA learners for expert-expert shaping:
   # "top1" / "bottom1" / "all".
   expert_expert_lola_learner: all
+  bilevel:
+    router_steps: 0
+    router_lr: null
+    expert_steps: 0
+    expert_lr: null
 
 
 
