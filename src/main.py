@@ -8,12 +8,11 @@ from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 import wandb
+from methods.bilevel import BilevelOptimizer, build_bilevel_optimizer
+from methods.lola import LOLA
 from models import Model
 from targets import ModelTarget, PiecewiseLinearTarget
 from utils import (
-    BilevelOptimizer,
-    apply_expert_expert_lola_shaping,
-    apply_router_router_lola_shaping,
     calculate_last_layer_regret,
     calculate_load_balancing_loss,
     calculate_max_vio,
@@ -22,7 +21,6 @@ from utils import (
     gating_gradient_norm,
     get_device,
     per_expert_gradient_norm,
-    per_expert_lola_regular_cosine_similarity,
     sample_uniformly,
     set_seed,
 )
@@ -149,40 +147,15 @@ def main() -> None:
     optimizer_type = training_cfg.get("optimizer", "SGD")
     optimizer_cls = getattr(torch.optim, optimizer_type)
 
-    bilevel_cfg = training_cfg.get("bilevel", None)
-    bilevel_router_steps = bilevel_cfg.router_steps if bilevel_cfg is not None else 0
-    bilevel_expert_steps = bilevel_cfg.expert_steps if bilevel_cfg is not None else 0
-    bilevel_router_lr = (
-        bilevel_cfg.get("router_lr") if bilevel_cfg is not None else None
+    optimizer = build_bilevel_optimizer(
+        model, optimizer_cls, training_cfg.learning_rate, training_cfg.bilevel
     )
-    bilevel_expert_lr = (
-        bilevel_cfg.get("expert_lr") if bilevel_cfg is not None else None
-    )
-
-    use_bilevel = (
-        bilevel_router_steps > 0
-        or bilevel_expert_steps > 0
-        or bilevel_router_lr is not None
-        or bilevel_expert_lr is not None
-    )
-    if use_bilevel:
-        router_lr = bilevel_router_lr or training_cfg.learning_rate
-        expert_lr = bilevel_expert_lr or training_cfg.learning_rate
-        router_opt = optimizer_cls(
-            [p for p in model.gating_function.parameters() if p.requires_grad],
-            lr=router_lr,
-        )
-        expert_opt = optimizer_cls(
-            [p for p in model.experts.parameters() if p.requires_grad],
-            lr=expert_lr,
-        )
-        optimizer = BilevelOptimizer(
-            router_opt, expert_opt, bilevel_router_steps, bilevel_expert_steps
-        )
-    else:
+    if optimizer is None:
         trainable_params = filter(lambda p: p.requires_grad, model.parameters())
         optimizer = optimizer_cls(trainable_params, lr=training_cfg.learning_rate)
     loss_fn = nn.MSELoss()
+
+    lola = LOLA(**training_cfg.lola)
 
     viz_frames = []
 
@@ -281,31 +254,8 @@ def main() -> None:
             loss += training_cfg.load_balancing_loss_weight * load_balancing_loss
 
         optimizer.zero_grad()
-
-        # Router-Router LOLA shaping
-        lola_alpha = training_cfg.get("router_router_lola_weight", 0.0)
-        router_router_lola_learner = training_cfg.get(
-            "router_router_lola_learner", "all"
-        )
-        lola_corrections = apply_router_router_lola_shaping(
-            model, output, y, lola_alpha, x, lola_learner=router_router_lola_learner
-        )
-
-        # Expert-Expert LOLA shaping
-        expert_lola_alpha = training_cfg.get("expert_expert_lola_weight", 0.0)
-        expert_expert_lola_learner = training_cfg.get(
-            "expert_expert_lola_learner", "all"
-        )
-        expert_lola_corrections = apply_expert_expert_lola_shaping(
-            model,
-            output,
-            y,
-            expert_lola_alpha,
-            x,
-            lola_learner=expert_expert_lola_learner,
-        )
-
-        loss.backward(retain_graph=(lola_alpha != 0 or expert_lola_alpha != 0))
+        loss.backward()
+        lola.shape_gradients(model, output, x, y)
 
         # ===== LOGGING =====
         per_expert_grad_norms = per_expert_gradient_norm(model)
@@ -328,55 +278,6 @@ def main() -> None:
             cumulative_regret_gating += regret_gating
             cumulative_regret_optimal += regret_optimal
 
-            total_grad_norm = gating_gradient_norm(model)
-            if lola_corrections is not None:
-                w_corr, b_corr = lola_corrections
-                regular_w_grad = model.gating_function.weight.grad - w_corr
-                regular_b_grad = model.gating_function.bias.grad - b_corr
-                lola_norm = (w_corr.pow(2).sum() + b_corr.pow(2).sum()).sqrt().item()
-                regular_norm = (
-                    (regular_w_grad.pow(2).sum() + regular_b_grad.pow(2).sum())
-                    .sqrt()
-                    .item()
-                )
-                cos_w, cos_b = per_expert_lola_regular_cosine_similarity(
-                    w_corr, b_corr, regular_w_grad, regular_b_grad
-                )
-            else:
-                lola_norm = 0.0
-                regular_norm = total_grad_norm
-                cos_w = float("nan")
-                cos_b = float("nan")
-
-            # Expert-side LOLA decomposition.
-            expert_total_norm = sum(n * n for n in per_expert_grad_norms) ** 0.5
-            if expert_lola_corrections is not None:
-                ew_corr, eb_corr = expert_lola_corrections
-                experts_w_grad = torch.stack(
-                    [e.weight.grad for e in model.experts], dim=0
-                )
-                experts_b_grad = torch.stack(
-                    [e.bias.grad for e in model.experts], dim=0
-                )
-                regular_ew_grad = experts_w_grad - ew_corr
-                regular_eb_grad = experts_b_grad - eb_corr
-                expert_lola_norm = (
-                    (ew_corr.pow(2).sum() + eb_corr.pow(2).sum()).sqrt().item()
-                )
-                expert_regular_norm = (
-                    (regular_ew_grad.pow(2).sum() + regular_eb_grad.pow(2).sum())
-                    .sqrt()
-                    .item()
-                )
-                expert_cos_w, expert_cos_b = per_expert_lola_regular_cosine_similarity(
-                    ew_corr, eb_corr, regular_ew_grad, regular_eb_grad
-                )
-            else:
-                expert_lola_norm = 0.0
-                expert_regular_norm = expert_total_norm
-                expert_cos_w = float("nan")
-                expert_cos_b = float("nan")
-
             wandb.log(
                 {
                     "loss": loss.item(),
@@ -389,20 +290,14 @@ def main() -> None:
                     **expert_load_metrics(
                         output["selected_experts"], model.num_experts
                     ),
-                    "gating_grad_norm": total_grad_norm,
-                    "expert_grad_norm": expert_total_norm,
-                    "lola/gating_grad_norm_lola": lola_norm,
-                    "lola/gating_grad_norm_regular": regular_norm,
-                    "lola/lola_regular_cos_sim_weight": cos_w,
-                    "lola/lola_regular_cos_sim_bias": cos_b,
-                    "lola/expert_grad_norm_lola": expert_lola_norm,
-                    "lola/expert_grad_norm_regular": expert_regular_norm,
-                    "lola/expert_lola_regular_cos_sim_weight": expert_cos_w,
-                    "lola/expert_lola_regular_cos_sim_bias": expert_cos_b,
-                    "bilevel/phase": (
-                        int(not optimizer.in_router_phase)
+                    "gating_grad_norm": gating_gradient_norm(model),
+                    "expert_grad_norm": sum(n * n for n in per_expert_grad_norms)
+                    ** 0.5,
+                    **lola.metrics(model),
+                    **(
+                        optimizer.metrics()
                         if isinstance(optimizer, BilevelOptimizer)
-                        else -1
+                        else {}
                     ),
                 }
             )

@@ -54,17 +54,21 @@ training:
   load_balancing_loss_weight: 0.0
   # DeepSeek V3 auxiliary loss-free load balancing gamma, controlling how much is added/subtracted to under/over-utilized experts (1e-3 default from paper)
   auxiliarly_loss_free_load_balancing_gamma: 0.0
-  # Router-Router LOLA shaping weight.
-  router_router_lola_weight: 0.0
-  # Which selected expert(s) act as LOLA learners (shaped to anticipate the
-  # naive learners' update): "top1" / "bottom1" pick one per sample; "all"
-  # makes every selected expert a LOLA learner shaping the others.
-  router_router_lola_learner: all
-  # Expert-Expert LOLA shaping weight.
-  expert_expert_lola_weight: 0.0
-  # Which selected expert(s) act as LOLA learners for expert-expert shaping:
-  # "top1" / "bottom1" / "all".
-  expert_expert_lola_learner: all
+  # LOLA shaping. Each direction is off while its weight is 0.
+  lola:
+    # Router-Router LOLA shaping weight.
+    router_router_weight: 0.0
+    # Which selected expert(s) act as LOLA learners (shaped to anticipate the
+    # naive learners' update): "top1" / "bottom1" pick one per sample; "all"
+    # makes every selected expert a LOLA learner shaping the others; "fixed:N"
+    # pins expert N as the sole LOLA learner (samples where N isn't selected
+    # contribute zero correction).
+    router_router_learner: all
+    # Expert-Expert LOLA shaping weight.
+    expert_expert_weight: 0.0
+    # Which selected expert(s) act as LOLA learners for expert-expert shaping:
+    # "top1" / "bottom1" / "all" / "fixed:N".
+    expert_expert_learner: all
   bilevel:
     router_steps: 0
     router_lr: null
