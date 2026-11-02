@@ -295,7 +295,7 @@ def per_expert_gradient_norm(model: nn.Module) -> list[float]:
 def gating_gradient_norm(model: nn.Module) -> float:
     """L2 norm of the router / gating Linear's parameter gradients."""
     sum_sq = 0.0
-    for p in model.gating_function.parameters():
+    for p in model.router.parameters():
         if p.grad is not None:
             sum_sq += float(p.grad.detach().pow(2).sum().item())
     return sum_sq**0.5

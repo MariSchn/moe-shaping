@@ -123,10 +123,10 @@ def router_visualization(
     device = model_device(model)
     x = torch.linspace(domain[0], domain[1], num_points, device=device).unsqueeze(-1)
 
-    slopes = model.gating_function.weight.detach()
-    intercepts = model.gating_function.bias.detach()
+    slopes = model.router.linear.weight.detach()
+    intercepts = model.router.linear.bias.detach()
 
-    routing_biases = model.routing_biases.detach()
+    routing_biases = model.router.routing_biases.detach()
 
     fig, ax = plt.subplots()
 
@@ -246,9 +246,9 @@ def target_router_visualization(
     device = model_device(model)
     x = torch.linspace(domain[0], domain[1], num_points, device=device).unsqueeze(-1)
 
-    slopes = model.gating_function.weight.detach()
-    intercepts = model.gating_function.bias.detach()
-    routing_biases = model.routing_biases.detach()
+    slopes = model.router.linear.weight.detach()
+    intercepts = model.router.linear.bias.detach()
+    routing_biases = model.router.routing_biases.detach()
 
     fig, ax = plt.subplots()
     for i in range(model.num_experts):
@@ -307,7 +307,7 @@ def per_expert_sample_count_visualization(
 
 
 def routing_bias_visualization(model: nn.Module) -> dict:
-    biases = model.routing_biases.detach().cpu().numpy()
+    biases = model.router.routing_biases.detach().cpu().numpy()
     num_experts = len(biases)
     expert_indices = np.arange(num_experts)
 

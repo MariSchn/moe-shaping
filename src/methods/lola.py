@@ -118,7 +118,7 @@ def apply_router_router_lola_shaping(
     controlled by `lola_learner` — see below.
 
     Args:
-        model: A `Model` instance with a `.gating_function` Linear.
+        model: A `Model` instance with a `LinearRouter`.
         output: The dict returned by `Model.forward` for the current batch.
             Must contain `gating_scores`, `expert_outputs`, `selected_experts`.
         targets: (B, output_dim) regression targets for the current batch.
@@ -156,9 +156,9 @@ def apply_router_router_lola_shaping(
     )  # (B, K) — K=1 for top1/bottom1, K=top_k for "all"
 
     # Extract the gating function
-    gating_w = model.gating_function.weight  # (E, input_dim)
-    gating_bias = model.gating_function.bias  # (E,)
-    router_activation = model.router_activation
+    gating_w = model.router.linear.weight  # (E, input_dim)
+    gating_bias = model.router.linear.bias  # (E,)
+    router_activation = model.router.activation
 
     # Pure per-sample loss as a function of gating params only.
     # Routing is treated as fixed based on the input selected experts.
@@ -272,7 +272,7 @@ def apply_expert_expert_lola_shaping(
 
     Args:
         model: A `Model` instance with `model.experts` an `nn.ModuleList` of
-            `nn.Linear` and `model.router_activation` set.
+            `nn.Linear` and `model.router.activation` set.
         output: The dict returned by `Model.forward` for the current batch.
             Must contain `gating_scores` and `selected_experts`.
         targets: (B, output_dim) regression targets for the current batch.
@@ -296,7 +296,7 @@ def apply_expert_expert_lola_shaping(
         return None
 
     gating_scores = output["gating_scores"]  # (B, num_experts)
-    router_activation = model.router_activation
+    router_activation = model.router.activation
 
     # Gating probabilities over the selected experts.
     # Detached, since for the expert-shaping loss the gates are treated as fixed.
@@ -503,14 +503,14 @@ def apply_router_expert_lola_shaping(
         return None  # off-diagonal pairing needs at least two selected experts
 
     gating_scores = output["gating_scores"]
-    router_activation = model.router_activation
+    router_activation = model.router.activation
 
     naive_indices = _lola_naive_indices(
         gating_scores, selected, lola_learner
     )  # (B, K) — which expert plays the naive role per sample
 
-    gating_w = model.gating_function.weight  # (E, input_dim)
-    gating_bias = model.gating_function.bias  # (E,)
+    gating_w = model.router.linear.weight  # (E, input_dim)
+    gating_bias = model.router.linear.bias  # (E,)
     experts_w = torch.stack(
         [e.weight for e in model.experts], dim=0
     )  # (E, output_dim, input_dim)
@@ -674,14 +674,14 @@ def apply_expert_router_lola_shaping(
         return None
 
     gating_scores = output["gating_scores"]
-    router_activation = model.router_activation
+    router_activation = model.router.activation
 
     naive_indices = _lola_naive_indices(
         gating_scores, selected, lola_learner
     )  # (B, K) — which expert plays the naive role per sample
 
-    gating_w = model.gating_function.weight
-    gating_bias = model.gating_function.bias
+    gating_w = model.router.linear.weight
+    gating_bias = model.router.linear.bias
     experts_w = torch.stack([e.weight for e in model.experts], dim=0)
     experts_b = torch.stack([e.bias for e in model.experts], dim=0)
     num_experts = gating_w.shape[0]
@@ -888,8 +888,8 @@ class LOLA:
 
         if self._router_corrections is not None:
             w_corr, b_corr = self._router_corrections
-            regular_w_grad = model.gating_function.weight.grad - w_corr
-            regular_b_grad = model.gating_function.bias.grad - b_corr
+            regular_w_grad = model.router.linear.weight.grad - w_corr
+            regular_b_grad = model.router.linear.bias.grad - b_corr
             lola_norm = (w_corr.pow(2).sum() + b_corr.pow(2).sum()).sqrt().item()
             regular_norm = (
                 (regular_w_grad.pow(2).sum() + regular_b_grad.pow(2).sum())

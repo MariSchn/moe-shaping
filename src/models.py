@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 from typing import Tuple
 
+from router import LinearRouter
+
 
 class Expert(nn.Module):
     """A single expert mapping ``input_dim -> output_dim``.
@@ -53,8 +55,6 @@ class Expert(nn.Module):
 
     @property
     def weight(self) -> torch.Tensor:
-        # Exposed for backward compatibility (e.g. LoLA shaping), which assumes a
-        # single linear expert. Only well-defined for single-layer experts.
         if not self.is_linear:
             raise AttributeError(
                 "Expert.weight is only defined for single-layer (num_layers=1) experts"
@@ -90,16 +90,9 @@ class Model(nn.Module):
     ):
         super().__init__()
 
-        if router_activation not in ("softmax", "sigmoid"):
-            raise ValueError(
-                f"router_activation must be 'softmax' or 'sigmoid', got {router_activation!r}"
-            )
-
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.num_experts = num_experts
-        self.router_top_k = router_top_k
-        self.router_activation = router_activation
 
         self.expert_hidden_dim = expert_hidden_dim
         self.expert_num_layers = expert_num_layers
@@ -115,25 +108,22 @@ class Model(nn.Module):
                 for _ in range(num_experts)
             ]
         )
-        self.gating_function = nn.Linear(input_dim, num_experts, bias=True)
-
-        # Auxiliary loss-free load balancing (ignored if cfg.training.load_balancing_loss_weight < 0)
-        self.register_buffer("routing_biases", torch.zeros(num_experts))
+        self.router = LinearRouter(
+            input_dim,
+            num_experts,
+            router_top_k,
+            router_activation,
+            initial_weights=initial_gating_weights,
+            initial_biases=initial_gating_biases,
+        )
 
         # Insert hard-coded weights and biases if provided
-        self.set_initial_weights(
-            initial_expert_weights,
-            initial_expert_biases,
-            initial_gating_weights,
-            initial_gating_biases,
-        )
+        self.set_initial_weights(initial_expert_weights, initial_expert_biases)
 
     def set_initial_weights(
         self,
         initial_expert_weights: list[list[float]],
         initial_expert_biases: list[list[float]],
-        initial_gating_weights: list[list[float]],
-        initial_gating_biases: list[float],
     ):
         if initial_expert_weights is not None:
             assert len(initial_expert_weights) == self.num_experts, (
@@ -151,53 +141,6 @@ class Model(nn.Module):
                 self.experts[i].bias.data = torch.tensor(
                     initial_expert_biases[i], dtype=torch.float32
                 )
-        if initial_gating_weights is not None:
-            assert len(initial_gating_weights) == self.num_experts, (
-                f"Initial gating weights must have {self.num_experts} elements, got {len(initial_gating_weights)}"
-            )
-            self.gating_function.weight.data = torch.tensor(
-                initial_gating_weights, dtype=torch.float32
-            )
-        if initial_gating_biases is not None:
-            assert len(initial_gating_biases) == self.num_experts, (
-                f"Initial gating biases must have {self.num_experts} elements, got {len(initial_gating_biases)}"
-            )
-            self.gating_function.bias.data = torch.tensor(
-                initial_gating_biases, dtype=torch.float32
-            )
-
-    def update_routing_biases(
-        self,
-        selected_experts: torch.Tensor,
-        gamma: float = 1e-3,
-        target_load: float | None = None,
-    ):
-        if gamma <= 0:
-            return
-
-        B, _ = selected_experts.shape
-
-        # Use uniform load as default target load
-        target_load = target_load or self.router_top_k / self.num_experts
-
-        # Calculate the mean load of each expert
-        expert_counts = torch.zeros(self.num_experts, device=selected_experts.device)
-        expert_counts.scatter_add_(
-            0,
-            selected_experts.flatten(),
-            torch.ones(selected_experts.numel(), device=selected_experts.device),
-        )
-        expert_loads = expert_counts / B
-
-        # Calculate the difference between the expert load and the target load
-        load_differences = expert_loads - target_load
-
-        bias_updates = torch.zeros(self.num_experts, device=selected_experts.device)
-        bias_updates[load_differences < 0] = gamma
-        bias_updates[load_differences > 0] = -gamma
-
-        # Update the routing biases
-        self.routing_biases += bias_updates
 
     def _compute_expert_outputs(self, x: torch.Tensor) -> torch.Tensor:
         """Run all experts on ``x`` in a single batched pass.
@@ -232,12 +175,8 @@ class Model(nn.Module):
             f"Input must have {self.input_dim} features, got {x.shape[1]} features"
         )
 
-        # Routing
-        gating_scores = self.gating_function(x)  # (B, num_experts)
-        _, top_k_indices = torch.topk(
-            gating_scores + self.routing_biases, self.router_top_k, dim=1
-        )  # (B, top_k) each
-        top_k_scores = torch.gather(gating_scores, dim=1, index=top_k_indices)
+        # Routing: (B, num_experts), (B, top_k), (B, top_k)
+        gating_scores, top_k_indices, selected_gate_probs = self.router(x)
 
         # Run all experts on the input as a single batched pass.
         # Shape: (B, num_experts, output_dim)
@@ -248,13 +187,6 @@ class Model(nn.Module):
             -1, -1, expert_outputs.size(-1)
         )
         selected_outputs = torch.gather(expert_outputs, dim=1, index=top_k_expanded)
-
-        # Normalize only over the top-k experts, not all experts.
-        if self.router_activation == "softmax":
-            selected_gate_probs = torch.softmax(top_k_scores, dim=1)  # (B, top_k)
-        else:  # "sigmoid": sigmoid + sum-normalization
-            sig = torch.sigmoid(top_k_scores)
-            selected_gate_probs = sig / sig.sum(dim=1, keepdim=True).clamp(min=1e-9)
 
         # Combine expert outputs: (B, output_dim)
         weighted = selected_outputs * selected_gate_probs.unsqueeze(-1)

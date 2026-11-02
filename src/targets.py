@@ -107,10 +107,10 @@ class ModelTarget(TargetFunction):
         if self.model.input_dim != 1:
             return None
 
-        w = self.model.gating_function.weight.detach().squeeze(-1)  # (num_experts,)
+        w = self.model.router.linear.weight.detach().squeeze(-1)  # (num_experts,)
         b = (
-            self.model.gating_function.bias.detach()
-            + self.model.routing_biases.detach()
+            self.model.router.linear.bias.detach()
+            + self.model.router.routing_biases.detach()
         )  # (num_experts,)
 
         # Collect all pairwise intersections where two gating lines cross
@@ -150,5 +150,5 @@ class ModelTarget(TargetFunction):
             return None
 
         return torch.tensor(
-            true_breakpoints, device=self.model.gating_function.weight.device
+            true_breakpoints, device=self.model.router.linear.weight.device
         )

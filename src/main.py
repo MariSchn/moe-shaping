@@ -132,7 +132,7 @@ def main() -> None:
     model = Model(**model_init_cfg).to(device)
 
     if freeze_router:
-        for p in model.gating_function.parameters():
+        for p in model.router.parameters():
             p.requires_grad_(False)
     if freeze_experts:
         for p in model.experts.parameters():
@@ -309,7 +309,7 @@ def main() -> None:
                 "per_expert_loss": per_expert_losses,
                 "per_expert_grad_norm": per_expert_grad_norms,
                 "train_selected_experts": output["selected_experts"].detach().cpu(),
-                "routing_biases": model.routing_biases.detach().cpu(),
+                "routing_biases": model.router.routing_biases.detach().cpu(),
             }
             if model.input_dim == 1:
                 with torch.inference_mode():
@@ -321,7 +321,7 @@ def main() -> None:
             viz_frames.append(frame)
 
         optimizer.step()
-        model.update_routing_biases(
+        model.router.update_routing_biases(
             output["selected_experts"],
             training_cfg.auxiliarly_loss_free_load_balancing_gamma,
         )

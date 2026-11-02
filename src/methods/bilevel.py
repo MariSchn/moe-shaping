@@ -68,7 +68,7 @@ def build_bilevel_optimizer(
         return None
 
     router_opt = optimizer_cls(
-        [p for p in model.gating_function.parameters() if p.requires_grad],
+        [p for p in model.router.parameters() if p.requires_grad],
         lr=router_lr or learning_rate,
     )
     expert_opt = optimizer_cls(
