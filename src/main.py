@@ -11,6 +11,7 @@ import wandb
 from methods.bilevel import BilevelOptimizer, build_bilevel_optimizer
 from methods.lola import LOLA
 from models import Model
+from router import BanditRouter, LinearRouter
 from targets import ModelTarget, PiecewiseLinearTarget
 from utils import (
     calculate_last_layer_regret,
@@ -172,9 +173,9 @@ def main() -> None:
         os.makedirs(d, exist_ok=True)
 
     def log_static_visualizations(subdir, panel_prefix):
-        figs = {
-            "routing_bias": routing_bias_visualization(model)["figure"],
-        }
+        figs = {}
+        if isinstance(model.router, LinearRouter):
+            figs["routing_bias"] = routing_bias_visualization(model)["figure"]
 
         if model.input_dim == 1:
             viz_kwargs = dict(
@@ -185,7 +186,8 @@ def main() -> None:
             )
             figs["model"] = model_visualization(**viz_kwargs)["figure"]
             figs["top_expert"] = top_expert_visualization(**viz_kwargs)["figure"]
-            figs["router"] = router_visualization(**viz_kwargs)["figure"]
+            if isinstance(model.router, LinearRouter):
+                figs["router"] = router_visualization(**viz_kwargs)["figure"]
             figs["expert"] = expert_visualization(**viz_kwargs)["figure"]
             figs["per_expert_sample_count"] = per_expert_sample_count_visualization(
                 model=model,
@@ -257,6 +259,13 @@ def main() -> None:
         loss.backward()
         lola.shape_gradients(model, output, x, y)
 
+        if isinstance(model.router, BanditRouter):
+            model.router.update(
+                x,
+                output["selected_experts"],
+                (output["predictions"].detach() - y).pow(2).mean(dim=-1),
+            )
+
         # ===== LOGGING =====
         per_expert_grad_norms = per_expert_gradient_norm(model)
         per_expert_losses = calculate_per_expert_loss(
@@ -295,6 +304,11 @@ def main() -> None:
                     ** 0.5,
                     **lola.metrics(model),
                     **(
+                        model.router.metrics()
+                        if isinstance(model.router, BanditRouter)
+                        else {}
+                    ),
+                    **(
                         optimizer.metrics()
                         if isinstance(optimizer, BilevelOptimizer)
                         else {}
@@ -309,8 +323,9 @@ def main() -> None:
                 "per_expert_loss": per_expert_losses,
                 "per_expert_grad_norm": per_expert_grad_norms,
                 "train_selected_experts": output["selected_experts"].detach().cpu(),
-                "routing_biases": model.router.routing_biases.detach().cpu(),
             }
+            if isinstance(model.router, LinearRouter):
+                frame["routing_biases"] = model.router.routing_biases.detach().cpu()
             if model.input_dim == 1:
                 with torch.inference_mode():
                     viz_output = model(viz_x)
@@ -321,10 +336,11 @@ def main() -> None:
             viz_frames.append(frame)
 
         optimizer.step()
-        model.router.update_routing_biases(
-            output["selected_experts"],
-            training_cfg.auxiliarly_loss_free_load_balancing_gamma,
-        )
+        if isinstance(model.router, LinearRouter):
+            model.router.update_routing_biases(
+                output["selected_experts"],
+                training_cfg.auxiliarly_loss_free_load_balancing_gamma,
+            )
         pbar.set_postfix({"loss": loss.item()})
 
     log_static_visualizations(final_dir, "final")

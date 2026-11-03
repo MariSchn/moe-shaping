@@ -39,6 +39,18 @@ model:
   output_dim: 1
   router_top_k: 2
   router_activation: softmax
+  # "linear" or "bandit" (contextual rising bandit, see router.BanditRouter).
+  router_type: linear
+  # Only used by the bandit router.
+  bandit_router:
+    # Window h = floor(epsilon * pulls) of the estimator, epsilon in (0, 1/2).
+    epsilon: 0.25
+    # Noise scale of the exploration bonus.
+    sigma: 0.1
+    # Confidence delta_t = t^-alpha of the exploration bonus, alpha > 2.
+    alpha: 3.0
+    # Learning rate of the reward model.
+    lr: 0.01
   expert_hidden_dim: null
   expert_num_layers: 1
   freeze_router: false

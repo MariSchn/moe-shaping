@@ -554,7 +554,6 @@ def export_training_animation_visualization(
     x_np = viz_x.squeeze(-1).numpy()
     steps = [f["step"] for f in viz_frames]
 
-    all_routing_biases = np.array([f["routing_biases"].numpy() for f in viz_frames])
     all_per_expert_loss = np.array(
         [
             f["per_expert_loss"].numpy()
@@ -566,7 +565,14 @@ def export_training_animation_visualization(
     all_per_expert_grad_norm = np.array(
         [np.array(f["per_expert_grad_norm"]) for f in viz_frames]
     )
-    num_experts = all_routing_biases.shape[1]
+    num_experts = all_per_expert_loss.shape[1]
+    # Only routers with auxiliary loss-free routing biases record them.
+    has_routing_biases = "routing_biases" in viz_frames[0]
+    all_routing_biases = (
+        np.array([f["routing_biases"].numpy() for f in viz_frames])
+        if has_routing_biases
+        else np.zeros((len(viz_frames), num_experts))
+    )
     all_expert_counts = np.array(
         [
             np.bincount(
@@ -615,18 +621,21 @@ def export_training_animation_visualization(
                 steps,
                 fps,
             ),
-            pool.submit(
-                _build_bar_animation,
-                path("routing_biases.mp4"),
-                all_routing_biases,
-                expert_indices,
-                _ylim(all_routing_biases),
-                "Bias",
-                "Routing Biases",
-                steps,
-                fps,
-            ),
         ]
+        if has_routing_biases:
+            futures.append(
+                pool.submit(
+                    _build_bar_animation,
+                    path("routing_biases.mp4"),
+                    all_routing_biases,
+                    expert_indices,
+                    _ylim(all_routing_biases),
+                    "Bias",
+                    "Routing Biases",
+                    steps,
+                    fps,
+                )
+            )
 
         if has_1d_data:
             y_target = None
@@ -651,8 +660,8 @@ def export_training_animation_visualization(
             )
             all_router_y = np.array(
                 [
-                    f["gating_scores"].numpy() + f["routing_biases"].numpy()
-                    for f in viz_frames
+                    f["gating_scores"].numpy() + biases
+                    for f, biases in zip(viz_frames, all_routing_biases)
                 ]
             )
             all_top_experts = [f["selected_experts"].numpy() for f in viz_frames]
