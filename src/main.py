@@ -11,7 +11,7 @@ import wandb
 from methods.bilevel import BilevelOptimizer, build_bilevel_optimizer
 from methods.lola import LOLA
 from models import Model
-from router import BanditRouter, LinearRouter
+from router import LinearRouter
 from targets import ModelTarget, PiecewiseLinearTarget
 from utils import (
     calculate_last_layer_regret,
@@ -259,12 +259,11 @@ def main() -> None:
         loss.backward()
         lola.shape_gradients(model, output, x, y)
 
-        if isinstance(model.router, BanditRouter):
-            model.router.update(
-                x,
-                output["selected_experts"],
-                (output["predictions"].detach() - y).pow(2).mean(dim=-1),
-            )
+        model.router.update(
+            x,
+            output["selected_experts"],
+            (output["predictions"].detach() - y).pow(2).mean(dim=-1),
+        )
 
         # ===== LOGGING =====
         per_expert_grad_norms = per_expert_gradient_norm(model)
@@ -303,11 +302,7 @@ def main() -> None:
                     "expert_grad_norm": sum(n * n for n in per_expert_grad_norms)
                     ** 0.5,
                     **lola.metrics(model),
-                    **(
-                        model.router.metrics()
-                        if isinstance(model.router, BanditRouter)
-                        else {}
-                    ),
+                    **model.router.metrics(),
                     **(
                         optimizer.metrics()
                         if isinstance(optimizer, BilevelOptimizer)

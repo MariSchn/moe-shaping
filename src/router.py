@@ -26,6 +26,20 @@ class Router(nn.Module, ABC):
             gate_probs: (B, top_k) weights of the selected experts' outputs.
         """
 
+    def update(
+        self,
+        x: torch.Tensor,
+        selected_experts: torch.Tensor,
+        losses: torch.Tensor,
+    ) -> None:
+        """Learn from the per-token losses ``(B,)`` of the final predictions for ``x``.
+
+        Only for routers that don't learn from the gradients of the task loss.
+        """
+
+    def metrics(self) -> dict[str, float]:
+        return {}
+
 
 class LinearRouter(Router):
     """Linear gating scores ``x @ W.T + b``, one row of ``W`` per expert.
@@ -161,10 +175,9 @@ class BanditRouter(Router):
         self.optimizer = torch.optim.Adam(self.reward_model.parameters(), lr=lr)
 
         self.num_tokens = 0
-        self.pulls = [0] * num_experts
 
-        # History of past reward models, used for the window to estimate increment
-        self.history = torch.zeros(num_experts, 1024, input_dim + 1)
+        # Per expert, the reward model's row [W_i, b_i] after each of its pulls.
+        self.history = [torch.empty(0, input_dim + 1) for _ in range(num_experts)]
 
         # r_i^l is linear in z = [x, 1], so the sums over pulls in the index reduce
         # to one row per expert. The payoff and increment are the two summands.
@@ -182,18 +195,16 @@ class BanditRouter(Router):
         payoff = z @ self.payoff.T
         return payoff, z @ self.increment.T, self.bonus.expand_as(payoff)
 
+    @torch.no_grad()
     def forward(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        with torch.no_grad():
-            payoff, increment, bonus = self._index_terms(x)
-            _, selected_experts = torch.topk(
-                payoff + increment + bonus, self.top_k, dim=1
-            )
-            predicted_rewards = self.reward_model(x)
-            gate_probs = torch.softmax(
-                torch.gather(predicted_rewards, 1, selected_experts), dim=1
-            )
+        payoff, increment, bonus = self._index_terms(x)
+        _, selected_experts = torch.topk(payoff + increment + bonus, self.top_k, dim=1)
+        predicted_rewards = self.reward_model(x)
+        gate_probs = torch.softmax(
+            torch.gather(predicted_rewards, 1, selected_experts), dim=1
+        )
         return predicted_rewards, selected_experts, gate_probs
 
     def update(
@@ -202,24 +213,20 @@ class BanditRouter(Router):
         selected_experts: torch.Tensor,
         losses: torch.Tensor,
     ) -> None:
-        """Learn from the per-token losses ``(B,)`` of the final predictions for ``x``."""
         rewards = torch.exp(-losses).unsqueeze(1).expand_as(selected_experts)
-
-        with torch.no_grad():
-            payoff, increment, bonus = (
-                torch.gather(term, 1, selected_experts) for term in self._index_terms(x)
-            )
-            explored = bonus.isfinite()
 
         # One regression step of the reward model on the observed rewards.
         predicted = torch.gather(self.reward_model(x), 1, selected_experts)
         reward_model_loss = (predicted - rewards).pow(2).mean()
-
-        self.optimizer.zero_grad()
         reward_model_loss.backward()
         self.optimizer.step()
+        # The main optimizer holds these parameters too: leave it no gradient to apply.
         self.optimizer.zero_grad()
 
+        payoff, increment, bonus = (
+            torch.gather(term, 1, selected_experts) for term in self._index_terms(x)
+        )
+        explored = bonus.isfinite()
         self._metrics = {
             "bandit/reward": rewards.mean().item(),
             "bandit/reward_model_loss": reward_model_loss.item(),
@@ -228,55 +235,39 @@ class BanditRouter(Router):
             "bandit/index_bonus": bonus[explored].mean().item(),
         }
 
-        with torch.no_grad():
-            self.num_tokens += x.shape[0]
-            self._record_pulls(selected_experts)
-            self._update_index()
+        self.num_tokens += x.shape[0]
+        self._record_pulls(selected_experts)
+        self._update_index()
 
+    @torch.no_grad()
     def _record_pulls(self, selected_experts: torch.Tensor) -> None:
-        """Count the new pulls and store the reward model's row for each of them."""
-        routed = torch.zeros(
-            selected_experts.shape[0], self.num_experts, device=selected_experts.device
-        )
-        routed.scatter_(1, selected_experts, 1.0)
-        counts = routed.sum(dim=0).int().tolist()
-
-        while max(n + c for n, c in zip(self.pulls, counts)) > self.history.shape[1]:
-            self.history = torch.cat(
-                [self.history, torch.zeros_like(self.history)], dim=1
-            )
-
+        """Store the reward model's row for each new pull."""
+        counts = torch.bincount(selected_experts.flatten(), minlength=self.num_experts)
         rows = torch.cat(
             [self.reward_model.weight, self.reward_model.bias.unsqueeze(1)], dim=1
         ).cpu()
-        for i, count in enumerate(counts):
-            self.history[i, self.pulls[i] : self.pulls[i] + count] = rows[i]
-            self.pulls[i] += count
+        for i, count in enumerate(counts.tolist()):
+            self.history[i] = torch.cat([self.history[i], rows[i].expand(count, -1)])
 
     def _update_index(self) -> None:
         """Evaluate the index's sums over pulls for the next token."""
         t = self.num_tokens + 1
-        payoff = torch.zeros(self.payoff.shape)
-        increment = torch.zeros(self.increment.shape)
-        bonus = torch.full(self.bonus.shape, float("inf"))
-        for i, n in enumerate(self.pulls):
+        for i, rows in enumerate(self.history):
+            n = len(rows)
             h = math.floor(self.epsilon * n)
             if h == 0:
                 # For window size 0, keep infinite bonus
                 continue
-            recent = self.history[i, n - h : n]  # pulls l = n - h + 1, ..., n
-            previous = self.history[i, n - 2 * h : n - h]  # pulls l - h
+            recent = rows[n - h :]  # pulls l = n - h + 1, ..., n
+            previous = rows[n - 2 * h : n - h]  # pulls l - h
             pulls = torch.arange(n - h + 1, n + 1).unsqueeze(1)
-            payoff[i] = recent.mean(dim=0)
-            increment[i] = ((t - pulls) * (recent - previous) / h).mean(dim=0)
-            bonus[i] = (
+            self.payoff[i] = recent.mean(dim=0)
+            self.increment[i] = ((t - pulls) * (recent - previous) / h).mean(dim=0)
+            self.bonus[i] = (
                 self.sigma
                 * (t - n + h - 1)
                 * math.sqrt(10 * self.alpha * math.log(t) / h**3)
             )
-        self.payoff.copy_(payoff)
-        self.increment.copy_(increment)
-        self.bonus.copy_(bonus)
 
     def metrics(self) -> dict[str, float]:
         """Means over the selected experts of the last `update`'s batch."""
