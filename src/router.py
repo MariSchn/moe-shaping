@@ -150,6 +150,12 @@ class BanditRouter(Router):
     r_i^l(x), the reward predicted for the current x by a linear reward model as
     it was at that pull.
 
+    With linucb_weight > 0, the index also gets LinUCB's covariance term
+
+        linucb_weight * sqrt(z^T A_i^-1 z),  A_i = linucb_ridge I + sum_l z_l z_l^T
+
+    with z = [x, 1] and z_l the features of the l-th pull of expert i.
+
     Every expert selected for a token receives the reward exp(-loss) of the final
     prediction. The gating scores are the current predicted rewards and the gate
     weights a softmax over those of the selected experts. The router learns only
@@ -165,11 +171,14 @@ class BanditRouter(Router):
         sigma: float = 0.1,
         alpha: float = 3.0,
         lr: float = 1e-2,
+        linucb_weight: float = 0.0,
+        linucb_ridge: float = 1.0,
     ):
         super().__init__(input_dim, num_experts, top_k)
         self.epsilon = epsilon
         self.sigma = sigma
         self.alpha = alpha
+        self.linucb_weight = linucb_weight
 
         self.reward_model = nn.Linear(input_dim, num_experts, bias=True)
         self.optimizer = torch.optim.Adam(self.reward_model.parameters(), lr=lr)
@@ -185,22 +194,33 @@ class BanditRouter(Router):
         self.register_buffer("increment", torch.zeros(num_experts, input_dim + 1))
         self.register_buffer("bonus", torch.full((num_experts,), float("inf")))
 
+        # Per expert, the design matrix A_i and a factor L_i with A_i^-1 = L_i L_i^T,
+        # so sqrt(z^T A_i^-1 z) = ||L_i^T z||. A_i is float64 on the CPU because it
+        # gets ill-conditioned when an expert only sees a narrow range of x, and MPS
+        # has no float64.
+        eye = torch.eye(input_dim + 1).expand(num_experts, -1, -1)
+        self.design = linucb_ridge * eye.double()
+        self.register_buffer("design_factor", eye / math.sqrt(linucb_ridge))
+
         self._metrics: dict[str, float] = {}
+
+    def _features(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.cat([x, torch.ones_like(x[:, :1])], dim=1)
 
     def _index_terms(
         self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Payoff, increment and bonus of the index, each ``(B, num_experts)``."""
-        z = torch.cat([x, torch.ones_like(x[:, :1])], dim=1)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Payoff, increment, bonus and covariance term, each ``(B, num_experts)``."""
+        z = self._features(x)
         payoff = z @ self.payoff.T
-        return payoff, z @ self.increment.T, self.bonus.expand_as(payoff)
+        covariance = self.linucb_weight * (z @ self.design_factor).norm(dim=-1).T
+        return payoff, z @ self.increment.T, self.bonus.expand_as(payoff), covariance
 
     @torch.no_grad()
     def forward(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        payoff, increment, bonus = self._index_terms(x)
-        _, selected_experts = torch.topk(payoff + increment + bonus, self.top_k, dim=1)
+        _, selected_experts = torch.topk(sum(self._index_terms(x)), self.top_k, dim=1)
         predicted_rewards = self.reward_model(x)
         gate_probs = torch.softmax(
             torch.gather(predicted_rewards, 1, selected_experts), dim=1
@@ -223,7 +243,7 @@ class BanditRouter(Router):
         # The main optimizer holds these parameters too: leave it no gradient to apply.
         self.optimizer.zero_grad()
 
-        payoff, increment, bonus = (
+        payoff, increment, bonus, covariance = (
             torch.gather(term, 1, selected_experts) for term in self._index_terms(x)
         )
         explored = bonus.isfinite()
@@ -233,11 +253,14 @@ class BanditRouter(Router):
             "bandit/index_payoff": payoff[explored].mean().item(),
             "bandit/index_increment": increment[explored].mean().item(),
             "bandit/index_bonus": bonus[explored].mean().item(),
+            "bandit/index_covariance": covariance[explored].mean().item(),
         }
 
         self.num_tokens += x.shape[0]
         self._record_pulls(selected_experts)
         self._update_index()
+        if self.linucb_weight > 0:
+            self._update_design(x, selected_experts)
 
     @torch.no_grad()
     def _record_pulls(self, selected_experts: torch.Tensor) -> None:
@@ -248,6 +271,15 @@ class BanditRouter(Router):
         ).cpu()
         for i, count in enumerate(counts.tolist()):
             self.history[i] = torch.cat([self.history[i], rows[i].expand(count, -1)])
+
+    @torch.no_grad()
+    def _update_design(self, x: torch.Tensor, selected_experts: torch.Tensor) -> None:
+        """Add the new pulls to the design matrices."""
+        z = self._features(x).cpu().double()
+        routed = torch.zeros(x.shape[0], self.num_experts, dtype=z.dtype)
+        routed.scatter_(1, selected_experts.cpu(), 1.0)
+        self.design += torch.einsum("be,bi,bj->eij", routed, z, z)
+        self.design_factor.copy_(torch.linalg.cholesky(torch.linalg.inv(self.design)))
 
     def _update_index(self) -> None:
         """Evaluate the index's sums over pulls for the next token."""

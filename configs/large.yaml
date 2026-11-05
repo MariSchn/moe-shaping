@@ -31,6 +31,10 @@ model:
     alpha: 3.0
     # Learning rate of the reward model.
     lr: 0.01
+    # Weight of LinUCB's covariance term in the index, off while 0.
+    linucb_weight: 0.0
+    # Ridge of the design matrices of the covariance term.
+    linucb_ridge: 1.0
   expert_hidden_dim: 512
   expert_num_layers: 2
   freeze_router: false
