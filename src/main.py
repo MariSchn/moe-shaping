@@ -11,7 +11,7 @@ import wandb
 from methods.bilevel import BilevelOptimizer, build_bilevel_optimizer
 from methods.lola import LOLA
 from models import Model
-from router import LinearRouter
+from router import BanditRouter, LinearRouter
 from targets import ModelTarget, PiecewiseLinearTarget
 from utils import (
     calculate_last_layer_regret,
@@ -324,6 +324,10 @@ def main() -> None:
             if model.input_dim == 1:
                 with torch.inference_mode():
                     viz_output = model(viz_x)
+                    if isinstance(model.router, BanditRouter):
+                        frame["index_terms"] = torch.stack(
+                            model.router.index_terms(viz_x)
+                        ).cpu()
                 frame["predictions"] = viz_output["predictions"].cpu()
                 frame["gating_scores"] = viz_output["gating_scores"].cpu()
                 frame["expert_outputs"] = viz_output["expert_outputs"].cpu()
@@ -359,12 +363,16 @@ def main() -> None:
             "per_expert_grad_norm",
             "per_expert_sample_count",
             "routing_biases",
+            "index",
         ]
         log_dict = {}
         for name in anim_names:
             path = os.path.join(anim_dir, f"{name}.mp4")
             if os.path.exists(path):
                 log_dict[f"animations/{name}"] = wandb.Video(path, format="mp4")
+        routing_map_path = os.path.join(anim_dir, "routing_map.png")
+        if os.path.exists(routing_map_path):
+            log_dict["animations/routing_map"] = wandb.Image(routing_map_path)
         wandb.log(log_dict)
 
 

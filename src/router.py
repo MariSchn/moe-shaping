@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 import torch
 import torch.nn as nn
 
+INDEX_TERMS = ("payoff", "increment", "bonus", "covariance")
+
 
 class Router(nn.Module, ABC):
     """Picks ``top_k`` of ``num_experts`` experts per input and weights their outputs."""
@@ -207,7 +209,7 @@ class BanditRouter(Router):
     def _features(self, x: torch.Tensor) -> torch.Tensor:
         return torch.cat([x, torch.ones_like(x[:, :1])], dim=1)
 
-    def _index_terms(
+    def index_terms(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Payoff, increment, bonus and covariance term, each ``(B, num_experts)``."""
@@ -220,7 +222,7 @@ class BanditRouter(Router):
     def forward(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        _, selected_experts = torch.topk(sum(self._index_terms(x)), self.top_k, dim=1)
+        _, selected_experts = torch.topk(sum(self.index_terms(x)), self.top_k, dim=1)
         predicted_rewards = self.reward_model(x)
         gate_probs = torch.softmax(
             torch.gather(predicted_rewards, 1, selected_experts), dim=1
@@ -243,8 +245,9 @@ class BanditRouter(Router):
         # The main optimizer holds these parameters too: leave it no gradient to apply.
         self.optimizer.zero_grad()
 
+        index_terms = self.index_terms(x)
         payoff, increment, bonus, covariance = (
-            torch.gather(term, 1, selected_experts) for term in self._index_terms(x)
+            torch.gather(term, 1, selected_experts) for term in index_terms
         )
         explored = bonus.isfinite()
         self._metrics = {
@@ -255,6 +258,9 @@ class BanditRouter(Router):
             "bandit/index_bonus": bonus[explored].mean().item(),
             "bandit/index_covariance": covariance[explored].mean().item(),
         }
+        for name, term in zip(INDEX_TERMS, index_terms):
+            for i, value in enumerate(term.mean(dim=0).tolist()):
+                self._metrics[f"bandit_index/{name}_{i}"] = value
 
         self.num_tokens += x.shape[0]
         self._record_pulls(selected_experts)
@@ -302,5 +308,6 @@ class BanditRouter(Router):
             )
 
     def metrics(self) -> dict[str, float]:
-        """Means over the selected experts of the last `update`'s batch."""
+        """Means over the last `update`'s batch: `bandit/` over the selected experts,
+        `bandit_index/` per expert over all tokens, selected or not."""
         return self._metrics

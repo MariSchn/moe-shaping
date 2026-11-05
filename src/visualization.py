@@ -9,7 +9,10 @@ from typing import Optional, Tuple
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+from matplotlib.colors import BoundaryNorm, ListedColormap
+from matplotlib.patches import Patch
 
+from router import INDEX_TERMS
 from utils import model_device
 from targets import ModelTarget, TargetFunction
 
@@ -539,6 +542,122 @@ def _build_bar_animation(
     _save_animation(fig, update, init, filepath, len(steps), fps)
 
 
+def _expert_colormap(num_experts):
+    return (
+        ListedColormap([f"C{i}" for i in range(num_experts)]),
+        BoundaryNorm(np.arange(-0.5, num_experts), num_experts),
+    )
+
+
+def _build_routing_map(
+    filepath, x_np, all_top_experts, top_k, num_experts, breakpoints, steps
+):
+    matplotlib.use("Agg")
+    cmap, norm = _expert_colormap(num_experts)
+    fig, axes = plt.subplots(
+        top_k, 1, sharex=True, squeeze=False, figsize=(9, 3 * top_k)
+    )
+    axes = axes[:, 0]
+    for k, ax in enumerate(axes):
+        ax.pcolormesh(
+            steps,
+            x_np,
+            np.array(all_top_experts)[:, :, k].T,
+            cmap=cmap,
+            norm=norm,
+            shading="nearest",
+        )
+        for i, bp in enumerate(breakpoints or []):
+            ax.axhline(
+                bp,
+                color="black",
+                linestyle="--",
+                linewidth=1,
+                label="GT Breakpoints" if i == 0 else None,
+            )
+        ax.set_title(f"Top-{k + 1} Expert")
+        ax.set_ylabel("x")
+    axes[-1].set_xlabel("Step")
+    handles = [
+        Patch(color=f"C{i}", label=f"Expert {i}") for i in range(num_experts)
+    ] + axes[0].get_legend_handles_labels()[0]
+    axes[0].legend(handles=handles, loc="upper left", bbox_to_anchor=(1.01, 1))
+    fig.suptitle("Routing Map Visualization")
+    fig.tight_layout()
+    fig.savefig(filepath, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _build_index_animation(
+    filepath, x_np, all_index_terms, all_top_experts, top_k, domain, steps, fps
+):
+    matplotlib.use("Agg")
+    num_points = len(x_np)
+    num_experts = all_index_terms.shape[-1]
+    # The bonus is infinite until an expert has enough pulls.
+    all_index_terms = np.where(np.isinf(all_index_terms), np.nan, all_index_terms)
+    all_panels = np.concatenate(
+        [all_index_terms, all_index_terms.sum(axis=1, keepdims=True)], axis=1
+    )
+    titles = [name.capitalize() for name in INDEX_TERMS] + ["Total Index"]
+    # Quantiles, because the early bonus would stretch the axis.
+    ylim = _ylim(np.nanquantile(all_panels, [0.01, 0.99]))
+
+    fig, axes = plt.subplots(1, len(titles), sharey=True, figsize=(20, 4.8))
+    lines = []
+    for ax, title in zip(axes, titles):
+        lines.append(
+            [
+                ax.plot(x_np, np.zeros(num_points), label=f"Expert {i}")[0]
+                for i in range(num_experts)
+            ]
+        )
+        ax.set_xlim(domain)
+        ax.set_ylim(ylim)
+        ax.grid(True)
+        ax.set_title(title)
+    axes[0].legend(loc="upper right")
+    ft = _add_frame_text(axes[0])
+
+    max_reward = axes[-1].axhline(
+        1, color="red", linestyle="--", linewidth=1, label="Max Reward"
+    )
+    axes[-1].legend(handles=[max_reward], loc="upper left")
+    strip = axes[-1].inset_axes([0, 0, 1, 0.1])
+    strip.set_xticks([])
+    strip.set_yticks(
+        np.arange(top_k) + 0.5,
+        [f"Top-{k + 1}" for k in range(top_k)],
+        fontsize=8,
+    )
+    cmap, norm = _expert_colormap(num_experts)
+    selected = strip.imshow(
+        all_top_experts[0].T,
+        aspect="auto",
+        cmap=cmap,
+        norm=norm,
+        extent=(*domain, 0, top_k),
+        origin="lower",
+        interpolation="nearest",
+    )
+    fig.tight_layout()
+    artists = (*(ln for panel in lines for ln in panel), selected, ft)
+
+    def init():
+        ft.set_text("")
+        return artists
+
+    def update(i):
+        for panel, values in zip(lines, all_panels[i]):
+            for j, ln in enumerate(panel):
+                ln.set_ydata(values[:, j])
+        selected.set_data(all_top_experts[i].T)
+        ft.set_text(f"Step: {steps[i]}")
+        return artists
+
+    _save_animation(fig, update, init, filepath, len(steps), fps)
+
+
 def export_training_animation_visualization(
     viz_frames: list[dict],
     viz_x: torch.Tensor,
@@ -720,7 +839,31 @@ def export_training_animation_visualization(
                         steps,
                         fps,
                     ),
+                    pool.submit(
+                        _build_routing_map,
+                        path("routing_map.png"),
+                        x_np,
+                        all_top_experts,
+                        top_k,
+                        num_experts,
+                        breakpoints,
+                        steps,
+                    ),
                 ]
             )
+            if "index_terms" in viz_frames[0]:
+                futures.append(
+                    pool.submit(
+                        _build_index_animation,
+                        path("index.mp4"),
+                        x_np,
+                        np.array([f["index_terms"].numpy() for f in viz_frames]),
+                        all_top_experts,
+                        top_k,
+                        domain,
+                        steps,
+                        fps,
+                    )
+                )
         for f in futures:
             f.result()
