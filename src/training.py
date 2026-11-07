@@ -4,11 +4,35 @@ from omegaconf import DictConfig
 from tqdm import tqdm
 
 import wandb
-from metrics import layer_metrics, load_balancing_loss, routing_regret
 from models import Model
+from monitoring.metrics import expert_load, layer_metrics, routing_regret
+from monitoring.visualization import input_grid, record_frame
 from targets import TargetFunction
 from utils import sample_uniformly
-from visualization import input_grid, record_frame
+
+
+def load_balancing_loss(
+    gating_scores: torch.Tensor,
+    selected_experts: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Auxiliary load balancing loss to encourage uniform expert utilization.
+
+    Follows Switch Transformer: L = num_experts * sum_i(f_i * P_i)
+    where f_i is the fraction of tokens dispatched to expert i (non-differentiable)
+    and P_i is the mean softmax router probability for expert i (differentiable).
+
+    Args:
+        gating_scores: (B, num_experts) raw router logits
+        selected_experts: (B, top_k) indices of selected experts
+
+    Returns:
+        Scalar load balancing loss.
+    """
+    num_experts = gating_scores.shape[1]
+    P = torch.softmax(gating_scores, dim=-1).mean(dim=0)
+    f = expert_load(selected_experts, num_experts)
+    return num_experts * (f * P).sum()
 
 
 def train(

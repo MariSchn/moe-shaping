@@ -6,30 +6,6 @@ import torch
 from models import ExpertBank, MoELayer, MoEOutput
 
 
-def load_balancing_loss(
-    gating_scores: torch.Tensor,
-    selected_experts: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Auxiliary load balancing loss to encourage uniform expert utilization.
-
-    Follows Switch Transformer: L = num_experts * sum_i(f_i * P_i)
-    where f_i is the fraction of tokens dispatched to expert i (non-differentiable)
-    and P_i is the mean softmax router probability for expert i (differentiable).
-
-    Args:
-        gating_scores: (B, num_experts) raw router logits
-        selected_experts: (B, top_k) indices of selected experts
-
-    Returns:
-        Scalar load balancing loss.
-    """
-    num_experts = gating_scores.shape[1]
-    P = torch.softmax(gating_scores, dim=-1).mean(dim=0)
-    f = expert_load(selected_experts, num_experts)
-    return num_experts * (f * P).sum()
-
-
 # Quantiles (in [0, 1]) of the per-expert load distribution, logged as
 # "load/p10".."load/p90" alongside "load/min" (the p0 extreme) and "load/max"
 # (p100). Mirrors _LOAD_QUANTILES in the Megatron-LM patch (lm/patches/0004).
