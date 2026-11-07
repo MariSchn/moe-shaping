@@ -135,4 +135,4 @@ class Model(nn.Module):
     def update_routers(self, outputs: list[MoEOutput], losses: torch.Tensor) -> None:
         """Pass every router the per-token losses ``(B,)`` of the final predictions."""
         for layer, output in zip(self.layers, outputs):
-            layer.router.update(output.x, output.selected_experts, losses)
+            layer.router.update(output.x.detach(), output.selected_experts, losses)
