@@ -4,7 +4,7 @@ from typing import Callable
 import torch
 import torch.nn as nn
 
-from router import Router
+from model.router import Router
 
 
 @dataclass

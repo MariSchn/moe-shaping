@@ -1,5 +1,5 @@
 # Contextual R-ed-UCB, learns only from rewards.
-_target_: router.BanditRouter
+_target_: model.router.BanditRouter
 _partial_: true
 epsilon: 0.25
 sigma: 0.1

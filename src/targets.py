@@ -2,7 +2,7 @@ import torch
 from abc import ABC, abstractmethod
 from typing import Tuple
 
-from models import Model
+from model.moe import Model
 from utils import sample_uniformly
 
 

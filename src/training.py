@@ -4,7 +4,7 @@ from omegaconf import DictConfig
 from tqdm import tqdm
 
 import wandb
-from models import Model
+from model.moe import Model
 from monitoring.metrics import expert_load, layer_metrics, routing_regret
 from monitoring.visualization import input_grid, record_frame
 from targets import TargetFunction

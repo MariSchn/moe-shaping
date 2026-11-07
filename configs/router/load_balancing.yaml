@@ -1,5 +1,5 @@
 # Auxiliary loss-free load balancing (DeepSeek-V3).
-_target_: router.LoadBalancingRouter
+_target_: model.router.LoadBalancingRouter
 _partial_: true
 activation: softmax
 hidden_dim: null

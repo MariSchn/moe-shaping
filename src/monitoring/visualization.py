@@ -12,9 +12,9 @@ from matplotlib.animation import FuncAnimation
 from matplotlib.colors import BoundaryNorm, ListedColormap
 from matplotlib.patches import Patch
 
-from models import Model, MoEOutput
+from model.moe import Model, MoEOutput
+from model.router import INDEX_TERMS
 from monitoring.metrics import per_expert_grad_norm, per_expert_loss
-from router import INDEX_TERMS
 from targets import TargetFunction
 from utils import sample_uniformly
 

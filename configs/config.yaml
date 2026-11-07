@@ -8,7 +8,7 @@ seed: 0
 
 # A stack of MoE layers, layer i mapping dims[i] -> dims[i + 1].
 model:
-  _target_: models.Model
+  _target_: model.moe.Model
   _convert_: all
   dims: [1, 1]
   num_experts: 4

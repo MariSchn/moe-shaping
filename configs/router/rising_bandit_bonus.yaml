@@ -1,5 +1,5 @@
 # MLP router with R-ed-UCB's exploration bonus.
-_target_: router.RisingBanditBonusRouter
+_target_: model.router.RisingBanditBonusRouter
 _partial_: true
 activation: softmax
 hidden_dim: null

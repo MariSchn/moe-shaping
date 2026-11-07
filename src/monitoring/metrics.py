@@ -3,7 +3,7 @@ from typing import Callable, Iterable, Tuple
 
 import torch
 
-from models import ExpertBank, MoELayer, MoEOutput
+from model.moe import ExpertBank, MoELayer, MoEOutput
 
 
 # Quantiles (in [0, 1]) of the per-expert load distribution, logged as

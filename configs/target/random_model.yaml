@@ -3,7 +3,7 @@ _target_: targets.ModelTarget
 _convert_: all
 domain: [-1, 1]
 model:
-  _target_: models.Model
+  _target_: model.moe.Model
   _convert_: all
   dims: ${model.dims}
   num_experts: 4
@@ -11,6 +11,6 @@ model:
   expert_hidden_dim: null
   expert_num_layers: 1
   router:
-    _target_: router.MLPRouter
+    _target_: model.router.MLPRouter
     _partial_: true
     activation: softmax

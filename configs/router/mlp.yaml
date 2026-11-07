@@ -1,5 +1,5 @@
 # Learned gating scores, linear for num_layers: 1.
-_target_: router.MLPRouter
+_target_: model.router.MLPRouter
 _partial_: true
 activation: softmax  # or sigmoid
 hidden_dim: null
