@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from typing import Tuple
 
-from router import LINEAR_ROUTERS, BanditRouter, RouterType
+from router import LINEAR_ROUTERS, BanditRouter, RandomRouter, RouterType
 
 
 class Expert(nn.Module):
@@ -114,6 +114,10 @@ class Model(nn.Module):
         match RouterType(router_type):
             case RouterType.BANDIT:
                 self.router = BanditRouter(
+                    input_dim, num_experts, router_top_k, **router_kwargs
+                )
+            case RouterType.RANDOM:
+                self.router = RandomRouter(
                     input_dim, num_experts, router_top_k, **router_kwargs
                 )
             case linear_router_type:

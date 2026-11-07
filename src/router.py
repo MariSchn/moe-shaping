@@ -14,6 +14,7 @@ class RouterType(StrEnum):
     UCB = "ucb"
     RISING_BANDIT_BONUS = "rising_bandit_bonus"
     BANDIT = "bandit"
+    RANDOM = "random"
 
 
 class Router(nn.Module, ABC):
@@ -211,6 +212,24 @@ LINEAR_ROUTERS: dict[RouterType, type[LinearRouter]] = {
     RouterType.UCB: UCBRouter,
     RouterType.RISING_BANDIT_BONUS: RisingBanditBonusRouter,
 }
+
+
+class RandomRouter(Router):
+    """Selects ``top_k`` distinct experts uniformly at random per token and weights
+    them equally. Has no parameters; its gating scores are all zero."""
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B = x.shape[0]
+        gating_scores = torch.zeros(B, self.num_experts, device=x.device)
+        selected_experts = (
+            torch.rand(B, self.num_experts, device=x.device)
+            .topk(self.top_k, dim=1)
+            .indices
+        )
+        gate_probs = torch.full((B, self.top_k), 1 / self.top_k, device=x.device)
+        return gating_scores, selected_experts, gate_probs
 
 
 class BanditRouter(Router):
