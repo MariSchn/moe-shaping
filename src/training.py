@@ -50,7 +50,7 @@ def train(
     frames = []
 
     # Running sums of per-step routing regret (cumulative bandit regret).
-    regret_gating = regret_optimal = 0.0
+    regret = 0.0
 
     def sample():
         x = sample_uniformly(target.domain, cfg.training.batch_size, model.input_dim)
@@ -75,7 +75,7 @@ def train(
 
         if cfg.wandb.enabled:
             last_layer, last = model.layers[-1], outputs[-1]
-            step_regret_gating, step_regret_optimal = routing_regret(
+            regret += routing_regret(
                 last.expert_outputs.detach(),
                 last.gating_scores.detach(),
                 predictions.detach(),
@@ -83,12 +83,9 @@ def train(
                 last_layer.router.gate_weights,
                 last_layer.router.top_k,
             )
-            regret_gating += step_regret_gating
-            regret_optimal += step_regret_optimal
             metrics = {
                 "loss": loss.item(),
-                "regret/gating": regret_gating,
-                "regret/optimal": regret_optimal,
+                "regret": regret,
             }
             for i, (layer, out) in enumerate(zip(model.layers, outputs)):
                 for name, value in layer_metrics(layer, out).items():

@@ -1,14 +1,9 @@
 import itertools
-from typing import Callable, Iterable, Tuple
+from typing import Callable, Iterable
 
 import torch
 
-from model.moe import ExpertBank, MoELayer, MoEOutput
-
-
-# Quantiles (in [0, 1]) of the per-expert load distribution, logged as
-# "load/p10".."load/p90" alongside "load/min" (the p0 extreme). Mirrors _LOAD_QUANTILES in the Megatron-LM patch (lm/patches/0004).
-LOAD_QUANTILES = (0.10, 0.25, 0.50, 0.75, 0.90)
+from model.moe import MoELayer, MoEOutput
 
 
 def expert_load(selected_experts: torch.Tensor, num_experts: int) -> torch.Tensor:
@@ -30,18 +25,12 @@ def expert_load(selected_experts: torch.Tensor, num_experts: int) -> torch.Tenso
 
 
 def load_metrics(selected_experts: torch.Tensor, num_experts: int) -> dict[str, float]:
-    """Per-expert load distribution summary, mirroring the Megatron-LM expert-load
-    logging (lm/patches/0004): "load/min", "load/pXX", and "load/max_vio", MaxVio
-    (Wang et al., 2024), (max_i load_i - mean load) / mean load. The mean load is
-    always top_k / num_experts, so MaxVio stands in for the max load."""
+    """The minimum load, for dead experts, and MaxVio (Wang et al., 2024),
+    (max_i load_i - mean load) / mean load. The mean load is always
+    top_k / num_experts, so MaxVio stands in for the max load."""
     load = expert_load(selected_experts, num_experts)
-    quantiles = torch.quantile(load, torch.tensor(LOAD_QUANTILES, device=load.device))
     return {
         "load/min": load.min().item(),
-        **{
-            f"load/p{round(q * 100)}": v
-            for q, v in zip(LOAD_QUANTILES, quantiles.tolist())
-        },
         "load/max_vio": ((load.max() - load.mean()) / load.mean()).item(),
     }
 
@@ -75,25 +64,16 @@ def routing_regret(
     targets: torch.Tensor,
     gate_weights: Callable[[torch.Tensor], torch.Tensor],
     combo_size: int,
-) -> Tuple[float, float]:
+) -> float:
     """
     Bandit-style routing regret for the last MoE layer.
 
     Treats each sample as a context, the router's choice of which ``combo_size``
     experts to combine as the action, and negative MSE as the reward. Regret is
     the router's actual prediction loss minus the loss of the best candidate
-    expert combination, averaged over the batch (per-sample regret).
-
-    Two oracles are returned, differing in how a candidate combination is mixed:
-
-    - ``regret_gating``: candidate experts mixed with the router's own
-      ``gate_weights`` of their gating scores. Isolates the routing *choice*
-      regret with the gating mechanism fixed.
-    - ``regret_optimal``: candidate experts mixed with the loss-minimizing convex
-      weight (closed form, ``combo_size == 2`` only). Stronger oracle that also
-      captures weighting suboptimality. Returns ``nan`` if ``combo_size != 2``.
-
-    By construction ``regret_optimal >= regret_gating >= 0``.
+    expert combination, mixed with the router's own ``gate_weights`` of their
+    gating scores, averaged over the batch. This isolates the routing *choice*
+    with the gating mechanism fixed.
 
     Args:
         expert_outputs: (B, num_experts, output_dim)
@@ -102,9 +82,6 @@ def routing_regret(
         targets: (B, output_dim)
         gate_weights: the router's `Router.gate_weights`.
         combo_size: Number of experts per candidate combination (top-k).
-
-    Returns:
-        (regret_gating, regret_optimal) as Python floats.
     """
     num_experts = expert_outputs.shape[1]
 
@@ -117,42 +94,16 @@ def routing_regret(
 
     sc = gating_scores[:, combo_idx]  # (B, C, combo_size)
     outs = expert_outputs[:, combo_idx, :]  # (B, C, combo_size, output_dim)
-    y = targets[:, None, :]  # (B, 1, output_dim)
-
-    # ----- Gating oracle: the router's gate weights over the combination.
-    gating_pred = (outs * gate_weights(sc).unsqueeze(-1)).sum(dim=2)
-    gating_losses = ((gating_pred - y) ** 2).mean(dim=-1)  # (B, C)
-    gating_best = gating_losses.min(dim=1).values  # (B,)
-    regret_gating = torch.relu(chosen_loss - gating_best).mean().item()
-
-    # ----- Optimal oracle: best convex weight per pair (combo_size == 2 only).
-    if combo_size == 2:
-        a = outs[:, :, 0, :]  # (B, C, output_dim)
-        b = outs[:, :, 1, :]
-        d = a - b
-        num = (d * (y - b)).sum(dim=-1)  # (B, C)
-        den = (d * d).sum(dim=-1).clamp(min=1e-12)  # (B, C)
-        w = (num / den).clamp(0.0, 1.0).unsqueeze(-1)  # (B, C, 1)
-        optimal_pred = w * a + (1.0 - w) * b  # (B, C, output_dim)
-        optimal_losses = ((optimal_pred - y) ** 2).mean(dim=-1)  # (B, C)
-        optimal_best = optimal_losses.min(dim=1).values  # (B,)
-        regret_optimal = torch.relu(chosen_loss - optimal_best).mean().item()
-    else:
-        regret_optimal = float("nan")
-
-    return regret_gating, regret_optimal
+    pred = (outs * gate_weights(sc).unsqueeze(-1)).sum(dim=2)  # (B, C, output_dim)
+    losses = ((pred - targets[:, None, :]) ** 2).mean(dim=-1)  # (B, C)
+    best = losses.min(dim=1).values  # (B,)
+    return torch.relu(chosen_loss - best).mean().item()
 
 
 def grad_norm(parameters: Iterable[torch.nn.Parameter]) -> float:
     """L2 norm of the parameters' gradients, 0 without any."""
     sum_sq = sum(p.grad.pow(2).sum() for p in parameters if p.grad is not None)
     return float(sum_sq) ** 0.5
-
-
-def per_expert_grad_norm(experts: ExpertBank) -> torch.Tensor:
-    """L2 norm of each expert's parameter gradients, ``(num_experts,)``."""
-    sum_sq = sum(p.grad.pow(2).flatten(1).sum(dim=1) for p in experts.parameters())
-    return sum_sq.sqrt()
 
 
 def layer_metrics(layer: MoELayer, output: MoEOutput) -> dict[str, float]:

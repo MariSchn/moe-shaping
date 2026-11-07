@@ -14,7 +14,7 @@ from matplotlib.patches import Patch
 
 from model.moe import Model, MoEOutput
 from model.router import INDEX_TERMS
-from monitoring.metrics import per_expert_grad_norm, per_expert_loss
+from monitoring.metrics import per_expert_loss
 from targets import TargetFunction
 from utils import sample_uniformly
 
@@ -39,7 +39,7 @@ def record_frame(
     x_grid: torch.Tensor | None = None,
 ) -> dict:
     """The model's state to plot, from its ``outputs`` on a batch with ``targets``,
-    the current gradients, and its outputs on the 1D inputs ``x_grid`` if given."""
+    and its outputs on the 1D inputs ``x_grid`` if given."""
     frame = {"step": step, "layers": []}
     if targets is not None:
         last = outputs[-1]
@@ -60,8 +60,6 @@ def record_frame(
                 output.selected_experts.cpu().flatten(), minlength=model.num_experts
             )
         }
-        if all(p.grad is not None for p in layer.experts.parameters()):
-            layer_frame["grad_norm"] = per_expert_grad_norm(layer.experts).cpu().numpy()
         if x_grid is None:
             layer_frame.update(_numpy(layer.router.snapshot(output.x)))
         else:
@@ -391,16 +389,6 @@ def render(
             ylabel="Sample Count",
             ylim=(0, int(counts.max()) + 1),
         )
-        if "grad_norm" in has:
-            norms = get("grad_norm")
-            plot(
-                path("grad_norm"),
-                _bars,
-                values=norms,
-                title=f"Layer {i}: Per Expert Gradient Norm",
-                ylabel="Gradient Norm",
-                ylim=(0, float(norms.max()) * 1.1 or 1.0),
-            )
         routing_biases = 0
         if "routing_biases" in has:
             # Leave out the infinite bonus of unexplored experts.
@@ -499,14 +487,11 @@ def plot_target(target: TargetFunction, output_dir: str, grid: bool) -> None:
 
 
 def plot_run(frames: list[dict], target: TargetFunction, output_dir: str) -> None:
-    """PNGs of the first and last frame and MP4s over all frames, into ``init/``,
-    ``final/`` and ``anims/`` of ``output_dir``."""
+    """MP4s over the frames into ``anims/`` of ``output_dir``."""
     ref = None
     if "x" in frames[0]:
         y = target(input_grid(target))
         ref = y[:, 0].cpu().numpy() if y.shape[-1] == 1 else None
     breakpoints = _breakpoints(target)
 
-    render(frames[:1], os.path.join(output_dir, "init"), ref, breakpoints)
-    render(frames[-1:], os.path.join(output_dir, "final"), ref, breakpoints)
     render(frames, os.path.join(output_dir, "anims"), ref, breakpoints, animate=True)

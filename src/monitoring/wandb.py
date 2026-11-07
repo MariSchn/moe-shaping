@@ -42,7 +42,7 @@ def init_wandb(cfg: DictConfig) -> None:
         config={**choices, **flatten(OmegaConf.to_container(cfg, resolve=True))},
     )
     wandb.define_metric("loss", summary="min,last")
-    wandb.define_metric("regret/*", summary="last")
+    wandb.define_metric("regret", summary="last")
 
 
 def log_plots(output_dir: str, subdirs: list[str]) -> None:

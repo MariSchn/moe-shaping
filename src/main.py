@@ -45,7 +45,7 @@ def main(cfg: DictConfig) -> None:
 
     plot_run(frames, target, output_dir)
     if cfg.wandb.enabled:
-        log_plots(output_dir, ["init", "final", "anims"])
+        log_plots(output_dir, ["anims"])
 
 
 if __name__ == "__main__":
