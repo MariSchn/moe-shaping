@@ -1,6 +1,5 @@
 import math
 from abc import ABC, abstractmethod
-from enum import StrEnum
 
 import torch
 import torch.nn as nn
@@ -8,13 +7,17 @@ import torch.nn as nn
 INDEX_TERMS = ("payoff", "increment", "bonus", "covariance")
 
 
-class RouterType(StrEnum):
-    LINEAR = "linear"
-    LOAD_BALANCING = "load_balancing"
-    UCB = "ucb"
-    RISING_BANDIT_BONUS = "rising_bandit_bonus"
-    BANDIT = "bandit"
-    RANDOM = "random"
+def mlp(
+    input_dim: int, output_dim: int, hidden_dim: int | None = None, num_layers: int = 1
+) -> nn.Sequential:
+    """``num_layers`` linear layers with ReLUs in between."""
+    if num_layers > 1 and hidden_dim is None:
+        raise ValueError("hidden_dim must be set when num_layers > 1")
+    dims = [input_dim] + [hidden_dim] * (num_layers - 1) + [output_dim]
+    layers = []
+    for d_in, d_out in zip(dims[:-1], dims[1:]):
+        layers += [nn.Linear(d_in, d_out), nn.ReLU()]
+    return nn.Sequential(*layers[:-1])
 
 
 class Router(nn.Module, ABC):
@@ -26,7 +29,6 @@ class Router(nn.Module, ABC):
         self.num_experts = num_experts
         self.top_k = top_k
 
-    @abstractmethod
     def forward(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -35,8 +37,24 @@ class Router(nn.Module, ABC):
         Returns:
             gating_scores: (B, num_experts) score of every expert.
             selected_experts: (B, top_k) indices of the selected experts.
-            gate_probs: (B, top_k) weights of the selected experts' outputs.
+            gate_weights: (B, top_k) weights of the selected experts' outputs.
         """
+        gating_scores, selection_scores = self.scores(x)
+        selected_experts = selection_scores.topk(self.top_k, dim=-1).indices
+        gate_weights = self.gate_weights(gating_scores.gather(-1, selected_experts))
+        return gating_scores, selected_experts, gate_weights
+
+    @abstractmethod
+    def scores(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gating scores and selection scores, each ``(B, num_experts)``.
+
+        The top-k experts by selection score are selected, and `gate_weights` turns
+        their gating scores into the weights of their outputs.
+        """
+
+    def gate_weights(self, scores: torch.Tensor) -> torch.Tensor:
+        """Weights of experts' outputs from their gating scores, over the last dim."""
+        return torch.softmax(scores, dim=-1)
 
     def update(
         self,
@@ -50,6 +68,10 @@ class Router(nn.Module, ABC):
         """
 
     def metrics(self) -> dict[str, float]:
+        return {}
+
+    def snapshot(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """State to plot, for the inputs ``x``."""
         return {}
 
 
@@ -67,8 +89,8 @@ def rising_bandit_bonus(
     return torch.where(h > 0, bonus, math.inf)
 
 
-class LinearRouter(Router):
-    """Linear gating scores ``x @ W.T + b``, one row of ``W`` per expert.
+class MLPRouter(Router):
+    """Gating scores from an MLP, linear for ``num_layers == 1``.
 
     Selects the top-k experts by score, shifted by the routing biases, and
     normalizes their scores into gate weights.
@@ -80,8 +102,8 @@ class LinearRouter(Router):
         num_experts: int,
         top_k: int,
         activation: str = "softmax",
-        initial_weights: list[list[float]] = None,
-        initial_biases: list[float] = None,
+        hidden_dim: int | None = None,
+        num_layers: int = 1,
     ):
         super().__init__(input_dim, num_experts, top_k)
 
@@ -91,44 +113,27 @@ class LinearRouter(Router):
             )
         self.activation = activation
 
-        self.linear = nn.Linear(input_dim, num_experts, bias=True)
+        self.scorer = mlp(input_dim, num_experts, hidden_dim, num_layers)
 
-        # Only used for the top-k selection, zero unless set by LinearRouterWithBonus.
+        # Only used for the top-k selection, zero unless set by MLPRouterWithBonus.
         self.register_buffer("routing_biases", torch.zeros(num_experts))
 
-        # Insert hard-coded weights and biases if provided
-        if initial_weights is not None:
-            assert len(initial_weights) == num_experts, (
-                f"Initial gating weights must have {num_experts} elements, got {len(initial_weights)}"
-            )
-            self.linear.weight.data = torch.tensor(initial_weights, dtype=torch.float32)
-        if initial_biases is not None:
-            assert len(initial_biases) == num_experts, (
-                f"Initial gating biases must have {num_experts} elements, got {len(initial_biases)}"
-            )
-            self.linear.bias.data = torch.tensor(initial_biases, dtype=torch.float32)
+    def scores(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        gating_scores = self.scorer(x)
+        return gating_scores, gating_scores + self.routing_biases
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        gating_scores = self.linear(x)
-        _, selected_experts = torch.topk(
-            gating_scores + self.routing_biases, self.top_k, dim=1
-        )
-        selected_scores = torch.gather(gating_scores, dim=1, index=selected_experts)
-
-        # Normalize only over the top-k experts, not all experts.
+    def gate_weights(self, scores: torch.Tensor) -> torch.Tensor:
         if self.activation == "softmax":
-            gate_probs = torch.softmax(selected_scores, dim=1)
-        else:  # "sigmoid": sigmoid + sum-normalization
-            sig = torch.sigmoid(selected_scores)
-            gate_probs = sig / sig.sum(dim=1, keepdim=True).clamp(min=1e-9)
+            return torch.softmax(scores, dim=-1)
+        sig = torch.sigmoid(scores)
+        return sig / sig.sum(dim=-1, keepdim=True).clamp(min=1e-9)
 
-        return gating_scores, selected_experts, gate_probs
+    def snapshot(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {"routing_biases": self.routing_biases}
 
 
-class LinearRouterWithBonus(LinearRouter, ABC):
-    """`LinearRouter` whose routing biases are an untrained per-expert bonus, set
+class MLPRouterWithBonus(MLPRouter, ABC):
+    """`MLPRouter` whose routing biases are an untrained per-expert bonus, set
     after each batch from the experts' pulls (tokens routed to them) so far."""
 
     def __init__(self, *args, **kwargs):
@@ -152,7 +157,7 @@ class LinearRouterWithBonus(LinearRouter, ABC):
         """Update ``routing_biases`` after a batch with ``counts`` pulls per expert."""
 
 
-class LoadBalancingRouter(LinearRouterWithBonus):
+class LoadBalancingRouter(MLPRouterWithBonus):
     """Auxiliary loss-free load balancing (DeepSeek-V3): raises the bonus of
     underloaded experts by gamma and lowers that of overloaded ones."""
 
@@ -165,7 +170,7 @@ class LoadBalancingRouter(LinearRouterWithBonus):
         self.routing_biases -= self.gamma * torch.sign(loads - 1 / self.num_experts)
 
 
-class UCBRouter(LinearRouterWithBonus):
+class UCBRouter(MLPRouterWithBonus):
     """UCB's exploration bonus ucb_weight * sqrt(2 log t / N), with t the tokens and
     N the expert's pulls so far. Infinite while N = 0."""
 
@@ -181,7 +186,7 @@ class UCBRouter(LinearRouterWithBonus):
         )
 
 
-class RisingBanditBonusRouter(LinearRouterWithBonus):
+class RisingBanditBonusRouter(MLPRouterWithBonus):
     """R-ed-UCB's exploration bonus, see `rising_bandit_bonus`, with t the tokens and
     N the expert's pulls so far."""
 
@@ -206,30 +211,16 @@ class RisingBanditBonusRouter(LinearRouterWithBonus):
         )
 
 
-LINEAR_ROUTERS: dict[RouterType, type[LinearRouter]] = {
-    RouterType.LINEAR: LinearRouter,
-    RouterType.LOAD_BALANCING: LoadBalancingRouter,
-    RouterType.UCB: UCBRouter,
-    RouterType.RISING_BANDIT_BONUS: RisingBanditBonusRouter,
-}
-
-
 class RandomRouter(Router):
     """Selects ``top_k`` distinct experts uniformly at random per token and weights
     them equally. Has no parameters; its gating scores are all zero."""
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def scores(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         B = x.shape[0]
-        gating_scores = torch.zeros(B, self.num_experts, device=x.device)
-        selected_experts = (
-            torch.rand(B, self.num_experts, device=x.device)
-            .topk(self.top_k, dim=1)
-            .indices
+        return (
+            torch.zeros(B, self.num_experts, device=x.device),
+            torch.rand(B, self.num_experts, device=x.device),
         )
-        gate_probs = torch.full((B, self.top_k), 1 / self.top_k, device=x.device)
-        return gating_scores, selected_experts, gate_probs
 
 
 class BanditRouter(Router):
@@ -315,15 +306,8 @@ class BanditRouter(Router):
         return payoff, z @ self.increment.T, self.bonus.expand_as(payoff), covariance
 
     @torch.no_grad()
-    def forward(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        _, selected_experts = torch.topk(sum(self.index_terms(x)), self.top_k, dim=1)
-        predicted_rewards = self.reward_model(x)
-        gate_probs = torch.softmax(
-            torch.gather(predicted_rewards, 1, selected_experts), dim=1
-        )
-        return predicted_rewards, selected_experts, gate_probs
+    def scores(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.reward_model(x), sum(self.index_terms(x))
 
     def update(
         self,
@@ -407,3 +391,6 @@ class BanditRouter(Router):
         """Means over the last `update`'s batch: `bandit/` over the selected experts,
         `bandit_index/` per expert over all tokens, selected or not."""
         return self._metrics
+
+    def snapshot(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {"index_terms": torch.stack(self.index_terms(x))}

@@ -12,19 +12,14 @@ command:
   - ${env}
   - python
   - ${program}
-  - --config
-  - configs/fixed_target.yaml
+  - ${args_no_hyphens}
 
 parameters:
-  training:
-    parameters:
-      learning_rate:
-        values: [1e-4, 1e-3, 1e-2]
-  model:
-    parameters:
-      router_type:
-        value: load_balancing
-      router_kwargs:
-        parameters:
-          gamma:
-            values: [1e-4,1e-3, 1e-2]
+  target:
+    value: fixed
+  router:
+    value: load_balancing
+  optimizer.lr:
+    values: [1e-4, 1e-3, 1e-2]
+  router.gamma:
+    values: [1e-4, 1e-3, 1e-2]

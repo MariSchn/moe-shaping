@@ -12,13 +12,12 @@ command:
   - ${env}
   - python
   - ${program}
-  - --config
-  - configs/fixed_target.yaml
+  - ${args_no_hyphens}
 
 parameters:
-  training:
-    parameters:
-      learning_rate:
-        values: [1e-4, 1e-3, 1e-2]
-      load_balancing_loss_weight:
-        values: [1e-3,1e-2, 1e-1]
+  target:
+    value: fixed
+  optimizer.lr:
+    values: [1e-4, 1e-3, 1e-2]
+  training.load_balancing_loss_weight:
+    values: [1e-3, 1e-2, 1e-1]

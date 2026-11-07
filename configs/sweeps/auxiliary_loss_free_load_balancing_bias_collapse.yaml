@@ -12,25 +12,18 @@ command:
   - ${env}
   - python
   - ${program}
-  - --config
-  - configs/default.yaml
+  - ${args_no_hyphens}
 
 parameters:
-  training:
-    parameters:
-      optimizer:
-        values: [SGD, Adam]
-      num_experts:
-        values: [4, 16]
-      router_top_k:
-        values: [2, 4, 8]
-      input_dim:
-        values: [1, 16]
-  model:
-    parameters:
-      router_type:
-        value: load_balancing
-      router_kwargs:
-        parameters:
-          gamma:
-            values: [1e-3, 1e-2]
+  router:
+    value: load_balancing
+  optimizer:
+    values: [sgd, adam]
+  model.num_experts:
+    values: [4, 16]
+  model.top_k:
+    values: [2, 4, 8]
+  model.dims:
+    values: [[1, 1], [16, 1]]
+  router.gamma:
+    values: [1e-3, 1e-2]

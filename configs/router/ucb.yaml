@@ -1,0 +1,7 @@
+# MLP router with a UCB exploration bonus.
+_target_: router.UCBRouter
+_partial_: true
+activation: softmax
+hidden_dim: null
+num_layers: 1
+ucb_weight: 1.0
