@@ -20,11 +20,17 @@ parameters:
     parameters:
       optimizer:
         values: [SGD, Adam]
-      auxiliarly_loss_free_load_balancing_gamma:
-        values: [1e-3, 1e-2]
       num_experts:
         values: [4, 16]
       router_top_k:
         values: [2, 4, 8]
       input_dim:
         values: [1, 16]
+  model:
+    parameters:
+      router_type:
+        value: load_balancing
+      router_kwargs:
+        parameters:
+          gamma:
+            values: [1e-3, 1e-2]

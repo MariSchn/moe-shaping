@@ -326,7 +326,7 @@ def routing_bias_visualization(model: nn.Module) -> dict:
 
 
 def _ylim(data, extra=None):
-    ymin, ymax = float(data.min()), float(data.max())
+    ymin, ymax = float(np.nanmin(data)), float(np.nanmax(data))
     if extra is not None:
         ymin = min(ymin, float(extra.min()))
         ymax = max(ymax, float(extra.max()))
@@ -685,13 +685,15 @@ def export_training_animation_visualization(
         [np.array(f["per_expert_grad_norm"]) for f in viz_frames]
     )
     num_experts = all_per_expert_loss.shape[1]
-    # Only routers with auxiliary loss-free routing biases record them.
+    # Only linear routers record routing biases.
     has_routing_biases = "routing_biases" in viz_frames[0]
     all_routing_biases = (
         np.array([f["routing_biases"].numpy() for f in viz_frames])
         if has_routing_biases
         else np.zeros((len(viz_frames), num_experts))
     )
+    # Leave out the infinite bonus of unexplored experts.
+    all_routing_biases[np.isinf(all_routing_biases)] = np.nan
     all_expert_counts = np.array(
         [
             np.bincount(

@@ -1,10 +1,19 @@
 import math
 from abc import ABC, abstractmethod
+from enum import StrEnum
 
 import torch
 import torch.nn as nn
 
 INDEX_TERMS = ("payoff", "increment", "bonus", "covariance")
+
+
+class RouterType(StrEnum):
+    LINEAR = "linear"
+    LOAD_BALANCING = "load_balancing"
+    UCB = "ucb"
+    RISING_BANDIT_BONUS = "rising_bandit_bonus"
+    BANDIT = "bandit"
 
 
 class Router(nn.Module, ABC):
@@ -36,18 +45,32 @@ class Router(nn.Module, ABC):
     ) -> None:
         """Learn from the per-token losses ``(B,)`` of the final predictions for ``x``.
 
-        Only for routers that don't learn from the gradients of the task loss.
+        For anything not learned from the gradients of the task loss.
         """
 
     def metrics(self) -> dict[str, float]:
         return {}
 
 
+def rising_bandit_bonus(
+    pulls: torch.Tensor, t: int, epsilon: float, sigma: float, alpha: float
+) -> torch.Tensor:
+    """R-ed-UCB's exploration bonus per expert (Metelli et al., 2022)
+
+        sigma (t - N + h - 1) sqrt(10 log(1 / delta_t) / h^3)
+
+    with N its pulls, h = floor(epsilon * N) and delta_t = t^-alpha. Infinite while h = 0.
+    """
+    h = torch.floor(epsilon * pulls)
+    bonus = sigma * (t - pulls + h - 1) * torch.sqrt(10 * alpha * math.log(t) / h**3)
+    return torch.where(h > 0, bonus, math.inf)
+
+
 class LinearRouter(Router):
     """Linear gating scores ``x @ W.T + b``, one row of ``W`` per expert.
 
-    Selects the top-k experts by score, shifted by the auxiliary loss-free
-    routing biases, and normalizes their scores into gate weights.
+    Selects the top-k experts by score, shifted by the routing biases, and
+    normalizes their scores into gate weights.
     """
 
     def __init__(
@@ -69,7 +92,7 @@ class LinearRouter(Router):
 
         self.linear = nn.Linear(input_dim, num_experts, bias=True)
 
-        # Auxiliary loss-free load balancing (ignored if cfg.training.load_balancing_loss_weight < 0)
+        # Only used for the top-k selection, zero unless set by LinearRouterWithBonus.
         self.register_buffer("routing_biases", torch.zeros(num_experts))
 
         # Insert hard-coded weights and biases if provided
@@ -102,38 +125,92 @@ class LinearRouter(Router):
 
         return gating_scores, selected_experts, gate_probs
 
-    def update_routing_biases(
+
+class LinearRouterWithBonus(LinearRouter, ABC):
+    """`LinearRouter` whose routing biases are an untrained per-expert bonus, set
+    after each batch from the experts' pulls (tokens routed to them) so far."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.num_tokens = 0
+        self.register_buffer("pulls", torch.zeros(self.num_experts))
+
+    def update(
         self,
+        x: torch.Tensor,
         selected_experts: torch.Tensor,
-        gamma: float = 1e-3,
-        target_load: float | None = None,
-    ):
-        if gamma <= 0:
-            return
+        losses: torch.Tensor,
+    ) -> None:
+        counts = torch.bincount(selected_experts.flatten(), minlength=self.num_experts)
+        self.pulls += counts
+        self.num_tokens += len(selected_experts)
+        self.update_bonus(counts)
 
-        B, _ = selected_experts.shape
+    @abstractmethod
+    def update_bonus(self, counts: torch.Tensor) -> None:
+        """Update ``routing_biases`` after a batch with ``counts`` pulls per expert."""
 
-        # Use uniform load as default target load
-        target_load = target_load or self.top_k / self.num_experts
 
-        # Calculate the mean load of each expert
-        expert_counts = torch.zeros(self.num_experts, device=selected_experts.device)
-        expert_counts.scatter_add_(
-            0,
-            selected_experts.flatten(),
-            torch.ones(selected_experts.numel(), device=selected_experts.device),
+class LoadBalancingRouter(LinearRouterWithBonus):
+    """Auxiliary loss-free load balancing (DeepSeek-V3): raises the bonus of
+    underloaded experts by gamma and lowers that of overloaded ones."""
+
+    def __init__(self, *args, gamma: float = 1e-3, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gamma = gamma
+
+    def update_bonus(self, counts: torch.Tensor) -> None:
+        loads = counts / counts.sum()
+        self.routing_biases -= self.gamma * torch.sign(loads - 1 / self.num_experts)
+
+
+class UCBRouter(LinearRouterWithBonus):
+    """UCB's exploration bonus ucb_weight * sqrt(2 log t / N), with t the tokens and
+    N the expert's pulls so far. Infinite while N = 0."""
+
+    def __init__(self, *args, ucb_weight: float = 1.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ucb_weight = ucb_weight
+        self.routing_biases.fill_(math.inf)
+
+    def update_bonus(self, counts: torch.Tensor) -> None:
+        t = self.num_tokens + 1
+        self.routing_biases.copy_(
+            self.ucb_weight * torch.sqrt(2 * math.log(t) / self.pulls)
         )
-        expert_loads = expert_counts / B
 
-        # Calculate the difference between the expert load and the target load
-        load_differences = expert_loads - target_load
 
-        bias_updates = torch.zeros(self.num_experts, device=selected_experts.device)
-        bias_updates[load_differences < 0] = gamma
-        bias_updates[load_differences > 0] = -gamma
+class RisingBanditBonusRouter(LinearRouterWithBonus):
+    """R-ed-UCB's exploration bonus, see `rising_bandit_bonus`, with t the tokens and
+    N the expert's pulls so far."""
 
-        # Update the routing biases
-        self.routing_biases += bias_updates
+    def __init__(
+        self,
+        *args,
+        epsilon: float = 0.25,
+        sigma: float = 0.1,
+        alpha: float = 3.0,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.epsilon = epsilon
+        self.sigma = sigma
+        self.alpha = alpha
+        self.routing_biases.fill_(math.inf)
+
+    def update_bonus(self, counts: torch.Tensor) -> None:
+        t = self.num_tokens + 1
+        self.routing_biases.copy_(
+            rising_bandit_bonus(self.pulls, t, self.epsilon, self.sigma, self.alpha)
+        )
+
+
+LINEAR_ROUTERS: dict[RouterType, type[LinearRouter]] = {
+    RouterType.LINEAR: LinearRouter,
+    RouterType.LOAD_BALANCING: LoadBalancingRouter,
+    RouterType.UCB: UCBRouter,
+    RouterType.RISING_BANDIT_BONUS: RisingBanditBonusRouter,
+}
 
 
 class BanditRouter(Router):
@@ -290,22 +367,22 @@ class BanditRouter(Router):
     def _update_index(self) -> None:
         """Evaluate the index's sums over pulls for the next token."""
         t = self.num_tokens + 1
+        num_pulls = torch.tensor(
+            [len(rows) for rows in self.history], dtype=torch.float
+        )
+        self.bonus.copy_(
+            rising_bandit_bonus(num_pulls, t, self.epsilon, self.sigma, self.alpha)
+        )
         for i, rows in enumerate(self.history):
             n = len(rows)
             h = math.floor(self.epsilon * n)
             if h == 0:
-                # For window size 0, keep infinite bonus
                 continue
             recent = rows[n - h :]  # pulls l = n - h + 1, ..., n
             previous = rows[n - 2 * h : n - h]  # pulls l - h
             pulls = torch.arange(n - h + 1, n + 1).unsqueeze(1)
             self.payoff[i] = recent.mean(dim=0)
             self.increment[i] = ((t - pulls) * (recent - previous) / h).mean(dim=0)
-            self.bonus[i] = (
-                self.sigma
-                * (t - n + h - 1)
-                * math.sqrt(10 * self.alpha * math.log(t) / h**3)
-            )
 
     def metrics(self) -> dict[str, float]:
         """Means over the last `update`'s batch: `bandit/` over the selected experts,

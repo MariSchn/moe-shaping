@@ -20,5 +20,11 @@ parameters:
     parameters:
       learning_rate:
         values: [1e-4, 1e-3, 1e-2]
-      auxiliarly_loss_free_load_balancing_gamma:
-        values: [1e-4,1e-3, 1e-2]
+  model:
+    parameters:
+      router_type:
+        value: load_balancing
+      router_kwargs:
+        parameters:
+          gamma:
+            values: [1e-4,1e-3, 1e-2]

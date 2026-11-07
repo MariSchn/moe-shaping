@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from typing import Tuple
 
-from router import BanditRouter, LinearRouter
+from router import LINEAR_ROUTERS, BanditRouter, RouterType
 
 
 class Expert(nn.Module):
@@ -87,8 +87,8 @@ class Model(nn.Module):
         initial_expert_biases: list[list[float]] = None,
         initial_gating_weights: list[list[float]] = None,
         initial_gating_biases: list[float] = None,
-        router_type: str = "linear",
-        bandit_router: dict | None = None,
+        router_type: RouterType = RouterType.LINEAR,
+        router_kwargs: dict | None = None,
     ):
         super().__init__()
 
@@ -110,23 +110,22 @@ class Model(nn.Module):
                 for _ in range(num_experts)
             ]
         )
-        if router_type == "linear":
-            self.router = LinearRouter(
-                input_dim,
-                num_experts,
-                router_top_k,
-                router_activation,
-                initial_weights=initial_gating_weights,
-                initial_biases=initial_gating_biases,
-            )
-        elif router_type == "bandit":
-            self.router = BanditRouter(
-                input_dim, num_experts, router_top_k, **(bandit_router or {})
-            )
-        else:
-            raise ValueError(
-                f"router_type must be 'linear' or 'bandit', got {router_type!r}"
-            )
+        router_kwargs = router_kwargs or {}
+        match RouterType(router_type):
+            case RouterType.BANDIT:
+                self.router = BanditRouter(
+                    input_dim, num_experts, router_top_k, **router_kwargs
+                )
+            case linear_router_type:
+                self.router = LINEAR_ROUTERS[linear_router_type](
+                    input_dim,
+                    num_experts,
+                    router_top_k,
+                    router_activation,
+                    initial_weights=initial_gating_weights,
+                    initial_biases=initial_gating_biases,
+                    **router_kwargs,
+                )
 
         # Insert hard-coded weights and biases if provided
         self.set_initial_weights(initial_expert_weights, initial_expert_biases)
