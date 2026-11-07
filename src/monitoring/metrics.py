@@ -7,8 +7,7 @@ from model.moe import ExpertBank, MoELayer, MoEOutput
 
 
 # Quantiles (in [0, 1]) of the per-expert load distribution, logged as
-# "load/p10".."load/p90" alongside "load/min" (the p0 extreme) and "load/max"
-# (p100). Mirrors _LOAD_QUANTILES in the Megatron-LM patch (lm/patches/0004).
+# "load/p10".."load/p90" alongside "load/min" (the p0 extreme). Mirrors _LOAD_QUANTILES in the Megatron-LM patch (lm/patches/0004).
 LOAD_QUANTILES = (0.10, 0.25, 0.50, 0.75, 0.90)
 
 
@@ -32,12 +31,12 @@ def expert_load(selected_experts: torch.Tensor, num_experts: int) -> torch.Tenso
 
 def load_metrics(selected_experts: torch.Tensor, num_experts: int) -> dict[str, float]:
     """Per-expert load distribution summary, mirroring the Megatron-LM expert-load
-    logging (lm/patches/0004): "load/min", "load/max", "load/pXX", and
-    "load/max_vio", MaxVio (Wang et al., 2024), (max_i load_i - mean load) / mean load."""
+    logging (lm/patches/0004): "load/min", "load/pXX", and "load/max_vio", MaxVio
+    (Wang et al., 2024), (max_i load_i - mean load) / mean load. The mean load is
+    always top_k / num_experts, so MaxVio stands in for the max load."""
     load = expert_load(selected_experts, num_experts)
     quantiles = torch.quantile(load, torch.tensor(LOAD_QUANTILES, device=load.device))
     return {
-        "load/max": load.max().item(),
         "load/min": load.min().item(),
         **{
             f"load/p{round(q * 100)}": v
@@ -156,13 +155,10 @@ def per_expert_grad_norm(experts: ExpertBank) -> torch.Tensor:
     return sum_sq.sqrt()
 
 
-def layer_metrics(
-    layer: MoELayer, output: MoEOutput, load_balancing_loss: torch.Tensor
-) -> dict[str, float]:
+def layer_metrics(layer: MoELayer, output: MoEOutput) -> dict[str, float]:
     """Metrics of one MoE layer, keyed ``<topic>/<name>``."""
     return {
         **load_metrics(output.selected_experts, layer.router.num_experts),
-        "load/balancing_loss": load_balancing_loss.item(),
         "grad_norm/router": grad_norm(layer.router.parameters()),
         "grad_norm/experts": grad_norm(layer.experts.parameters()),
         **{f"router/{k}": v for k, v in layer.router.metrics().items()},

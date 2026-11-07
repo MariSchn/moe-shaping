@@ -128,9 +128,6 @@ class MLPRouter(Router):
         sig = torch.sigmoid(scores)
         return sig / sig.sum(dim=-1, keepdim=True).clamp(min=1e-9)
 
-    def snapshot(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        return {"routing_biases": self.routing_biases}
-
 
 class MLPRouterWithBonus(MLPRouter, ABC):
     """`MLPRouter` whose routing biases are an untrained per-expert bonus, set
@@ -155,6 +152,9 @@ class MLPRouterWithBonus(MLPRouter, ABC):
     @abstractmethod
     def update_bonus(self, counts: torch.Tensor) -> None:
         """Update ``routing_biases`` after a batch with ``counts`` pulls per expert."""
+
+    def snapshot(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {"routing_biases": self.routing_biases}
 
 
 class LoadBalancingRouter(MLPRouterWithBonus):
@@ -331,7 +331,6 @@ class BanditRouter(Router):
         )
         explored = bonus.isfinite()
         self._metrics = {
-            "reward": rewards.mean().item(),
             "reward_model_loss": reward_model_loss.item(),
             "index_payoff": payoff[explored].mean().item(),
             "index_increment": increment[explored].mean().item(),

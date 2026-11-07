@@ -63,14 +63,10 @@ def train(
         predictions, outputs = model(x)
         loss = F.mse_loss(predictions, y)
 
-        # Always calculated for logging, only added to the loss with a positive weight.
-        load_balancing_losses = [
-            load_balancing_loss(out.gating_scores, out.selected_experts)
-            for out in outputs
-        ]
         if cfg.training.load_balancing_loss_weight > 0:
             loss = loss + cfg.training.load_balancing_loss_weight * sum(
-                load_balancing_losses
+                load_balancing_loss(out.gating_scores, out.selected_experts)
+                for out in outputs
             )
 
         optimizer.zero_grad()
@@ -94,10 +90,8 @@ def train(
                 "regret/gating": regret_gating,
                 "regret/optimal": regret_optimal,
             }
-            for i, (layer, out, lb_loss) in enumerate(
-                zip(model.layers, outputs, load_balancing_losses)
-            ):
-                for name, value in layer_metrics(layer, out, lb_loss).items():
+            for i, (layer, out) in enumerate(zip(model.layers, outputs)):
+                for name, value in layer_metrics(layer, out).items():
                     metrics[f"{name}/layer{i}"] = value
             wandb.log(metrics)
 
