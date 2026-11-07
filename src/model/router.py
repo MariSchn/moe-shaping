@@ -331,16 +331,13 @@ class BanditRouter(Router):
         )
         explored = bonus.isfinite()
         self._metrics = {
-            "bandit/reward": rewards.mean().item(),
-            "bandit/reward_model_loss": reward_model_loss.item(),
-            "bandit/index_payoff": payoff[explored].mean().item(),
-            "bandit/index_increment": increment[explored].mean().item(),
-            "bandit/index_bonus": bonus[explored].mean().item(),
-            "bandit/index_covariance": covariance[explored].mean().item(),
+            "reward": rewards.mean().item(),
+            "reward_model_loss": reward_model_loss.item(),
+            "index_payoff": payoff[explored].mean().item(),
+            "index_increment": increment[explored].mean().item(),
+            "index_bonus": bonus[explored].mean().item(),
+            "index_covariance": covariance[explored].mean().item(),
         }
-        for name, term in zip(INDEX_TERMS, index_terms):
-            for i, value in enumerate(term.mean(dim=0).tolist()):
-                self._metrics[f"bandit_index/{name}_{i}"] = value
 
         self.num_tokens += x.shape[0]
         self._record_pulls(selected_experts)
@@ -388,8 +385,7 @@ class BanditRouter(Router):
             self.increment[i] = ((t - pulls) * (recent - previous) / h).mean(dim=0)
 
     def metrics(self) -> dict[str, float]:
-        """Means over the last `update`'s batch: `bandit/` over the selected experts,
-        `bandit_index/` per expert over all tokens, selected or not."""
+        """Means over the last `update`'s batch and its selected experts."""
         return self._metrics
 
     def snapshot(self, x: torch.Tensor) -> dict[str, torch.Tensor]:

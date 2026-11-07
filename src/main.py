@@ -4,7 +4,7 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 import wandb
-from monitoring.visualization import plot_run
+from monitoring.visualization import plot_run, plot_target
 from monitoring.wandb import init_wandb, log_plots
 from training import train
 from utils import get_device, set_seed
@@ -37,11 +37,15 @@ def main(cfg: DictConfig) -> None:
             p.numel() for p in model.parameters() if p.requires_grad
         )
 
+    plot_target(target, output_dir, grid=model.input_dim == 1)
+    if cfg.wandb.enabled:
+        log_plots(output_dir, ["target"])
+
     frames = train(model, target, optimizer, cfg)
 
     plot_run(frames, target, output_dir)
     if cfg.wandb.enabled:
-        log_plots(output_dir)
+        log_plots(output_dir, ["init", "final", "anims"])
 
 
 if __name__ == "__main__":

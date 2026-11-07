@@ -128,25 +128,61 @@ def _expert_colormap(num_experts):
     )
 
 
-def _lines(x, ys, labels, title, ylim, ref=None, breakpoints=(), yticks=None):
-    """One line over ``x`` per label, ``ys`` is ``(T, len(labels), len(x))``."""
-    fig, ax = plt.subplots()
+def _add_selection_strip(strip, x, selected_experts, num_experts):
+    """Show the top-k experts ``(len(x), top_k)`` at every x on the axes ``strip``,
+    in the experts' line colors. Returns the image."""
+    top_k = selected_experts.shape[-1]
+    strip.set_yticks(
+        np.arange(top_k) + 0.5, [f"Top-{k + 1}" for k in range(top_k)], fontsize=8
+    )
+    cmap, norm = _expert_colormap(num_experts)
+    return strip.imshow(
+        selected_experts.T,
+        aspect="auto",
+        cmap=cmap,
+        norm=norm,
+        extent=(x[0], x[-1], 0, top_k),
+        origin="lower",
+        interpolation="nearest",
+    )
+
+
+def _lines(x, ys, labels, title, ylim, ref=None, breakpoints=(), selected_experts=None):
+    """One line over ``x`` per label, ``ys`` is ``(T, len(labels), len(x))``.
+
+    With ``selected_experts`` ``(T, len(x), top_k)``, a strip below shows the top-k
+    experts, the labels being the experts.
+    """
+    if selected_experts is None:
+        fig, ax = plt.subplots()
+    else:
+        fig, (ax, strip_ax) = plt.subplots(
+            2,
+            1,
+            sharex=True,
+            height_ratios=(12, 1),
+            gridspec_kw={"hspace": 0.05},
+            figsize=(6.4, 5.2),
+        )
     lines = [ax.plot(x, ys[0, i], label=label)[0] for i, label in enumerate(labels)]
     if ref is not None:
         ax.plot(x, ref, color="black", linestyle="--", label="Target")
     _add_breakpoints(ax, breakpoints)
     ax.legend()
     ax.set_xlim(x[0], x[-1])
+    if selected_experts is not None:
+        strip = _add_selection_strip(strip_ax, x, selected_experts[0], len(labels))
     ax.set_ylim(ylim)
-    if yticks is not None:
-        ax.set_yticks(yticks)
     ax.grid(True)
     ax.set_title(title)
 
     def update(i):
         for line, y in zip(lines, ys[i]):
             line.set_ydata(y)
-        return lines
+        if selected_experts is None:
+            return lines
+        strip.set_data(selected_experts[i].T)
+        return (*lines, strip)
 
     return fig, update
 
@@ -175,7 +211,6 @@ def _index(x, index_terms, selected_experts, title):
     """The bandit index terms ``(T, len(INDEX_TERMS), len(x), num_experts)``, their
     sum, and the selected experts ``(T, len(x), top_k)``."""
     num_experts = index_terms.shape[-1]
-    top_k = selected_experts.shape[-1]
     domain = (x[0], x[-1])
     # The bonus is infinite until an expert has enough pulls.
     index_terms = np.where(np.isinf(index_terms), np.nan, index_terms)
@@ -209,19 +244,7 @@ def _index(x, index_terms, selected_experts, title):
     axes[-1].legend(handles=[max_reward], loc="upper left")
     strip = axes[-1].inset_axes([0, 0, 1, 0.1])
     strip.set_xticks([])
-    strip.set_yticks(
-        np.arange(top_k) + 0.5, [f"Top-{k + 1}" for k in range(top_k)], fontsize=8
-    )
-    cmap, norm = _expert_colormap(num_experts)
-    selected = strip.imshow(
-        selected_experts[0].T,
-        aspect="auto",
-        cmap=cmap,
-        norm=norm,
-        extent=(*domain, 0, top_k),
-        origin="lower",
-        interpolation="nearest",
-    )
+    selected = _add_selection_strip(strip, x, selected_experts[0], num_experts)
     fig.tight_layout()
 
     def update(i):
@@ -397,18 +420,6 @@ def render(
             continue
 
         selected = get("selected_experts")
-        top_k = selected.shape[-1]
-        plot(
-            path("top_expert"),
-            _lines,
-            x=x,
-            ys=selected.transpose(0, 2, 1),
-            labels=[f"Top-{k + 1} Expert" for k in range(top_k)],
-            title=f"Layer {i}: Top-k Experts",
-            ylim=(-0.1, num_experts - 0.9),
-            breakpoints=breakpoints,
-            yticks=range(num_experts),
-        )
         scores = (get("gating_scores") + routing_biases).transpose(0, 2, 1)
         plot(
             path("router"),
@@ -419,6 +430,7 @@ def render(
             title=f"Layer {i}: Routing Scores",
             ylim=_ylim(scores),
             breakpoints=breakpoints,
+            selected_experts=selected,
         )
         expert_outputs = get("expert_outputs")
         if expert_outputs.shape[-1] == 1:
@@ -433,6 +445,7 @@ def render(
                 title=f"Layer {i}: Experts",
                 ylim=_ylim(ys, layer_ref),
                 ref=layer_ref,
+                selected_experts=selected,
             )
         if "index_terms" in has:
             plot(
@@ -467,25 +480,33 @@ def render(
             future.result()
 
 
-def plot_run(frames: list[dict], target: TargetFunction, output_dir: str) -> None:
-    """PNGs of the target and the first and last frame, and MP4s over all frames,
-    into ``target/``, ``init/``, ``final/`` and ``anims/`` of ``output_dir``."""
-    x_grid = input_grid(target) if "x" in frames[0] else None
-    ref = None
-    if x_grid is not None:
-        y = target(x_grid)
-        ref = y[:, 0].cpu().numpy() if y.shape[-1] == 1 else None
+def _breakpoints(target: TargetFunction) -> list[float]:
+    """The target's breakpoints inside its domain."""
+    if target.breakpoints is None:
+        return []
+    bps = target.breakpoints.cpu()
+    return bps[(bps > target.domain[0]) & (bps < target.domain[1])].tolist()
 
-    breakpoints = []
-    if target.breakpoints is not None:
-        bps = target.breakpoints.cpu()
-        breakpoints = bps[(bps > target.domain[0]) & (bps < target.domain[1])].tolist()
 
+def plot_target(target: TargetFunction, output_dir: str, grid: bool) -> None:
+    """PNGs of the target into ``target/`` of ``output_dir``, over the input grid
+    if ``grid``."""
     render(
-        [target_frame(target, x_grid)],
+        [target_frame(target, input_grid(target) if grid else None)],
         os.path.join(output_dir, "target"),
-        breakpoints=breakpoints,
+        breakpoints=_breakpoints(target),
     )
+
+
+def plot_run(frames: list[dict], target: TargetFunction, output_dir: str) -> None:
+    """PNGs of the first and last frame and MP4s over all frames, into ``init/``,
+    ``final/`` and ``anims/`` of ``output_dir``."""
+    ref = None
+    if "x" in frames[0]:
+        y = target(input_grid(target))
+        ref = y[:, 0].cpu().numpy() if y.shape[-1] == 1 else None
+    breakpoints = _breakpoints(target)
+
     render(frames[:1], os.path.join(output_dir, "init"), ref, breakpoints)
     render(frames[-1:], os.path.join(output_dir, "final"), ref, breakpoints)
     render(frames, os.path.join(output_dir, "anims"), ref, breakpoints, animate=True)

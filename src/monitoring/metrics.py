@@ -32,8 +32,8 @@ def expert_load(selected_experts: torch.Tensor, num_experts: int) -> torch.Tenso
 
 def load_metrics(selected_experts: torch.Tensor, num_experts: int) -> dict[str, float]:
     """Per-expert load distribution summary, mirroring the Megatron-LM expert-load
-    logging (lm/patches/0004): "load/min", "load/max", "load/pXX", and MaxVio
-    (Wang et al., 2024), (max_i load_i - mean load) / mean load."""
+    logging (lm/patches/0004): "load/min", "load/max", "load/pXX", and
+    "load/max_vio", MaxVio (Wang et al., 2024), (max_i load_i - mean load) / mean load."""
     load = expert_load(selected_experts, num_experts)
     quantiles = torch.quantile(load, torch.tensor(LOAD_QUANTILES, device=load.device))
     return {
@@ -43,7 +43,7 @@ def load_metrics(selected_experts: torch.Tensor, num_experts: int) -> dict[str, 
             f"load/p{round(q * 100)}": v
             for q, v in zip(LOAD_QUANTILES, quantiles.tolist())
         },
-        "max_vio": ((load.max() - load.mean()) / load.mean()).item(),
+        "load/max_vio": ((load.max() - load.mean()) / load.mean()).item(),
     }
 
 
@@ -159,10 +159,11 @@ def per_expert_grad_norm(experts: ExpertBank) -> torch.Tensor:
 def layer_metrics(
     layer: MoELayer, output: MoEOutput, load_balancing_loss: torch.Tensor
 ) -> dict[str, float]:
+    """Metrics of one MoE layer, keyed ``<topic>/<name>``."""
     return {
-        "load_balancing_loss": load_balancing_loss.item(),
         **load_metrics(output.selected_experts, layer.router.num_experts),
-        "router_grad_norm": grad_norm(layer.router.parameters()),
-        "expert_grad_norm": grad_norm(layer.experts.parameters()),
-        **layer.router.metrics(),
+        "load/balancing_loss": load_balancing_loss.item(),
+        "grad_norm/router": grad_norm(layer.router.parameters()),
+        "grad_norm/experts": grad_norm(layer.experts.parameters()),
+        **{f"router/{k}": v for k, v in layer.router.metrics().items()},
     }

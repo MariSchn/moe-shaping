@@ -98,7 +98,7 @@ def train(
                 zip(model.layers, outputs, load_balancing_losses)
             ):
                 for name, value in layer_metrics(layer, out, lb_loss).items():
-                    metrics[f"layer{i}/{name}"] = value
+                    metrics[f"{name}/layer{i}"] = value
             wandb.log(metrics)
 
         if step % cfg.logging.frame_every == 0:
