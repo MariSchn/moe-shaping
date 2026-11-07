@@ -3,7 +3,6 @@ defaults:
   - router: mlp
   - optimizer: adam
   - target: random_model
-  - experiment: null
 
 seed: 0
 
