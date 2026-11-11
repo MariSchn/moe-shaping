@@ -33,7 +33,6 @@ wandb:
   enabled: true
   project: moe-shaping
   entity: mari-schn
-  # Defaults to the command line overrides, e.g. "router=ucb,seed=1".
   run_name: null
   run_tags: []
 
