@@ -45,7 +45,7 @@ def init_wandb(cfg: DictConfig) -> None:
     wandb.define_metric("regret", summary="last")
 
 
-def log_plots(output_dir: str, subdirs: list[str]) -> None:
+def log_plots(output_dir: str, subdirs: list[str], commit: bool = True) -> None:
     """Every PNG and MP4 in ``subdirs`` of ``output_dir``, keyed ``plots/<path>``."""
     log = {}
     for subdir in subdirs:
@@ -59,4 +59,4 @@ def log_plots(output_dir: str, subdirs: list[str]) -> None:
                     if ext == ".mp4"
                     else wandb.Image(path)
                 )
-    wandb.log(log)
+    wandb.log(log, commit=commit)

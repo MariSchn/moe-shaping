@@ -39,7 +39,8 @@ def main(cfg: DictConfig) -> None:
 
     plot_target(target, output_dir, grid=model.input_dim == 1)
     if cfg.wandb.enabled:
-        log_plots(output_dir, ["target"])
+        # Not committed, so it lands on step 0 with the first training metrics
+        log_plots(output_dir, ["target"], commit=False)
 
     frames = train(model, target, optimizer, cfg)
 

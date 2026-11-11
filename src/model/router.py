@@ -154,7 +154,7 @@ class MLPRouterWithBonus(MLPRouter, ABC):
         """Update ``routing_biases`` after a batch with ``counts`` pulls per expert."""
 
     def snapshot(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        return {"routing_biases": self.routing_biases}
+        return {"routing_biases": self.routing_biases.clone()}
 
 
 class LoadBalancingRouter(MLPRouterWithBonus):

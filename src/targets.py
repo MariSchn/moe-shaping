@@ -44,7 +44,9 @@ class PiecewiseLinearTarget(TargetFunction):
                 domain[0], domain[1], num_pieces + 1, device=device
             )
         elif breakpoint_mode == "random":
-            self._breakpoints = sample_uniformly(domain, num_pieces + 1)
+            self._breakpoints = (
+                sample_uniformly(domain, num_pieces + 1)[:, 0].sort().values.to(device)
+            )
         else:
             raise ValueError(f"Invalid breakpoint mode: {breakpoint_mode}")
 
