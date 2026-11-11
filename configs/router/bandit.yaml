@@ -1,0 +1,9 @@
+# Contextual R-ed-UCB, learns only from rewards.
+_target_: model.router.BanditRouter
+_partial_: true
+epsilon: 0.25
+sigma: 0.1
+alpha: 3.0
+lr: 1e-2
+linucb_weight: 0.0
+linucb_ridge: 1.0

@@ -1,0 +1,2 @@
+_target_: model.router.RandomRouter
+_partial_: true

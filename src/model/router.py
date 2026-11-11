@@ -7,6 +7,19 @@ import torch.nn as nn
 INDEX_TERMS = ("payoff", "increment", "bonus", "covariance")
 
 
+def mlp(
+    input_dim: int, output_dim: int, hidden_dim: int | None = None, num_layers: int = 1
+) -> nn.Sequential:
+    """``num_layers`` linear layers with ReLUs in between."""
+    if num_layers > 1 and hidden_dim is None:
+        raise ValueError("hidden_dim must be set when num_layers > 1")
+    dims = [input_dim] + [hidden_dim] * (num_layers - 1) + [output_dim]
+    layers = []
+    for d_in, d_out in zip(dims[:-1], dims[1:]):
+        layers += [nn.Linear(d_in, d_out), nn.ReLU()]
+    return nn.Sequential(*layers[:-1])
+
+
 class Router(nn.Module, ABC):
     """Picks ``top_k`` of ``num_experts`` experts per input and weights their outputs."""
 
@@ -16,7 +29,6 @@ class Router(nn.Module, ABC):
         self.num_experts = num_experts
         self.top_k = top_k
 
-    @abstractmethod
     def forward(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -25,8 +37,24 @@ class Router(nn.Module, ABC):
         Returns:
             gating_scores: (B, num_experts) score of every expert.
             selected_experts: (B, top_k) indices of the selected experts.
-            gate_probs: (B, top_k) weights of the selected experts' outputs.
+            gate_weights: (B, top_k) weights of the selected experts' outputs.
         """
+        gating_scores, selection_scores = self.scores(x)
+        selected_experts = selection_scores.topk(self.top_k, dim=-1).indices
+        gate_weights = self.gate_weights(gating_scores.gather(-1, selected_experts))
+        return gating_scores, selected_experts, gate_weights
+
+    @abstractmethod
+    def scores(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gating scores and selection scores, each ``(B, num_experts)``.
+
+        The top-k experts by selection score are selected, and `gate_weights` turns
+        their gating scores into the weights of their outputs.
+        """
+
+    def gate_weights(self, scores: torch.Tensor) -> torch.Tensor:
+        """Weights of experts' outputs from their gating scores, over the last dim."""
+        return torch.softmax(scores, dim=-1)
 
     def update(
         self,
@@ -36,18 +64,36 @@ class Router(nn.Module, ABC):
     ) -> None:
         """Learn from the per-token losses ``(B,)`` of the final predictions for ``x``.
 
-        Only for routers that don't learn from the gradients of the task loss.
+        For anything not learned from the gradients of the task loss.
         """
 
     def metrics(self) -> dict[str, float]:
         return {}
 
+    def snapshot(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """State to plot, for the inputs ``x``."""
+        return {}
 
-class LinearRouter(Router):
-    """Linear gating scores ``x @ W.T + b``, one row of ``W`` per expert.
 
-    Selects the top-k experts by score, shifted by the auxiliary loss-free
-    routing biases, and normalizes their scores into gate weights.
+def rising_bandit_bonus(
+    pulls: torch.Tensor, t: int, epsilon: float, sigma: float, alpha: float
+) -> torch.Tensor:
+    """R-ed-UCB's exploration bonus per expert (Metelli et al., 2022)
+
+        sigma (t - N + h - 1) sqrt(10 log(1 / delta_t) / h^3)
+
+    with N its pulls, h = floor(epsilon * N) and delta_t = t^-alpha. Infinite while h = 0.
+    """
+    h = torch.floor(epsilon * pulls)
+    bonus = sigma * (t - pulls + h - 1) * torch.sqrt(10 * alpha * math.log(t) / h**3)
+    return torch.where(h > 0, bonus, math.inf)
+
+
+class MLPRouter(Router):
+    """Gating scores from an MLP, linear for ``num_layers == 1``.
+
+    Selects the top-k experts by score, shifted by the routing biases, and
+    normalizes their scores into gate weights.
     """
 
     def __init__(
@@ -56,8 +102,8 @@ class LinearRouter(Router):
         num_experts: int,
         top_k: int,
         activation: str = "softmax",
-        initial_weights: list[list[float]] = None,
-        initial_biases: list[float] = None,
+        hidden_dim: int | None = None,
+        num_layers: int = 1,
     ):
         super().__init__(input_dim, num_experts, top_k)
 
@@ -67,73 +113,114 @@ class LinearRouter(Router):
             )
         self.activation = activation
 
-        self.linear = nn.Linear(input_dim, num_experts, bias=True)
+        self.scorer = mlp(input_dim, num_experts, hidden_dim, num_layers)
 
-        # Auxiliary loss-free load balancing (ignored if cfg.training.load_balancing_loss_weight < 0)
+        # Only used for the top-k selection, zero unless set by MLPRouterWithBonus.
         self.register_buffer("routing_biases", torch.zeros(num_experts))
 
-        # Insert hard-coded weights and biases if provided
-        if initial_weights is not None:
-            assert len(initial_weights) == num_experts, (
-                f"Initial gating weights must have {num_experts} elements, got {len(initial_weights)}"
-            )
-            self.linear.weight.data = torch.tensor(initial_weights, dtype=torch.float32)
-        if initial_biases is not None:
-            assert len(initial_biases) == num_experts, (
-                f"Initial gating biases must have {num_experts} elements, got {len(initial_biases)}"
-            )
-            self.linear.bias.data = torch.tensor(initial_biases, dtype=torch.float32)
+    def scores(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        gating_scores = self.scorer(x)
+        return gating_scores, gating_scores + self.routing_biases
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        gating_scores = self.linear(x)
-        _, selected_experts = torch.topk(
-            gating_scores + self.routing_biases, self.top_k, dim=1
-        )
-        selected_scores = torch.gather(gating_scores, dim=1, index=selected_experts)
-
-        # Normalize only over the top-k experts, not all experts.
+    def gate_weights(self, scores: torch.Tensor) -> torch.Tensor:
         if self.activation == "softmax":
-            gate_probs = torch.softmax(selected_scores, dim=1)
-        else:  # "sigmoid": sigmoid + sum-normalization
-            sig = torch.sigmoid(selected_scores)
-            gate_probs = sig / sig.sum(dim=1, keepdim=True).clamp(min=1e-9)
+            return torch.softmax(scores, dim=-1)
+        sig = torch.sigmoid(scores)
+        return sig / sig.sum(dim=-1, keepdim=True).clamp(min=1e-9)
 
-        return gating_scores, selected_experts, gate_probs
 
-    def update_routing_biases(
+class MLPRouterWithBonus(MLPRouter, ABC):
+    """`MLPRouter` whose routing biases are an untrained per-expert bonus, set
+    after each batch from the experts' pulls (tokens routed to them) so far."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.num_tokens = 0
+        self.register_buffer("pulls", torch.zeros(self.num_experts))
+
+    def update(
         self,
+        x: torch.Tensor,
         selected_experts: torch.Tensor,
-        gamma: float = 1e-3,
-        target_load: float | None = None,
-    ):
-        if gamma <= 0:
-            return
+        losses: torch.Tensor,
+    ) -> None:
+        counts = torch.bincount(selected_experts.flatten(), minlength=self.num_experts)
+        self.pulls += counts
+        self.num_tokens += len(selected_experts)
+        self.update_bonus(counts)
 
-        B, _ = selected_experts.shape
+    @abstractmethod
+    def update_bonus(self, counts: torch.Tensor) -> None:
+        """Update ``routing_biases`` after a batch with ``counts`` pulls per expert."""
 
-        # Use uniform load as default target load
-        target_load = target_load or self.top_k / self.num_experts
+    def snapshot(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {"routing_biases": self.routing_biases.clone()}
 
-        # Calculate the mean load of each expert
-        expert_counts = torch.zeros(self.num_experts, device=selected_experts.device)
-        expert_counts.scatter_add_(
-            0,
-            selected_experts.flatten(),
-            torch.ones(selected_experts.numel(), device=selected_experts.device),
+
+class LoadBalancingRouter(MLPRouterWithBonus):
+    """Auxiliary loss-free load balancing (DeepSeek-V3): raises the bonus of
+    underloaded experts by gamma and lowers that of overloaded ones."""
+
+    def __init__(self, *args, gamma: float = 1e-3, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gamma = gamma
+
+    def update_bonus(self, counts: torch.Tensor) -> None:
+        loads = counts / counts.sum()
+        self.routing_biases -= self.gamma * torch.sign(loads - 1 / self.num_experts)
+
+
+class UCBRouter(MLPRouterWithBonus):
+    """UCB's exploration bonus ucb_weight * sqrt(2 log t / N), with t the tokens and
+    N the expert's pulls so far. Infinite while N = 0."""
+
+    def __init__(self, *args, ucb_weight: float = 1.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ucb_weight = ucb_weight
+        self.routing_biases.fill_(math.inf)
+
+    def update_bonus(self, counts: torch.Tensor) -> None:
+        t = self.num_tokens + 1
+        self.routing_biases.copy_(
+            self.ucb_weight * torch.sqrt(2 * math.log(t) / self.pulls)
         )
-        expert_loads = expert_counts / B
 
-        # Calculate the difference between the expert load and the target load
-        load_differences = expert_loads - target_load
 
-        bias_updates = torch.zeros(self.num_experts, device=selected_experts.device)
-        bias_updates[load_differences < 0] = gamma
-        bias_updates[load_differences > 0] = -gamma
+class RisingBanditBonusRouter(MLPRouterWithBonus):
+    """R-ed-UCB's exploration bonus, see `rising_bandit_bonus`, with t the tokens and
+    N the expert's pulls so far."""
 
-        # Update the routing biases
-        self.routing_biases += bias_updates
+    def __init__(
+        self,
+        *args,
+        epsilon: float = 0.25,
+        sigma: float = 0.1,
+        alpha: float = 3.0,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.epsilon = epsilon
+        self.sigma = sigma
+        self.alpha = alpha
+        self.routing_biases.fill_(math.inf)
+
+    def update_bonus(self, counts: torch.Tensor) -> None:
+        t = self.num_tokens + 1
+        self.routing_biases.copy_(
+            rising_bandit_bonus(self.pulls, t, self.epsilon, self.sigma, self.alpha)
+        )
+
+
+class RandomRouter(Router):
+    """Selects ``top_k`` distinct experts uniformly at random per token and weights
+    them equally. Has no parameters; its gating scores are all zero."""
+
+    def scores(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        B = x.shape[0]
+        return (
+            torch.zeros(B, self.num_experts, device=x.device),
+            torch.rand(B, self.num_experts, device=x.device),
+        )
 
 
 class BanditRouter(Router):
@@ -219,15 +306,8 @@ class BanditRouter(Router):
         return payoff, z @ self.increment.T, self.bonus.expand_as(payoff), covariance
 
     @torch.no_grad()
-    def forward(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        _, selected_experts = torch.topk(sum(self.index_terms(x)), self.top_k, dim=1)
-        predicted_rewards = self.reward_model(x)
-        gate_probs = torch.softmax(
-            torch.gather(predicted_rewards, 1, selected_experts), dim=1
-        )
-        return predicted_rewards, selected_experts, gate_probs
+    def scores(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.reward_model(x), sum(self.index_terms(x))
 
     def update(
         self,
@@ -251,16 +331,12 @@ class BanditRouter(Router):
         )
         explored = bonus.isfinite()
         self._metrics = {
-            "bandit/reward": rewards.mean().item(),
-            "bandit/reward_model_loss": reward_model_loss.item(),
-            "bandit/index_payoff": payoff[explored].mean().item(),
-            "bandit/index_increment": increment[explored].mean().item(),
-            "bandit/index_bonus": bonus[explored].mean().item(),
-            "bandit/index_covariance": covariance[explored].mean().item(),
+            "reward_model_loss": reward_model_loss.item(),
+            "index_payoff": payoff[explored].mean().item(),
+            "index_increment": increment[explored].mean().item(),
+            "index_bonus": bonus[explored].mean().item(),
+            "index_covariance": covariance[explored].mean().item(),
         }
-        for name, term in zip(INDEX_TERMS, index_terms):
-            for i, value in enumerate(term.mean(dim=0).tolist()):
-                self._metrics[f"bandit_index/{name}_{i}"] = value
 
         self.num_tokens += x.shape[0]
         self._record_pulls(selected_experts)
@@ -290,24 +366,26 @@ class BanditRouter(Router):
     def _update_index(self) -> None:
         """Evaluate the index's sums over pulls for the next token."""
         t = self.num_tokens + 1
+        num_pulls = torch.tensor(
+            [len(rows) for rows in self.history], dtype=torch.float
+        )
+        self.bonus.copy_(
+            rising_bandit_bonus(num_pulls, t, self.epsilon, self.sigma, self.alpha)
+        )
         for i, rows in enumerate(self.history):
             n = len(rows)
             h = math.floor(self.epsilon * n)
             if h == 0:
-                # For window size 0, keep infinite bonus
                 continue
             recent = rows[n - h :]  # pulls l = n - h + 1, ..., n
             previous = rows[n - 2 * h : n - h]  # pulls l - h
             pulls = torch.arange(n - h + 1, n + 1).unsqueeze(1)
             self.payoff[i] = recent.mean(dim=0)
             self.increment[i] = ((t - pulls) * (recent - previous) / h).mean(dim=0)
-            self.bonus[i] = (
-                self.sigma
-                * (t - n + h - 1)
-                * math.sqrt(10 * self.alpha * math.log(t) / h**3)
-            )
 
     def metrics(self) -> dict[str, float]:
-        """Means over the last `update`'s batch: `bandit/` over the selected experts,
-        `bandit_index/` per expert over all tokens, selected or not."""
+        """Means over the last `update`'s batch and its selected experts."""
         return self._metrics
+
+    def snapshot(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {"index_terms": torch.stack(self.index_terms(x))}

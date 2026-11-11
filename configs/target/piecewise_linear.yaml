@@ -1,0 +1,5 @@
+_target_: targets.PiecewiseLinearTarget
+_convert_: all
+domain: [-1, 1]
+num_pieces: 4
+breakpoint_mode: linear  # or random

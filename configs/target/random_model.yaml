@@ -1,0 +1,16 @@
+# A randomly initialized model of the trained model's dims.
+_target_: targets.ModelTarget
+_convert_: all
+domain: [-1, 1]
+model:
+  _target_: model.moe.Model
+  _convert_: all
+  dims: ${model.dims}
+  num_experts: 4
+  top_k: 2
+  expert_hidden_dim: null
+  expert_num_layers: 1
+  router:
+    _target_: model.router.MLPRouter
+    _partial_: true
+    activation: softmax

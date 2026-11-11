@@ -1,0 +1,48 @@
+defaults:
+  - _self_
+  - router: mlp
+  - optimizer: adam
+  - target: random_model
+
+seed: 0
+
+# A stack of MoE layers, layer i mapping dims[i] -> dims[i + 1].
+model:
+  _target_: model.moe.Model
+  _convert_: all
+  dims: [1, 1]
+  num_experts: 4
+  top_k: 2
+  expert_hidden_dim: null
+  expert_num_layers: 1
+  router: ${router}
+
+training:
+  num_steps: 5000
+  batch_size: 128
+  # Weight of the Switch Transformer-style load balancing loss (1e-2 default from paper).
+  load_balancing_loss_weight: 0.0
+  freeze_router: false
+  freeze_experts: false
+
+logging:
+  # Steps between the frames of the animations.
+  frame_every: 50
+
+wandb:
+  enabled: true
+  project: moe-shaping
+  entity: mari-schn
+  run_name: null
+  run_tags: []
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: outputs/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.override_dirname}
+  job:
+    config:
+      override_dirname:
+        exclude_keys: [wandb.enabled, wandb.run_name, wandb.run_tags]
