@@ -172,17 +172,38 @@ class LoadBalancingRouter(MLPRouterWithBonus):
 
 class UCBRouter(MLPRouterWithBonus):
     """UCB's exploration bonus ucb_weight * sqrt(2 log t / N), with t the tokens and
-    N the expert's pulls so far. Infinite while N = 0."""
+    N the expert's pulls so far. Infinite while N = 0.
 
-    def __init__(self, *args, ucb_weight: float = 1.0, **kwargs):
+    With ``per_step``, t counts steps and N the expert's share of each batch's
+    tokens, making the bonus independent of the batch size. With ``discount`` < 1,
+    t and N are discounted by it every step (Discounted UCB), so the bonus levels
+    off instead of decaying to zero.
+    """
+
+    def __init__(
+        self,
+        *args,
+        ucb_weight: float = 1.0,
+        per_step: bool = False,
+        discount: float = 1.0,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.ucb_weight = ucb_weight
+        self.per_step = per_step
+        self.discount = discount
         self.routing_biases.fill_(math.inf)
+        self.rounds = 0.0
+        self.register_buffer("round_pulls", torch.zeros(self.num_experts))
 
     def update_bonus(self, counts: torch.Tensor) -> None:
-        t = self.num_tokens + 1
+        batch_size = counts.sum().item() / self.top_k
+        unit = 1 / batch_size if self.per_step else 1.0
+        self.rounds = self.discount * self.rounds + batch_size * unit
+        self.round_pulls.mul_(self.discount).add_(counts * unit)
+        t = self.rounds + 1
         self.routing_biases.copy_(
-            self.ucb_weight * torch.sqrt(2 * math.log(t) / self.pulls)
+            self.ucb_weight * torch.sqrt(2 * math.log(t) / self.round_pulls)
         )
 
 

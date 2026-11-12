@@ -5,3 +5,7 @@ activation: softmax
 hidden_dim: null
 num_layers: 1
 ucb_weight: 1.0
+# Count steps instead of tokens, making the bonus independent of the batch size.
+per_step: false
+# Discount of the counts per step (Discounted UCB), 1.0 for none.
+discount: 1.0
