@@ -313,6 +313,26 @@ def _routing_map(path, x, selected_experts, num_experts, breakpoints, steps):
     plt.close(fig)
 
 
+def _expert_map(path, values, title, label, steps):
+    """``values`` ``(T, num_experts)`` over steps and experts."""
+    num_experts = values.shape[1]
+    fig, ax = plt.subplots(figsize=(9, 3))
+    mesh = ax.pcolormesh(
+        steps,
+        np.arange(num_experts),
+        np.ma.masked_invalid(values.T),
+        cmap="RdBu_r",
+        shading="nearest",
+    )
+    ax.set_yticks(np.arange(num_experts), [f"Expert {i}" for i in range(num_experts)])
+    ax.set_xlabel("Step")
+    fig.colorbar(mesh, ax=ax, label=label)
+    ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(f"{path}.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def render(
     frames: list[dict],
     output_dir: str,
@@ -334,6 +354,20 @@ def render(
         jobs.append(
             (_save, dict(path=name, build=build, kwargs=kwargs, steps=steps, fps=fps))
         )
+
+    def bars(name, values, title, ylabel, ylim):
+        """Bars of the single frame, or with ``animate`` an image over the steps."""
+        if animate:
+            jobs.append(
+                (
+                    _expert_map,
+                    dict(
+                        path=name, values=values, title=title, label=ylabel, steps=steps
+                    ),
+                )
+            )
+        else:
+            plot(name, _bars, values=values, title=title, ylabel=ylabel, ylim=ylim)
 
     def stack(key, frames=frames):
         return np.stack([frame[key] for frame in frames])
@@ -357,9 +391,8 @@ def render(
         )
     if "per_expert_loss" in frames[0]:
         losses = stack("per_expert_loss")
-        plot(
+        bars(
             os.path.join(output_dir, "per_expert_loss"),
-            _bars,
             values=losses,
             title="Per Expert Loss (Last Layer)",
             ylabel="Loss",
@@ -381,9 +414,8 @@ def render(
 
         counts = get("sample_count")
         num_experts = counts.shape[1]
-        plot(
+        bars(
             path("sample_count"),
-            _bars,
             values=counts,
             title=f"Layer {i}: Per Expert Sample Count",
             ylabel="Sample Count",
@@ -394,9 +426,8 @@ def render(
             # Leave out the infinite bonus of unexplored experts.
             routing_biases = get("routing_biases")
             routing_biases = np.where(np.isinf(routing_biases), np.nan, routing_biases)
-            plot(
+            bars(
                 path("routing_biases"),
-                _bars,
                 values=routing_biases,
                 title=f"Layer {i}: Routing Biases",
                 ylabel="Bias",
