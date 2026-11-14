@@ -1,0 +1,15 @@
+# Imbalanced: experts 0 and 1 serve every input, y = x + 3 + 6 sigmoid(8x), and experts
+# 2 and 3 are never selected. Load balancing splits the inputs between two expert pairs
+# instead, fitting two lines with a jump. This relies on the offset of 6, gamma >= 1e-3
+# and the default 5000 steps; with 10000 steps it fits the target in about 40% of seeds.
+defaults:
+  - random_model
+  - _self_
+
+model:
+  dims: [1, 1]
+  initial_parameters:
+    layers.0.experts.weights.0: [[[1.0]], [[1.0]], [[0.0]], [[0.0]]]
+    layers.0.experts.biases.0: [[3.0], [9.0], [0.0], [0.0]]
+    layers.0.router.scorer.0.weight: [[-4.0], [4.0], [0.0], [0.0]]
+    layers.0.router.scorer.0.bias: [0.0, 0.0, -10.0, -10.0]
