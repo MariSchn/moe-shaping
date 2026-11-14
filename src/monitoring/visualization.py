@@ -150,11 +150,21 @@ def _add_selection_strip(strip, x, selected_experts, num_experts):
     )
 
 
-def _lines(x, ys, labels, title, ylim, ref=None, breakpoints=(), selected_experts=None):
+def _lines(
+    x,
+    ys,
+    labels,
+    title,
+    ylim,
+    ref=None,
+    breakpoints=(),
+    selected_experts=None,
+    num_experts=None,
+):
     """One line over ``x`` per label, ``ys`` is ``(T, len(labels), len(x))``.
 
     With ``selected_experts`` ``(T, len(x), top_k)``, a strip below shows the top-k
-    experts, the labels being the experts.
+    of the ``num_experts`` experts, by default the labels.
     """
     if selected_experts is None:
         fig, ax = plt.subplots()
@@ -174,7 +184,9 @@ def _lines(x, ys, labels, title, ylim, ref=None, breakpoints=(), selected_expert
     ax.legend()
     ax.set_xlim(x[0], x[-1])
     if selected_experts is not None:
-        strip = _add_selection_strip(strip_ax, x, selected_experts[0], len(labels))
+        strip = _add_selection_strip(
+            strip_ax, x, selected_experts[0], num_experts or len(labels)
+        )
     ax.set_ylim(ylim)
     ax.grid(True)
     ax.set_title(title)
@@ -415,6 +427,14 @@ def render(
         x = frames[0]["x"]
     if grid and frames[0]["predictions"].shape[-1] == 1:
         ys = stack("predictions").transpose(0, 2, 1)
+        # A strip of the last layer's selected experts, if there are layers.
+        strip = {}
+        if frames[0]["layers"]:
+            last_layer = [frame["layers"][-1] for frame in frames]
+            strip = dict(
+                selected_experts=stack("selected_experts", last_layer),
+                num_experts=len(last_layer[0]["sample_count"]),
+            )
         plot(
             os.path.join(output_dir, "model"),
             _lines,
@@ -425,6 +445,7 @@ def render(
             ylim=_ylim(ys, ref),
             ref=ref,
             breakpoints=breakpoints,
+            **strip,
         )
     if "per_expert_loss" in frames[0]:
         losses = stack("per_expert_loss")
