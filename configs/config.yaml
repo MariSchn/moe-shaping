@@ -28,6 +28,9 @@ training:
 logging:
   # Steps between the frames of the animations.
   frame_every: 50
+  # Steps between logs of the metrics too slow to log every step: target_mse, load
+  # and gradient norms.
+  eval_every: 50
 
 wandb:
   enabled: true

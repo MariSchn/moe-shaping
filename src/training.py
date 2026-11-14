@@ -5,7 +5,12 @@ from tqdm import tqdm
 
 import wandb
 from model.moe import Model
-from monitoring.metrics import expert_load, layer_metrics, routing_regret
+from monitoring.metrics import (
+    expert_load,
+    layer_metrics,
+    routing_regret,
+    target_mse,
+)
 from monitoring.visualization import input_grid, record_frame
 from targets import TargetFunction
 from utils import sample_uniformly
@@ -52,6 +57,14 @@ def train(
     # Running sums of per-step routing regret (cumulative bandit regret).
     regret = 0.0
 
+    # Parameter distance to the target, if it is a model of the same architecture.
+    target_layers = target.model.layers if target.model is not None else []
+    log_target_mse = len(target_layers) == len(model.layers) and all(
+        [p.shape for p in layer.experts.parameters()]
+        == [p.shape for p in target_layer.experts.parameters()]
+        for layer, target_layer in zip(model.layers, target_layers)
+    )
+
     def sample():
         x = sample_uniformly(target.domain, cfg.training.batch_size, model.input_dim)
         x = x.to(target.device)
@@ -87,9 +100,15 @@ def train(
                 "loss": loss.item(),
                 "regret": regret,
             }
-            for i, (layer, out) in enumerate(zip(model.layers, outputs)):
-                for name, value in layer_metrics(layer, out).items():
-                    metrics[f"{name}/layer{i}"] = value
+            for i, layer in enumerate(model.layers):
+                for name, value in layer.router.metrics().items():
+                    metrics[f"router/{name}/layer{i}"] = value
+            if step % cfg.logging.eval_every == 0:
+                if log_target_mse:
+                    metrics["target_mse"] = target_mse(model, target.model)
+                for i, (layer, out) in enumerate(zip(model.layers, outputs)):
+                    for name, value in layer_metrics(layer, out).items():
+                        metrics[f"{name}/layer{i}"] = value
             wandb.log(metrics)
 
         if step % cfg.logging.frame_every == 0:

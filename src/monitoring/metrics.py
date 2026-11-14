@@ -2,8 +2,10 @@ import itertools
 from typing import Callable, Iterable
 
 import torch
+from scipy.optimize import linear_sum_assignment
 
-from model.moe import MoELayer, MoEOutput
+from model.moe import Model, MoELayer, MoEOutput
+from model.router import MLPRouter
 
 
 def expert_load(selected_experts: torch.Tensor, num_experts: int) -> torch.Tensor:
@@ -112,5 +114,49 @@ def layer_metrics(layer: MoELayer, output: MoEOutput) -> dict[str, float]:
         **load_metrics(output.selected_experts, layer.router.num_experts),
         "grad_norm/router": grad_norm(layer.router.parameters()),
         "grad_norm/experts": grad_norm(layer.experts.parameters()),
-        **{f"router/{k}": v for k, v in layer.router.metrics().items()},
     }
+
+
+def linear_router_rows(router: MLPRouter) -> torch.Tensor | None:
+    """Weight and bias of each expert's row of a linear router, ``(E, d_in + 1)``,
+    canonicalized against the router's invariances: centered over the experts for
+    softmax gating (shifting all rows alike changes nothing) and, for top-1, scaled
+    to unit norm (only the argmax matters). None for non-linear routers."""
+    if not isinstance(router, MLPRouter) or len(router.scorer) != 1:
+        return None
+    linear = router.scorer[0]
+    rows = torch.cat([linear.weight, linear.bias[:, None]], dim=1)
+    if router.activation == "softmax":
+        rows = rows - rows.mean(dim=0)
+    if router.top_k == 1:
+        rows = rows / rows.norm().clamp(min=1e-12)
+    return rows
+
+
+@torch.no_grad()
+def target_mse(model: Model, target_model: Model) -> float:
+    """MSE between the parameters of ``model`` and ``target_model`` (same
+    architecture), under the permutation of each layer's experts that minimizes it.
+
+    Each expert is matched together with its row of the router if both routers are
+    linear, the router compared by the rows of `linear_router_rows`.
+    """
+
+    def expert_params(layer):
+        bank = layer.experts
+        return torch.cat([p.flatten(1) for p in [*bank.weights, *bank.biases]], 1)
+
+    squared_error, numel = 0.0, 0
+    for layer, target_layer in zip(model.layers, target_model.layers):
+        params, target_params = expert_params(layer), expert_params(target_layer)
+        router = linear_router_rows(layer.router)
+        target_router = linear_router_rows(target_layer.router)
+        if router is not None and target_router is not None:
+            params = torch.cat([params, router], dim=1)
+            target_params = torch.cat([target_params, target_router], dim=1)
+
+        cost = torch.cdist(params, target_params).pow(2).cpu().numpy()
+        rows, cols = linear_sum_assignment(cost)
+        squared_error += cost[rows, cols].sum()
+        numel += params.numel()
+    return float(squared_error / numel)
