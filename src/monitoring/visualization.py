@@ -9,7 +9,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from matplotlib.animation import FuncAnimation
-from matplotlib.colors import BoundaryNorm, ListedColormap
+from matplotlib.colors import (
+    BoundaryNorm,
+    LinearSegmentedColormap,
+    ListedColormap,
+    Normalize,
+)
 from matplotlib.patches import Patch
 
 from model.moe import Model, MoEOutput
@@ -313,20 +318,47 @@ def _routing_map(path, x, selected_experts, num_experts, breakpoints, steps):
     plt.close(fig)
 
 
-def _expert_map(path, values, title, label, steps):
-    """``values`` ``(T, num_experts)`` over steps and experts."""
+def _expert_map(path, values, title, label, steps, baseline):
+    """``values`` ``(T, num_experts)`` over steps and experts. White is the
+    ``baseline``, blue above it and red below."""
     num_experts = values.shape[1]
+    lo = min(float(np.nanmin(values)), baseline)
+    hi = max(float(np.nanmax(values)), baseline)
+    hi = hi if hi > lo else lo + 1.0
+    # The white point sits at the baseline, each side spanning to its extreme.
+    white = (baseline - lo) / (hi - lo)
+    stops = [(white, "white")]
+    if white > 0:
+        stops.insert(0, (0.0, "#b2182b"))
+    if white < 1:
+        stops.append((1.0, "#2166ac"))
     fig, ax = plt.subplots(figsize=(9, 3))
     mesh = ax.pcolormesh(
         steps,
         np.arange(num_experts),
         np.ma.masked_invalid(values.T),
-        cmap="RdBu_r",
+        cmap=LinearSegmentedColormap.from_list("baseline", stops),
+        norm=Normalize(lo, hi),
         shading="nearest",
     )
     ax.set_yticks(np.arange(num_experts), [f"Expert {i}" for i in range(num_experts)])
     ax.set_xlabel("Step")
     fig.colorbar(mesh, ax=ax, label=label)
+    ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(f"{path}.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _expert_lines(path, values, steps, title, ylabel):
+    """One line per expert over steps, ``values`` is ``(T, num_experts)``."""
+    fig, ax = plt.subplots(figsize=(9, 3))
+    for e in range(values.shape[1]):
+        ax.plot(steps, values[:, e], label=f"Expert {e}")
+    ax.set_xlabel("Step")
+    ax.set_ylabel(ylabel)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1))
+    ax.grid(True)
     ax.set_title(title)
     fig.tight_layout()
     fig.savefig(f"{path}.png", dpi=150, bbox_inches="tight")
@@ -355,14 +387,19 @@ def render(
             (_save, dict(path=name, build=build, kwargs=kwargs, steps=steps, fps=fps))
         )
 
-    def bars(name, values, title, ylabel, ylim):
+    def bars(name, values, title, ylabel, ylim, baseline=0.0):
         """Bars of the single frame, or with ``animate`` an image over the steps."""
         if animate:
             jobs.append(
                 (
                     _expert_map,
                     dict(
-                        path=name, values=values, title=title, label=ylabel, steps=steps
+                        path=name,
+                        values=values,
+                        title=title,
+                        label=ylabel,
+                        steps=steps,
+                        baseline=baseline,
                     ),
                 )
             )
@@ -391,13 +428,30 @@ def render(
         )
     if "per_expert_loss" in frames[0]:
         losses = stack("per_expert_loss")
-        bars(
-            os.path.join(output_dir, "per_expert_loss"),
-            values=losses,
-            title="Per Expert Loss (Last Layer)",
-            ylabel="Loss",
-            ylim=(0, float(np.nanmax(losses)) * 1.1 or 1.0),
-        )
+        name = os.path.join(output_dir, "per_expert_loss")
+        title = "Per Expert Loss (Last Layer)"
+        if animate:
+            jobs.append(
+                (
+                    _expert_lines,
+                    dict(
+                        path=name,
+                        values=losses,
+                        steps=steps,
+                        title=title,
+                        ylabel="Loss",
+                    ),
+                )
+            )
+        else:
+            plot(
+                name,
+                _bars,
+                values=losses,
+                title=title,
+                ylabel="Loss",
+                ylim=(0, float(np.nanmax(losses)) * 1.1 or 1.0),
+            )
 
     num_layers = len(frames[0]["layers"])
     for i in range(num_layers):
@@ -420,6 +474,8 @@ def render(
             title=f"Layer {i}: Per Expert Sample Count",
             ylabel="Sample Count",
             ylim=(0, int(counts.max()) + 1),
+            # Uniform load.
+            baseline=counts[0].sum() / num_experts,
         )
         routing_biases = 0
         if "routing_biases" in has:
@@ -434,6 +490,19 @@ def render(
                 ylim=_ylim(routing_biases),
             )
             routing_biases = routing_biases[:, None, :]
+        if "pulls" in has and animate:
+            jobs.append(
+                (
+                    _expert_lines,
+                    dict(
+                        path=path("pulls"),
+                        values=get("pulls"),
+                        steps=steps,
+                        title="Cumulative Pulls",
+                        ylabel="Pulls",
+                    ),
+                )
+            )
 
         if not grid:
             continue

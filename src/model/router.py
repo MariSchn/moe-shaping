@@ -206,6 +206,9 @@ class UCBRouter(MLPRouterWithBonus):
             self.ucb_weight * torch.sqrt(2 * math.log(t) / self.round_pulls)
         )
 
+    def snapshot(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {**super().snapshot(x), "pulls": self.pulls.clone()}
+
 
 class RisingBanditBonusRouter(MLPRouterWithBonus):
     """R-ed-UCB's exploration bonus, see `rising_bandit_bonus`, with t the tokens and
@@ -230,6 +233,9 @@ class RisingBanditBonusRouter(MLPRouterWithBonus):
         self.routing_biases.copy_(
             rising_bandit_bonus(self.pulls, t, self.epsilon, self.sigma, self.alpha)
         )
+
+    def snapshot(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {**super().snapshot(x), "pulls": self.pulls.clone()}
 
 
 class RandomRouter(Router):
@@ -409,4 +415,7 @@ class BanditRouter(Router):
         return self._metrics
 
     def snapshot(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        return {"index_terms": torch.stack(self.index_terms(x))}
+        return {
+            "index_terms": torch.stack(self.index_terms(x)),
+            "pulls": torch.tensor([len(rows) for rows in self.history]),
+        }
