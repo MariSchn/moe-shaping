@@ -1,0 +1,12 @@
+# MLP router with LinUCB's contextual exploration bonus.
+_target_: model.router.LinUCBRouter
+_partial_: true
+activation: softmax
+hidden_dim: null
+num_layers: 1
+linucb_weight: 1.0
+linucb_ridge: 1.0
+# Count each pull as 1 / batch size, making the bonus independent of the batch size.
+per_step: false
+# Discount of the design matrices per step (D-LinUCB), 1.0 for none.
+discount: 1.0

@@ -92,8 +92,7 @@ def rising_bandit_bonus(
 class MLPRouter(Router):
     """Gating scores from an MLP, linear for ``num_layers == 1``.
 
-    Selects the top-k experts by score, shifted by the routing biases, and
-    normalizes their scores into gate weights.
+    Selects the top-k experts by score and normalizes their scores into gate weights.
     """
 
     def __init__(
@@ -115,12 +114,9 @@ class MLPRouter(Router):
 
         self.scorer = mlp(input_dim, num_experts, hidden_dim, num_layers)
 
-        # Only used for the top-k selection, zero unless set by MLPRouterWithBonus.
-        self.register_buffer("routing_biases", torch.zeros(num_experts))
-
     def scores(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         gating_scores = self.scorer(x)
-        return gating_scores, gating_scores + self.routing_biases
+        return gating_scores, gating_scores
 
     def gate_weights(self, scores: torch.Tensor) -> torch.Tensor:
         if self.activation == "softmax":
@@ -130,13 +126,26 @@ class MLPRouter(Router):
 
 
 class MLPRouterWithBonus(MLPRouter, ABC):
-    """`MLPRouter` whose routing biases are an untrained per-expert bonus, set
-    after each batch from the experts' pulls (tokens routed to them) so far."""
+    """`MLPRouter` whose selection scores get an untrained bonus, updated after each
+    batch from the experts' pulls (tokens routed to them) so far.
+
+    The bonus is per expert, in ``routing_biases``, unless `bonus` is overridden.
+    """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.num_tokens = 0
         self.register_buffer("pulls", torch.zeros(self.num_experts))
+        self.register_buffer("routing_biases", torch.zeros(self.num_experts))
+
+    def bonus(self, x: torch.Tensor) -> torch.Tensor:
+        """The bonus of each expert for each row of ``x``, broadcastable to
+        ``(B, num_experts)``."""
+        return self.routing_biases
+
+    def scores(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        gating_scores = self.scorer(x)
+        return gating_scores, gating_scores + self.bonus(x)
 
     def update(
         self,
@@ -147,14 +156,19 @@ class MLPRouterWithBonus(MLPRouter, ABC):
         counts = torch.bincount(selected_experts.flatten(), minlength=self.num_experts)
         self.pulls += counts
         self.num_tokens += len(selected_experts)
-        self.update_bonus(counts)
+        self.update_bonus(x, selected_experts, counts)
 
     @abstractmethod
-    def update_bonus(self, counts: torch.Tensor) -> None:
-        """Update ``routing_biases`` after a batch with ``counts`` pulls per expert."""
+    def update_bonus(
+        self, x: torch.Tensor, selected_experts: torch.Tensor, counts: torch.Tensor
+    ) -> None:
+        """Update the bonus after a batch ``x`` with ``counts`` pulls per expert."""
 
     def snapshot(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        return {"routing_biases": self.routing_biases.clone()}
+        return {
+            "routing_biases": self.routing_biases.clone(),
+            "pulls": self.pulls.clone(),
+        }
 
 
 class LoadBalancingRouter(MLPRouterWithBonus):
@@ -165,7 +179,9 @@ class LoadBalancingRouter(MLPRouterWithBonus):
         super().__init__(*args, **kwargs)
         self.gamma = gamma
 
-    def update_bonus(self, counts: torch.Tensor) -> None:
+    def update_bonus(
+        self, x: torch.Tensor, selected_experts: torch.Tensor, counts: torch.Tensor
+    ) -> None:
         loads = counts / counts.sum()
         self.routing_biases -= self.gamma * torch.sign(loads - 1 / self.num_experts)
 
@@ -196,7 +212,9 @@ class UCBRouter(MLPRouterWithBonus):
         self.rounds = 0.0
         self.register_buffer("round_pulls", torch.zeros(self.num_experts))
 
-    def update_bonus(self, counts: torch.Tensor) -> None:
+    def update_bonus(
+        self, x: torch.Tensor, selected_experts: torch.Tensor, counts: torch.Tensor
+    ) -> None:
         batch_size = counts.sum().item() / self.top_k
         unit = 1 / batch_size if self.per_step else 1.0
         self.rounds = self.discount * self.rounds + batch_size * unit
@@ -205,9 +223,6 @@ class UCBRouter(MLPRouterWithBonus):
         self.routing_biases.copy_(
             self.ucb_weight * torch.sqrt(2 * math.log(t) / self.round_pulls)
         )
-
-    def snapshot(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        return {**super().snapshot(x), "pulls": self.pulls.clone()}
 
 
 class RisingBanditBonusRouter(MLPRouterWithBonus):
@@ -228,14 +243,86 @@ class RisingBanditBonusRouter(MLPRouterWithBonus):
         self.alpha = alpha
         self.routing_biases.fill_(math.inf)
 
-    def update_bonus(self, counts: torch.Tensor) -> None:
+    def update_bonus(
+        self, x: torch.Tensor, selected_experts: torch.Tensor, counts: torch.Tensor
+    ) -> None:
         t = self.num_tokens + 1
         self.routing_biases.copy_(
             rising_bandit_bonus(self.pulls, t, self.epsilon, self.sigma, self.alpha)
         )
 
+
+class LinUCBRouter(MLPRouterWithBonus):
+    """LinUCB's contextual exploration bonus
+
+        linucb_weight * sqrt(z^T A_i^-1 z)
+
+    with z = [x, 1] and A_i = linucb_ridge I + sum_l z_l z_l^T the design matrix of
+    expert i, with z_l the features of its l-th pull. Unlike the other bonuses, it
+    differs per token.
+
+    With ``per_step``, each pull counts 1 / batch size, making the bonus independent
+    of the batch size. With ``discount`` < 1, A_i is discounted by it every step
+    towards linucb_ridge I (D-LinUCB, Russac et al., 2019), so the bonus levels off
+    instead of decaying to zero.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        num_experts: int,
+        top_k: int,
+        *args,
+        linucb_weight: float = 1.0,
+        linucb_ridge: float = 1.0,
+        per_step: bool = False,
+        discount: float = 1.0,
+        **kwargs,
+    ):
+        super().__init__(input_dim, num_experts, top_k, *args, **kwargs)
+        self.linucb_weight = linucb_weight
+        self.per_step = per_step
+        self.discount = discount
+
+        # Per expert, A_i and a factor L_i with A_i^-1 = L_i L_i^T, so
+        # sqrt(z^T A_i^-1 z) = ||L_i^T z||. A_i is float64 on the CPU because it gets
+        # ill-conditioned when an expert only sees a narrow range of x, and MPS has
+        # no float64.
+        eye = torch.eye(input_dim + 1).expand(num_experts, -1, -1)
+        self.ridge = linucb_ridge * eye.double()
+        self.design = self.ridge
+        self.register_buffer("design_factor", eye / math.sqrt(linucb_ridge))
+
+    def _features(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.cat([x, torch.ones_like(x[:, :1])], dim=1)
+
+    def bonus(self, x: torch.Tensor) -> torch.Tensor:
+        z = self._features(x)
+        return self.linucb_weight * (z @ self.design_factor).norm(dim=-1).T
+
+    @torch.no_grad()
+    def update_bonus(
+        self, x: torch.Tensor, selected_experts: torch.Tensor, counts: torch.Tensor
+    ) -> None:
+        z = self._features(x).cpu().double()
+        routed = torch.zeros(x.shape[0], self.num_experts, dtype=z.dtype)
+        routed.scatter_(1, selected_experts.cpu(), 1.0)
+        unit = 1 / x.shape[0] if self.per_step else 1.0
+        self.design = (
+            self.discount * self.design
+            + (1 - self.discount) * self.ridge
+            + unit * torch.einsum("be,bi,bj->eij", routed, z, z)
+        )
+        self.design_factor.copy_(torch.linalg.cholesky(torch.linalg.inv(self.design)))
+
     def snapshot(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        return {**super().snapshot(x), "pulls": self.pulls.clone()}
+        bonus = self.bonus(x)
+        return {
+            # The mean over x, to compare with the other routers' per-expert bonus.
+            "routing_biases": bonus.mean(dim=0),
+            "selection_bonus": bonus,
+            "pulls": self.pulls.clone(),
+        }
 
 
 class RandomRouter(Router):

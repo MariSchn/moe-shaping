@@ -511,6 +511,8 @@ def render(
                 ylim=_ylim(routing_biases),
             )
             routing_biases = routing_biases[:, None, :]
+        if "selection_bonus" in has:
+            routing_biases = get("selection_bonus")
         if "pulls" in has and animate:
             jobs.append(
                 (
