@@ -173,17 +173,37 @@ class MLPRouterWithBonus(MLPRouter, ABC):
 
 class LoadBalancingRouter(MLPRouterWithBonus):
     """Auxiliary loss-free load balancing (DeepSeek-V3): raises the bonus of
-    underloaded experts by gamma and lowers that of overloaded ones."""
+    underloaded experts by gamma and lowers that of overloaded ones.
 
-    def __init__(self, *args, gamma: float = 1e-3, **kwargs):
+    Gamma is constant until step ``decay_start``, decays to 0 along a cosine until
+    step ``decay_end`` and stays 0 after (Beam, Reflection AI).
+    """
+
+    def __init__(
+        self,
+        *args,
+        gamma: float = 1e-3,
+        decay_start: int,
+        decay_end: int,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.gamma = gamma
+        self.decay_start = decay_start
+        self.decay_end = decay_end
+        self.step = 0
 
     def update_bonus(
         self, x: torch.Tensor, selected_experts: torch.Tensor, counts: torch.Tensor
     ) -> None:
+        progress = (self.step - self.decay_start) / max(
+            1, self.decay_end - self.decay_start
+        )
+        progress = min(1.0, max(0.0, progress))
+        gamma = self.gamma * (1 + math.cos(math.pi * progress)) / 2
         loads = counts / counts.sum()
-        self.routing_biases -= self.gamma * torch.sign(loads - 1 / self.num_experts)
+        self.routing_biases -= gamma * torch.sign(loads - 1 / self.num_experts)
+        self.step += 1
 
 
 class UCBRouter(MLPRouterWithBonus):

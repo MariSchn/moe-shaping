@@ -5,3 +5,7 @@ activation: softmax
 hidden_dim: null
 num_layers: 1
 gamma: 1e-3
+# Steps over which gamma decays to 0 along a cosine (Beam), the training's steps for
+# a constant gamma.
+decay_start: ${training.num_steps}
+decay_end: ${training.num_steps}
