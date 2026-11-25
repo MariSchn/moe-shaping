@@ -61,10 +61,9 @@ def per_expert_loss(
 
 def routing_regret(
     expert_outputs: torch.Tensor,
-    gating_scores: torch.Tensor,
     predictions: torch.Tensor,
     targets: torch.Tensor,
-    gate_weights: Callable[[torch.Tensor], torch.Tensor],
+    combo_weights: Callable[[torch.Tensor], torch.Tensor],
     combo_size: int,
 ) -> float:
     """
@@ -73,16 +72,16 @@ def routing_regret(
     Treats each sample as a context, the router's choice of which ``combo_size``
     experts to combine as the action, and negative MSE as the reward. Regret is
     the router's actual prediction loss minus the loss of the best candidate
-    expert combination, mixed with the router's own ``gate_weights`` of their
-    gating scores, averaged over the batch. This isolates the routing *choice*
-    with the gating mechanism fixed.
+    expert combination, mixed with the weights the router's gating gives it,
+    averaged over the batch. This isolates the routing *choice* with the gating
+    mechanism fixed.
 
     Args:
         expert_outputs: (B, num_experts, output_dim)
-        gating_scores: (B, num_experts)
         predictions: (B, output_dim) router's actual combined output
         targets: (B, output_dim)
-        gate_weights: the router's `Router.gate_weights`.
+        combo_weights: the weights (B, C, combo_size) the router gives the
+            combinations (C, combo_size), its `Router.combo_weights` for the batch.
         combo_size: Number of experts per candidate combination (top-k).
     """
     num_experts = expert_outputs.shape[1]
@@ -94,9 +93,9 @@ def routing_regret(
     combos = list(itertools.combinations(range(num_experts), combo_size))
     combo_idx = torch.tensor(combos, dtype=torch.long, device=expert_outputs.device)
 
-    sc = gating_scores[:, combo_idx]  # (B, C, combo_size)
     outs = expert_outputs[:, combo_idx, :]  # (B, C, combo_size, output_dim)
-    pred = (outs * gate_weights(sc).unsqueeze(-1)).sum(dim=2)  # (B, C, output_dim)
+    weights = combo_weights(combo_idx)  # (B, C, combo_size)
+    pred = (outs * weights.unsqueeze(-1)).sum(dim=2)  # (B, C, output_dim)
     losses = ((pred - targets[:, None, :]) ** 2).mean(dim=-1)  # (B, C)
     best = losses.min(dim=1).values  # (B,)
     return torch.relu(chosen_loss - best).mean().item()

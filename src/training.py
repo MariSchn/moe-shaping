@@ -1,3 +1,5 @@
+from functools import partial
+
 import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig
@@ -65,13 +67,31 @@ def train(
         for layer, target_layer in zip(model.layers, target_layers)
     )
 
+    # Routers that compare tokens of the same input get every input twice.
+    paired = any(layer.router.paired_inputs for layer in model.layers)
+
     def sample():
-        x = sample_uniformly(target.domain, cfg.training.batch_size, model.input_dim)
+        batch_size = cfg.training.batch_size // 2 if paired else cfg.training.batch_size
+        x = sample_uniformly(target.domain, batch_size, model.input_dim)
+        if paired:
+            x = x.repeat_interleave(2, dim=0)
         x = x.to(target.device)
         return x, target(x)
 
+    # With lr_decay, every learning rate decays linearly to 0 over the steps,
+    # including those of the routers' own optimizers.
+    optimizers = [optimizer] + [
+        opt for layer in model.layers for opt in layer.router.optimizers()
+    ]
+    base_lrs = [[group["lr"] for group in opt.param_groups] for opt in optimizers]
+
+    model.train()
     pbar = tqdm(range(cfg.training.num_steps), desc="Training")
     for step in pbar:
+        if cfg.training.lr_decay:
+            for opt, lrs in zip(optimizers, base_lrs):
+                for group, lr in zip(opt.param_groups, lrs):
+                    group["lr"] = lr * (1 - step / cfg.training.num_steps)
         x, y = sample()
         predictions, outputs = model(x)
         loss = F.mse_loss(predictions, y)
@@ -90,10 +110,11 @@ def train(
             last_layer, last = model.layers[-1], outputs[-1]
             regret += routing_regret(
                 last.expert_outputs.detach(),
-                last.gating_scores.detach(),
                 predictions.detach(),
                 y,
-                last_layer.router.gate_weights,
+                partial(
+                    last_layer.router.combo_weights, last.x, last.gating_scores.detach()
+                ),
                 last_layer.router.top_k,
             )
             metrics = {
@@ -117,6 +138,7 @@ def train(
         optimizer.step()
         pbar.set_postfix({"loss": loss.item()})
 
+    model.eval()
     x, y = sample()
     with torch.no_grad():
         _, outputs = model(x)

@@ -24,6 +24,8 @@ training:
   load_balancing_loss_weight: 0.0
   freeze_router: false
   freeze_experts: false
+  # Linear decay of every learning rate to 0 over the steps, the routers' own too.
+  lr_decay: false
 
 logging:
   # Steps between the frames of the animations.

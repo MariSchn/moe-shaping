@@ -1,0 +1,11 @@
+# Separate selection and gating: a selection head picks the experts and learns from
+# duels between paired tokens, a gating head conditioned on the selected set weights
+# them.
+_target_: model.router.SeparatedRouter
+_partial_: true
+hidden_dim: null
+num_layers: 1
+# Adam learning rate of the selection head.
+lr: 0.3
+# Score margin the better set of a duel should have.
+margin: 0.3

@@ -23,6 +23,9 @@ def mlp(
 class Router(nn.Module, ABC):
     """Picks ``top_k`` of ``num_experts`` experts per input and weights their outputs."""
 
+    # Whether training batches must hold every input twice, in consecutive tokens.
+    paired_inputs = False
+
     def __init__(self, input_dim: int, num_experts: int, top_k: int):
         super().__init__()
         self.input_dim = input_dim
@@ -31,18 +34,21 @@ class Router(nn.Module, ABC):
 
     def forward(
         self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Route a batch ``x`` of shape ``(B, input_dim)``.
 
         Returns:
             gating_scores: (B, num_experts) score of every expert.
             selected_experts: (B, top_k) indices of the selected experts.
             gate_weights: (B, top_k) weights of the selected experts' outputs.
+            explored: (B,) whether each token explored a set of experts the router
+                would not select, so that it must not train the experts or the gating;
+                None for routers that do not explore this way.
         """
         gating_scores, selection_scores = self.scores(x)
         selected_experts = selection_scores.topk(self.top_k, dim=-1).indices
         gate_weights = self.gate_weights(gating_scores.gather(-1, selected_experts))
-        return gating_scores, selected_experts, gate_weights
+        return gating_scores, selected_experts, gate_weights, None
 
     @abstractmethod
     def scores(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -55,6 +61,19 @@ class Router(nn.Module, ABC):
     def gate_weights(self, scores: torch.Tensor) -> torch.Tensor:
         """Weights of experts' outputs from their gating scores, over the last dim."""
         return torch.softmax(scores, dim=-1)
+
+    def combo_weights(
+        self, x: torch.Tensor, gating_scores: torch.Tensor, combos: torch.Tensor
+    ) -> torch.Tensor:
+        """Weights ``(B, C, top_k)`` the router would give each set of experts in
+        ``combos`` ``(C, top_k)``, for the inputs ``x`` with the ``gating_scores``
+        `forward` gave them."""
+        return self.gate_weights(gating_scores[:, combos])
+
+    def optimizers(self) -> list[torch.optim.Optimizer]:
+        """The optimizers the router steps itself in `update`, for the learning-rate
+        schedule."""
+        return []
 
     def update(
         self,
@@ -521,8 +540,120 @@ class BanditRouter(Router):
         """Means over the last `update`'s batch and its selected experts."""
         return self._metrics
 
+    def optimizers(self) -> list[torch.optim.Optimizer]:
+        return [self.optimizer]
+
     def snapshot(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         return {
             "index_terms": torch.stack(self.index_terms(x)),
             "pulls": torch.tensor([len(rows) for rows in self.history]),
         }
+
+
+class SeparatedRouter(Router):
+    """Separate models for which experts to select and how to weight them.
+
+    A selection head scores the experts and its top-k are selected. It learns only from
+    the losses of its own picks: in training the inputs come in pairs, the first token
+    of a pair takes the top-k and the second a uniformly random set, and the set with
+    the lower loss should score (the sum of its experts' scores) at least ``margin``
+    higher, a hinge weighted by the loss gap and stepped by the router's own Adam. The
+    second token does not train the experts or the gating.
+
+    The gating is conditioned on the selected set: every set has its own logits for its
+    experts but the last (whose logit is 0), softmaxed into the weights. They start at 0
+    and learn from the task loss's gradients. Its gating scores are the selection
+    scores, for plots.
+    """
+
+    paired_inputs = True
+
+    def __init__(
+        self,
+        input_dim: int,
+        num_experts: int,
+        top_k: int,
+        hidden_dim: int | None = None,
+        num_layers: int = 1,
+        lr: float = 0.3,
+        margin: float = 0.3,
+    ):
+        super().__init__(input_dim, num_experts, top_k)
+        self.margin = margin
+        self.selector = mlp(input_dim, num_experts, hidden_dim, num_layers)
+        self.optimizer = torch.optim.Adam(self.selector.parameters(), lr=lr)
+
+        # Every set of top_k experts, increasing within and across sets.
+        self.register_buffer(
+            "sets", torch.combinations(torch.arange(num_experts), top_k)
+        )
+        self.gate = mlp(input_dim, len(self.sets) * (top_k - 1), hidden_dim, num_layers)
+        nn.init.zeros_(self.gate[-1].weight)
+        nn.init.zeros_(self.gate[-1].bias)
+
+        self._metrics: dict[str, float] = {}
+
+    @torch.no_grad()
+    def scores(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        selection_scores = self.selector(x)
+        return selection_scores, selection_scores
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        selection_scores, _ = self.scores(x)
+        selected = selection_scores.topk(self.top_k, dim=-1).indices
+        explored = None
+        if self.training:
+            # The second token of every pair explores a uniformly random set.
+            random_sets = torch.rand(x.shape[0], self.num_experts, device=x.device)
+            random_sets = random_sets.topk(self.top_k, dim=-1).indices
+            second = (torch.arange(x.shape[0], device=x.device) % 2 == 1)[:, None]
+            greedy, selected = selected, torch.where(second, random_sets, selected)
+            explored = (selected.sort(-1).values != greedy.sort(-1).values).any(-1)
+        return selection_scores, selected, self.set_weights(x, selected), explored
+
+    def set_weights(self, x: torch.Tensor, sets: torch.Tensor) -> torch.Tensor:
+        """Weights ``(B, ..., top_k)`` of the sets of experts ``(B, ..., top_k)``."""
+        order = sets.sort(dim=-1)
+        ids = (order.values.unsqueeze(-2) == self.sets).all(-1).float().argmax(-1)
+        logits = self.gate(x).view(len(x), len(self.sets), self.top_k - 1)
+        index = ids.view(len(x), -1, 1).expand(-1, -1, self.top_k - 1)
+        logits = logits.gather(1, index)
+        logits = torch.cat([logits, torch.zeros_like(logits[..., :1])], dim=-1)
+        weights = torch.softmax(logits, dim=-1).view(sets.shape)
+        # From increasing expert order back to the order of `sets`.
+        return torch.empty_like(weights).scatter_(-1, order.indices, weights)
+
+    @torch.no_grad()
+    def combo_weights(
+        self, x: torch.Tensor, gating_scores: torch.Tensor, combos: torch.Tensor
+    ) -> torch.Tensor:
+        return self.set_weights(x, combos.expand(len(x), -1, -1))
+
+    def update(
+        self,
+        x: torch.Tensor,
+        selected_experts: torch.Tensor,
+        losses: torch.Tensor,
+    ) -> None:
+        """One step of the hinge over the pairs of tokens (2i, 2i + 1)."""
+        set_scores = self.selector(x).gather(-1, selected_experts).sum(-1).view(-1, 2)
+        losses = losses.view(-1, 2)
+        sets = selected_experts.sort(-1).values.view(-1, 2, self.top_k)
+        differ = (sets[:, 0] != sets[:, 1]).any(-1)
+        second_better = torch.sign(losses[:, 0] - losses[:, 1])
+        gap = (losses[:, 1] - losses[:, 0]).abs()
+        lead = second_better * (set_scores[:, 1] - set_scores[:, 0])
+        loss = (torch.relu(self.margin - lead) * gap * differ).mean()
+        loss.backward()
+        self.optimizer.step()
+        # The main optimizer holds these parameters too: leave it no gradient to apply.
+        self.optimizer.zero_grad()
+        self._metrics = {"duel_loss": loss.item()}
+
+    def metrics(self) -> dict[str, float]:
+        return self._metrics
+
+    def optimizers(self) -> list[torch.optim.Optimizer]:
+        return [self.optimizer]
