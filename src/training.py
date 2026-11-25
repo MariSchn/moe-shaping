@@ -78,20 +78,9 @@ def train(
         x = x.to(target.device)
         return x, target(x)
 
-    # With lr_decay, every learning rate decays linearly to 0 over the steps,
-    # including those of the routers' own optimizers.
-    optimizers = [optimizer] + [
-        opt for layer in model.layers for opt in layer.router.optimizers()
-    ]
-    base_lrs = [[group["lr"] for group in opt.param_groups] for opt in optimizers]
-
     model.train()
     pbar = tqdm(range(cfg.training.num_steps), desc="Training")
     for step in pbar:
-        if cfg.training.lr_decay:
-            for opt, lrs in zip(optimizers, base_lrs):
-                for group, lr in zip(opt.param_groups, lrs):
-                    group["lr"] = lr * (1 - step / cfg.training.num_steps)
         x, y = sample()
         predictions, outputs = model(x)
         loss = F.mse_loss(predictions, y)

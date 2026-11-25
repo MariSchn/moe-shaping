@@ -70,11 +70,6 @@ class Router(nn.Module, ABC):
         `forward` gave them."""
         return self.gate_weights(gating_scores[:, combos])
 
-    def optimizers(self) -> list[torch.optim.Optimizer]:
-        """The optimizers the router steps itself in `update`, for the learning-rate
-        schedule."""
-        return []
-
     def update(
         self,
         x: torch.Tensor,
@@ -540,9 +535,6 @@ class BanditRouter(Router):
         """Means over the last `update`'s batch and its selected experts."""
         return self._metrics
 
-    def optimizers(self) -> list[torch.optim.Optimizer]:
-        return [self.optimizer]
-
     def snapshot(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         return {
             "index_terms": torch.stack(self.index_terms(x)),
@@ -654,6 +646,3 @@ class SeparatedRouter(Router):
 
     def metrics(self) -> dict[str, float]:
         return self._metrics
-
-    def optimizers(self) -> list[torch.optim.Optimizer]:
-        return [self.optimizer]
