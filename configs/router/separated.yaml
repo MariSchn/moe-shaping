@@ -1,6 +1,3 @@
-# Separate selection and gating: a selection head picks the experts and learns from
-# duels between paired tokens, a gating head conditioned on the selected set weights
-# them.
 _target_: model.router.SeparatedRouter
 _partial_: true
 hidden_dim: null
