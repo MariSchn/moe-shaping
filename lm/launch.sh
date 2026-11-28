@@ -1,35 +1,26 @@
 #!/bin/bash
 #
-# Train the small MoE on CSCS Alps (default: 1 GH200 node).
-#
 # Usage: ./launch.sh [steps] [nodes]
 #   steps   training iterations            (default 1000)
 #   nodes   number of nodes, 4 GPUs each   (default 1)
 #
-# Everything else is env-overridable (set inline or in config.sh):
-#   Model:   NUM_LAYERS HIDDEN FFN HEADS KV_HEADS NUM_EXPERTS MBS GBS SEQ_LEN
-#            (defaults below define a ~tiny top-2 MoE; per-expert FFN = FFN)
-#   Schedule/eval: LR EVAL_INTERVAL EVAL_ITERS LR_WARMUP_ITERS TIME
-#   Cluster: SBATCH_ACCOUNT PARTITION (empty = cluster default, e.g. PARTITION=debug)
-#
 # Examples:
-#   ./launch.sh                                  # 1000 steps, 1 node
-#   ./launch.sh 50                               # quick 50-step smoke run
-#   NUM_EXPERTS=16 HIDDEN=768 ./launch.sh 2000   # bigger model
+#   ./launch.sh 50
 
 set -euo pipefail
 
 WORKDIR=${WORKDIR:-/users/smarian/projects/moe-shaping/lm}
 [ -f "$WORKDIR/config.sh" ] && source "$WORKDIR/config.sh"
 
-# ---- Cluster + W&B config (defaults; override via env.sh or env) ----
-SBATCH_ACCOUNT=${SBATCH_ACCOUNT:-aa004}
-PARTITION=${PARTITION:-normal}
-export WANDB_PROJECT=${WANDB_PROJECT:-moe-shaping-clariden}
-export WANDB_ENTITY=${WANDB_ENTITY:-mari-schn}
+# ---- Cluster ----
+PARTITION=${PARTITION:-debug}
 
+# ---- Training ----
 STEPS=${1:-1000}
 NODES=${2:-1}
+MBS=${MBS:-1}
+GBS=${GBS:-256}
+SEQ_LEN=${SEQ_LEN:-4096}
 
 # ---- Model ----
 NUM_LAYERS=${NUM_LAYERS:-32}
@@ -39,9 +30,6 @@ HEADS=${HEADS:-16}
 HEAD_DIM=${HEAD_DIM:-128}
 KV_HEADS=${KV_HEADS:-4}
 NUM_EXPERTS=${NUM_EXPERTS:-16}
-MBS=${MBS:-1}
-GBS=${GBS:-256}
-SEQ_LEN=${SEQ_LEN:-4096}
 
 # ---- Schedule / eval ----
 LR=${LR:-3e-4}
@@ -51,13 +39,13 @@ EVAL_ITERS=${EVAL_ITERS:-10}
 # so clamp it for short/smoke runs (e.g. STEPS=50 -> 5).
 LR_WARMUP_ITERS=${LR_WARMUP_ITERS:-$(( STEPS / 10 ))}
 [ "$LR_WARMUP_ITERS" -ge "$STEPS" ] && LR_WARMUP_ITERS=$(( STEPS / 2 ))
-TIME=${TIME:-01:00:00}
+TIME=${TIME:-01:30:00}
 
 JOB_NAME="moe-${STEPS}s-${NODES}n"
 
 ################ W&B block ################
 WANDB_BLOCK='
-# WANDB
+# f
 if [ -n "$WANDB_API_KEY" ]; then
     echo "[$(date)] WANDB enabled."
     TRAINING_CMD="$TRAINING_CMD \
@@ -186,6 +174,7 @@ TRAINING_ARGS=(
     --micro-batch-size \$MBS
     --global-batch-size \$GBS
     --train-iters \$TRAINING_STEPS
+    ${EXIT_DURATION_IN_MINS:+--exit-duration-in-mins ${EXIT_DURATION_IN_MINS}}
     --log-interval 1
     --eval-interval ${EVAL_INTERVAL}
     --eval-iters ${EVAL_ITERS}
