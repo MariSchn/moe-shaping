@@ -5,7 +5,7 @@
 # as the account to sbatch.
 export SBATCH_ACCOUNT="a145"
 
-# Optional: set to log metrics (incl. bilevel/phase) to W&B; leave empty for
+# Optional: set to log metrics to W&B; leave empty for
 # TensorBoard-only.
 export WANDB_API_KEY=""
 

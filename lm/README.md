@@ -1,6 +1,6 @@
-# `lm/` — LM-scale bilevel-alternation MoE training
+# `lm/` — LM-scale MoE training
 
-This directory scales the bilevel / alternating MoE training procedure from the
+This directory scales the MoE training from the
 toy `src/` experiments up to a real (small) Mixture-of-Experts **language model**,
 trained on the [CSCS Alps](https://docs.cscs.ch/) cluster (GH200 nodes) on top of
 [Megatron-LM](https://github.com/NVIDIA/Megatron-LM).
@@ -8,23 +8,7 @@ trained on the [CSCS Alps](https://docs.cscs.ch/) cluster (GH200 nodes) on top o
 It is adapted from the [`swiss-ai/lsaie-ss26-gipfelsturm`](https://github.com/swiss-ai/lsaie-ss26-gipfelsturm)
 training harness: a thin SLURM launcher around Megatron-LM. Megatron already has
 native MoE (router, top-k, experts, aux-loss / loss-free balancing), so the only
-custom additions are a small **MoE model preset** and a **bilevel-alternation
-patch** that alternates optimizer updates between router and expert parameters.
-
-## What "bilevel alternation" means here
-
-The optimizer alternates between two phases over a fixed cycle:
-
-- **router phase** (`--bilevel-router-steps` steps): only the MoE router
-  parameters (`*.router.*`) are updated; expert parameters are frozen.
-- **expert phase** (`--bilevel-expert-steps` steps): only the MoE expert
-  parameters (`*.experts.*`) are updated; router parameters are frozen.
-
-The transformer backbone (attention, embeddings, norms, lm-head) trains every
-step. Freezing is implemented by **masking the inactive param group's learning
-rate to 0** (router/expert params are placed in their own optimizer param groups).
-Setting `--bilevel-router-steps 0` disables alternation entirely (joint training
-baseline). See `patches/` for details.
+custom addition is a small **MoE model preset**.
 
 ## Setup
 
@@ -59,19 +43,13 @@ sed "s|workdir = .*|workdir = \"$HOME\"|" alps3.toml > ~/.edf/alps3.toml
 ```
 
 The launcher generates a self-contained SLURM script in `logs/` and submits it.
-Model dimensions and bilevel knobs are env-overridable (see the header of
+Model dimensions are env-overridable (see the header of
 `launch.sh`). Examples:
 
 ```bash
 ./launch.sh 50                                # quick smoke run
-BILEVEL=0 ./launch.sh 1000                    # joint-training baseline (no alternation)
-ROUTER_LR=1e-3 EXPERT_LR=3e-4 ./launch.sh 2000
 NUM_EXPERTS=16 HIDDEN=768 NUM_LAYERS=12 ./launch.sh 2000
 ```
-
-`BILEVEL=0` runs plain Megatron MoE training (no `--bilevel-*` flags, no
-router/expert param-group split). Bilevel and baseline runs get distinct
-job/log/W&B names (tag `bl-r<R>e<E>` vs `joint`) so they don't clobber each other.
 
 The default model is a ~tiny top-2 MoE (8 layers, hidden 512, 8 experts) sized to
 iterate quickly on a single node with pure data parallelism (TP=PP=1).
@@ -109,7 +87,7 @@ if line numbers shift on a future Megatron version.
 Verify a patch applies cleanly:
 
 ```bash
-cd Megatron-LM && git apply --check ../patches/0002-bilevel-alternation.patch
+cd Megatron-LM && git apply --check ../patches/0001-log-tokens-per-sec-to-wandb.patch
 ```
 
 ### Current patches
@@ -117,8 +95,6 @@ cd Megatron-LM && git apply --check ../patches/0002-bilevel-alternation.patch
 | Patch | Description |
 |-------|-------------|
 | `0001-log-tokens-per-sec-to-wandb.patch` | Logs tokens/sec/GPU to stdout, TensorBoard, W&B |
-| `0002-bilevel-alternation.patch` | Router/expert param-group split + per-phase LR masking; adds `--bilevel-*` / `--router-lr` / `--expert-lr` args; logs `bilevel/phase` |
-| `0003-log-expert-imbalance.patch` | Always logs `expert_imbalance` (raw load-balance loss, monitor-only) even when the aux-loss coefficient is 0 |
 
 ## Dependencies
 
