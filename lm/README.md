@@ -43,16 +43,16 @@ sed "s|workdir = .*|workdir = \"$HOME\"|" alps3.toml > ~/.edf/alps3.toml
 ```
 
 The launcher generates a self-contained SLURM script in `logs/` and submits it.
-Model dimensions are env-overridable (see the header of
-`launch.sh`). Examples:
+Environment variables can override the model dimensions in `launch.sh`.
 
 ```bash
 ./launch.sh 50                                # quick smoke run
 NUM_EXPERTS=16 HIDDEN=768 NUM_LAYERS=12 ./launch.sh 2000
 ```
 
-The default model is a ~tiny top-2 MoE (8 layers, hidden 512, 8 experts) sized to
-iterate quickly on a single node with pure data parallelism (TP=PP=1).
+The default uses 32 layers, hidden size 4096, 16 experts of width 448, top-2
+routing, with full causal attention over the configured sequence length
+(4096 tokens by default). See the [Phi-tiny-MoE-instruct config](https://huggingface.co/microsoft/Phi-tiny-MoE-instruct/blob/main/config.json).
 
 ## Container image
 

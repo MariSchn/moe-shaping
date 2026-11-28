@@ -32,13 +32,14 @@ STEPS=${1:-1000}
 NODES=${2:-1}
 
 # ---- Model ----
-NUM_LAYERS=${NUM_LAYERS:-8}
-HIDDEN=${HIDDEN:-512}
-FFN=${FFN:-1024}
-HEADS=${HEADS:-8}
-KV_HEADS=${KV_HEADS:-2}
-NUM_EXPERTS=${NUM_EXPERTS:-8}
-MBS=${MBS:-8}
+NUM_LAYERS=${NUM_LAYERS:-32}
+HIDDEN=${HIDDEN:-4096}
+FFN=${FFN:-448}
+HEADS=${HEADS:-16}
+HEAD_DIM=${HEAD_DIM:-128}
+KV_HEADS=${KV_HEADS:-4}
+NUM_EXPERTS=${NUM_EXPERTS:-16}
+MBS=${MBS:-1}
 GBS=${GBS:-256}
 SEQ_LEN=${SEQ_LEN:-4096}
 
@@ -154,23 +155,28 @@ cat >> "$SCRIPT" << MODEL
 NETWORK_SIZE_ARGS=(
     --num-layers ${NUM_LAYERS}
     --hidden-size ${HIDDEN}
-    --ffn-hidden-size ${FFN}
     --num-attention-heads ${HEADS}
+    --kv-channels ${HEAD_DIM}
     --group-query-attention
     --num-query-groups ${KV_HEADS}
     --max-position-embeddings \$SEQ_LEN
     --position-embedding-type rope
     --normalization RMSNorm
+    --norm-epsilon 1e-5
+    --add-qkv-bias
+    --disable-bias-linear
     --swiglu
     --untie-embeddings-and-output-weights
     --seq-length \$SEQ_LEN
 )
 
-# Top-2 routing (Megatron default moe_router_topk=2); per-expert FFN = --ffn-hidden-size.
 MOE_ARGS=(
     --num-experts ${NUM_EXPERTS}
-    --moe-router-load-balancing-type aux_loss
-    --moe-aux-loss-coeff 0.01
+    --moe-ffn-hidden-size ${FFN}
+    --moe-router-topk 2
+    --moe-router-load-balancing-type none
+    --moe-aux-loss-coeff 0.0
+    --moe-input-jitter-eps 0.01
 )
 MODEL
 
@@ -184,7 +190,6 @@ TRAINING_ARGS=(
     --eval-interval ${EVAL_INTERVAL}
     --eval-iters ${EVAL_ITERS}
     --cross-entropy-loss-fusion
-    --disable-bias-linear
     --optimizer adam
     --dataloader-type single
     --no-check-for-nan-in-loss-and-grad
