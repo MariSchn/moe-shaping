@@ -1,8 +1,13 @@
+import itertools
 import math
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
+
+if TYPE_CHECKING:
+    from model.moe import MoEOutput
 
 INDEX_TERMS = ("payoff", "increment", "bonus", "covariance")
 
@@ -56,13 +61,9 @@ class Router(nn.Module, ABC):
         """Weights of experts' outputs from their gating scores, over the last dim."""
         return torch.softmax(scores, dim=-1)
 
-    def update(
-        self,
-        x: torch.Tensor,
-        selected_experts: torch.Tensor,
-        losses: torch.Tensor,
-    ) -> None:
-        """Learn from the per-token losses ``(B,)`` of the final predictions for ``x``.
+    def update(self, output: "MoEOutput", losses: torch.Tensor) -> None:
+        """Learn from the layer's ``output`` after the backward pass and the per-token
+        losses ``(B,)`` of the final predictions.
 
         For anything not learned from the gradients of the task loss.
         """
@@ -125,6 +126,87 @@ class MLPRouter(Router):
         return sig / sig.sum(dim=-1, keepdim=True).clamp(min=1e-9)
 
 
+class SplitRouter(Router):
+    """Selection and gating by separate MLPs, linear for ``num_layers == 1``: the
+    top-k experts by the selector's scores are selected, and a softmax over the
+    scorer's scores of those weights their outputs.
+
+    The scorer learns from the task loss. The selector gets no gradient from it and
+    instead imitates a local search over the selection, see `update`.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        num_experts: int,
+        top_k: int,
+        hidden_dim: int | None = None,
+        num_layers: int = 1,
+    ):
+        super().__init__(input_dim, num_experts, top_k)
+        self.scorer = mlp(input_dim, num_experts, hidden_dim, num_layers)
+        self.selector = mlp(input_dim, num_experts, hidden_dim, num_layers)
+        self._metrics: dict[str, float] = {}
+
+    def scores(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.scorer(x), self.selector(x)
+
+    def update(self, output: "MoEOutput", losses: torch.Tensor) -> None:
+        """Set the selector's gradient for a margin loss towards the best of the
+        current selection and every swap of a selected for an unselected expert.
+
+        A candidate's loss change is estimated as ``g . d + ||d||^2 / output_dim``,
+        with ``d`` the change of the layer's output and ``g`` the gradient of the
+        token's loss at it: exact for an MSE loss on the last layer's output, a
+        second-order estimate in earlier layers. This evaluates every expert; at
+        scale, one would evaluate a few sampled swaps.
+        """
+        x = output.x.detach()
+        y = output.output.detach()
+        # The task loss is a mean over tokens: undo it for each token's gradient.
+        grad = output.output.grad * len(x)
+
+        selected = output.selected_experts
+        unselected = (
+            torch.ones_like(output.gating_scores, dtype=torch.bool)
+            .scatter(1, selected, False)
+            .nonzero()[:, 1]
+            .view(len(x), -1)
+        )
+        candidates = [selected]
+        for i, j in itertools.product(range(self.top_k), range(unselected.shape[1])):
+            swapped = selected.clone()
+            swapped[:, i] = unselected[:, j]
+            candidates.append(swapped)
+        candidates = torch.stack(candidates, dim=1)  # (B, C, top_k)
+
+        rows = torch.arange(len(x), device=x.device)[:, None, None]
+        weights = self.gate_weights(output.gating_scores.detach()[rows, candidates])
+        candidate_outputs = (
+            weights.unsqueeze(-1) * output.expert_outputs.detach()[rows, candidates]
+        ).sum(dim=2)
+        delta = candidate_outputs - y.unsqueeze(1)
+        loss_change = (grad.unsqueeze(1) * delta).sum(-1) + delta.pow(2).mean(-1)
+        best = loss_change.argmin(dim=1)
+        best_experts = candidates[rows[:, 0, 0], best]
+
+        # Every expert of the best candidate should outscore every other by 1. Unlike
+        # a cross-entropy, this doesn't pull the best experts' scores together, which
+        # a linear selector can't do without misranking near the switches.
+        others = torch.ones_like(output.gating_scores).scatter(1, best_experts, 0.0)
+        scores = self.selector(x)
+        gaps = 1 - (scores.gather(1, best_experts).unsqueeze(-1) - scores.unsqueeze(1))
+        selector_loss = (gaps.relu() * others.unsqueeze(1)).sum((1, 2)).mean()
+        selector_loss.backward()
+        self._metrics = {
+            "selector_loss": selector_loss.item(),
+            "swapped_fraction": (best > 0).float().mean().item(),
+        }
+
+    def metrics(self) -> dict[str, float]:
+        return self._metrics
+
+
 class MLPRouterWithBonus(MLPRouter, ABC):
     """`MLPRouter` whose selection scores get an untrained bonus, updated after each
     batch from the experts' pulls (tokens routed to them) so far.
@@ -147,12 +229,8 @@ class MLPRouterWithBonus(MLPRouter, ABC):
         gating_scores = self.scorer(x)
         return gating_scores, gating_scores + self.bonus(x)
 
-    def update(
-        self,
-        x: torch.Tensor,
-        selected_experts: torch.Tensor,
-        losses: torch.Tensor,
-    ) -> None:
+    def update(self, output: "MoEOutput", losses: torch.Tensor) -> None:
+        x, selected_experts = output.x.detach(), output.selected_experts
         counts = torch.bincount(selected_experts.flatten(), minlength=self.num_experts)
         self.pulls += counts
         self.num_tokens += len(selected_experts)
@@ -443,12 +521,8 @@ class BanditRouter(Router):
     def scores(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.reward_model(x), sum(self.index_terms(x))
 
-    def update(
-        self,
-        x: torch.Tensor,
-        selected_experts: torch.Tensor,
-        losses: torch.Tensor,
-    ) -> None:
+    def update(self, output: "MoEOutput", losses: torch.Tensor) -> None:
+        x, selected_experts = output.x.detach(), output.selected_experts
         rewards = torch.exp(-losses).unsqueeze(1).expand_as(selected_experts)
 
         # One regression step of the reward model on the observed rewards.

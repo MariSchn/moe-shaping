@@ -1,0 +1,6 @@
+# Separate selection and gating MLPs, linear for num_layers: 1. The selector imitates
+# the best swap of one selected expert.
+_target_: model.router.SplitRouter
+_partial_: true
+hidden_dim: null
+num_layers: 1
