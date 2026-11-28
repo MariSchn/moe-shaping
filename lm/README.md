@@ -23,7 +23,7 @@ cp config.sh.example config.sh
 auto-derived from the launcher's location, so you only set it to run Megatron
 from a different checkout (e.g. a scratch copy).
 
-**2. Initialize the Megatron-LM submodule** (pinned to `core_v0.16.1`):
+**2. Initialize the Megatron-LM submodule** (pinned to `core_v0.20.1`):
 
 ```bash
 git submodule update --init lm/Megatron-LM   # run from the repo root
@@ -98,4 +98,4 @@ cd Megatron-LM && git apply --check ../patches/0001-log-tokens-per-sec-to-wandb.
 
 ## Dependencies
 
-- [Megatron-LM](https://github.com/NVIDIA/Megatron-LM) `core_v0.16.1` (git submodule)
+- [Megatron-LM](https://github.com/NVIDIA/Megatron-LM) `core_v0.20.1` (git submodule)
