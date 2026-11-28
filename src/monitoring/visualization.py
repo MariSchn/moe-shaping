@@ -55,7 +55,11 @@ def record_frame(
         )
 
     if x_grid is not None:
+        # In eval mode, so that routers that explore in training route greedily.
+        training = model.training
+        model.eval()
         predictions, grid_outputs = model(x_grid)
+        model.train(training)
         frame["x"] = x_grid[:, 0].cpu().numpy()
         frame["predictions"] = predictions.cpu().numpy()
 

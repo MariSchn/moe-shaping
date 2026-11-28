@@ -1,0 +1,21 @@
+_target_: targets.ModelTarget
+_convert_: all
+domain: [-1, 1]
+model:
+  _target_: model.moe.Model
+  _convert_: all
+  dims: [1, 1]
+  num_experts: 3
+  top_k: 2
+  router:
+    _target_: model.router.SeparatedRouter
+    _partial_: true
+  initial_parameters:
+    layers.0.experts.weights.0: [[[0.0]], [[0.0]], [[0.0]]]
+    layers.0.experts.biases.0: [[2.0], [0.0], [-2.0]]
+    # Selection scores (-x, 10, x): drop expert 2 for x < 0 and expert 0 for x > 0.
+    layers.0.router.selector.0.weight: [[-1.0], [0.0], [1.0]]
+    layers.0.router.selector.0.bias: [0.0, 10.0, 0.0]
+    # Logits of the pairs (0, 1), (0, 2), (1, 2), each weighting its first expert.
+    layers.0.router.gate.0.weight: [[20.0], [40.0], [20.0]]
+    layers.0.router.gate.0.bias: [10.0, 0.0, -10.0]

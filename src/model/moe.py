@@ -74,12 +74,14 @@ class MoELayer(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> MoEOutput:
-        gating_scores, selected_experts, gate_weights = self.router(x)
+        gating_scores, selected_experts, gate_weights, explored = self.router(x)
         expert_outputs = self.experts(x)
         selected_outputs = expert_outputs.gather(
             1, selected_experts.unsqueeze(-1).expand(-1, -1, expert_outputs.shape[-1])
         )
         output = (selected_outputs * gate_weights.unsqueeze(-1)).sum(dim=1)
+        if explored is not None:
+            output = torch.where(explored[:, None], output.detach(), output)
         return MoEOutput(x, output, gating_scores, expert_outputs, selected_experts)
 
 
